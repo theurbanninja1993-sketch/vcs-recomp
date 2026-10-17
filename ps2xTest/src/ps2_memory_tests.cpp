@@ -2112,7 +2112,7 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "VIF1 DIRECT image should update GS VRAM through GIF path2");
         });
 
-        tc.Run("VIF1 DIRECT image tag can continue with raw image qwords", [](TestCase &t)
+        tc.Run("VIF1 DIRECT image tag continues into the next DIRECT payload", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -2141,6 +2141,9 @@ void register_ps2_memory_tests()
             appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: GIF IMAGE tag only.
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            // The pixels follow in the next DIRECT payload, as PATH2 delivers
+            // them; raw stream bytes after a DIRECT are VIFcodes (19bdda6).
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u));
             for (uint32_t i = 0; i < 16u; ++i)
             {
                 packet.push_back(static_cast<uint8_t>(0xA0u + i));
@@ -2162,7 +2165,7 @@ void register_ps2_memory_tests()
                     }
                 }
             }
-            t.IsTrue(imageOk, "raw qwords after a DIRECT image tag should continue the PATH2 image upload");
+            t.IsTrue(imageOk, "the next DIRECT payload should continue the PATH2 image upload");
         });
 
         tc.Run("VIF1 DIRECT finds an image continuation after packed setup", [](TestCase &t)
@@ -2194,6 +2197,7 @@ void register_ps2_memory_tests()
             appendU64(packet, GS_REG_TEXA);
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // pixels in the next DIRECT payload
             for (uint32_t i = 0; i < 16u; ++i)
                 packet.push_back(static_cast<uint8_t>(0xC0u + i));
 

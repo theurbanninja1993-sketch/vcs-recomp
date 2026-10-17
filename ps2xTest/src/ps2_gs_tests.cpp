@@ -1001,8 +1001,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, kUvRow1);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, kUvRow1);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, kUvRow1 + (16ull | (16ull << 16))); // 1x1 sprite: [X0, X1) must not be empty
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
 
             const uint32_t dstPixel = readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u);
             t.Equals(dstPixel, static_cast<uint32_t>(kSourceColor),
@@ -1282,6 +1282,12 @@ void register_ps2_gs_tests()
                      "latched host presentation should normalize framebuffer alpha for host upload");
 
             std::memcpy(vram.data() + 0u, &kUpdatedSourcePixel, sizeof(kUpdatedSourcePixel));
+            // A present with no GS input since the last latch is a repeat and
+            // is skipped, so redraw the copy as the next frame would.
+            gs.writeRegister(GS_REG_UV, kUv0);
+            gs.writeRegister(GS_REG_XYZ2, kXyz0);
+            gs.writeRegister(GS_REG_UV, kUv1);
+            gs.writeRegister(GS_REG_XYZ2, kXyz1);
 
             std::vector<uint8_t> staleFrame;
             uint32_t staleWidth = 0u;
@@ -2652,8 +2658,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull | (16ull << 16))); // 1x1 sprite: [X0, X1) must not be empty
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -2797,8 +2803,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull | (16ull << 16))); // 1x1 sprite: [X0, X1) must not be empty
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -2859,8 +2865,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull | (16ull << 16))); // 1x1 sprite: [X0, X1) must not be empty
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -2925,8 +2931,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull | (16ull << 16))); // 1x1 sprite: [X0, X1) must not be empty
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -3462,7 +3468,9 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_FRAME_1, kFrame);
                 gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
                 gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
-                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                // GS pixel centres are integer: offset the triangle by half a pixel so
+                // pixel (1,1) samples the primitive at (1.5, 1.5).
+                gs.writeRegister(GS_REG_XYOFFSET_1, 8ull | (8ull << 32));
                 gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
                 gs.writeRegister(GS_REG_ALPHA_1, 0ull);
                 gs.writeRegister(GS_REG_TEX0_1, kTex0);
@@ -3629,7 +3637,9 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_FRAME_1, kFrame);
             gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
             gs.writeRegister(GS_REG_SCISSOR_1, (4ull << 16) | (4ull << 48));
-            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            // GS pixel centres are integer: offset the triangle by half a pixel so
+            // pixel (1,1) samples the primitive at (1.5, 1.5).
+            gs.writeRegister(GS_REG_XYOFFSET_1, 8ull | (8ull << 32));
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_TEX0_1, kTex0);
             gs.writeRegister(GS_REG_CLAMP_1, 1ull);
@@ -3854,7 +3864,7 @@ void register_ps2_gs_tests()
                 int last = -1;
                 for (uint32_t x = 6u; x <= 26u; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
+                    const size_t offset = GSPSMCT32::addrPSMCT32(0u, 1u, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
                     uint32_t pixel = 0u;
                     std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
                     if ((pixel & 0x00FFFFFFu) != 0u)
@@ -3875,7 +3885,7 @@ void register_ps2_gs_tests()
                 sawFilledRow = true;
                 for (int x = first; x <= last; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
+                    const size_t offset = GSPSMCT32::addrPSMCT32(0u, 1u, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
                     uint32_t pixel = 0u;
                     std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
                     if ((pixel & 0x00FFFFFFu) == 0u)
@@ -3914,20 +3924,24 @@ void register_ps2_gs_tests()
             setRegU32(loadCtx, 4, kImageAddr);
             setRegU32(loadCtx, 5, kSrcAddr);
             ps2_stubs::sceGsExecLoadImage(rdram, &loadCtx, &runtime);
+            // The temporary GIF packet comes from the HLE arena (35d6846) and is
+            // freed again, so the next arena allocation lands where it was.
+            const uint32_t packetAddr = runtime.hleMalloc(16u);
+            runtime.guestFree(packetAddr);
             t.Equals(static_cast<int32_t>(getRegU32Test(loadCtx, 2)), 0,
                      "sceGsExecLoadImage should succeed for a simple CT32 upload");
             uint64_t loadTag = 0u;
-            std::memcpy(&loadTag, rdram + runtime.guestHeapBase(), sizeof(loadTag));
+            std::memcpy(&loadTag, rdram + packetAddr, sizeof(loadTag));
             t.Equals(loadTag, 0x1000000000008004ull,
                      "sceGsExecLoadImage should populate the packed A+D GIF tag in guest RAM");
             uint64_t loadReg1 = 0u;
             uint64_t loadReg2 = 0u;
             uint64_t loadReg3 = 0u;
             uint64_t loadReg4 = 0u;
-            std::memcpy(&loadReg1, rdram + runtime.guestHeapBase() + 24u, sizeof(loadReg1));
-            std::memcpy(&loadReg2, rdram + runtime.guestHeapBase() + 40u, sizeof(loadReg2));
-            std::memcpy(&loadReg3, rdram + runtime.guestHeapBase() + 56u, sizeof(loadReg3));
-            std::memcpy(&loadReg4, rdram + runtime.guestHeapBase() + 72u, sizeof(loadReg4));
+            std::memcpy(&loadReg1, rdram + packetAddr + 24u, sizeof(loadReg1));
+            std::memcpy(&loadReg2, rdram + packetAddr + 40u, sizeof(loadReg2));
+            std::memcpy(&loadReg3, rdram + packetAddr + 56u, sizeof(loadReg3));
+            std::memcpy(&loadReg4, rdram + packetAddr + 72u, sizeof(loadReg4));
             t.Equals(loadReg1, 0x50ull, "sceGsExecLoadImage should encode BITBLTBUF as A+D register 0x50");
             t.Equals(loadReg2, 0x51ull, "sceGsExecLoadImage should encode TRXPOS as A+D register 0x51");
             t.Equals(loadReg3, 0x52ull, "sceGsExecLoadImage should encode TRXREG as A+D register 0x52");
@@ -3942,17 +3956,17 @@ void register_ps2_gs_tests()
             t.Equals(static_cast<int32_t>(getRegU32Test(storeCtx, 2)), 0,
                      "sceGsExecStoreImage should succeed for a matching CT32 readback");
             uint64_t storeTag = 0u;
-            std::memcpy(&storeTag, rdram + runtime.guestHeapBase(), sizeof(storeTag));
+            std::memcpy(&storeTag, rdram + packetAddr, sizeof(storeTag));
             t.Equals(storeTag, 0x1000000000008004ull,
                      "sceGsExecStoreImage should populate the packed A+D GIF tag in guest RAM");
             uint64_t storeReg1 = 0u;
             uint64_t storeReg2 = 0u;
             uint64_t storeReg3 = 0u;
             uint64_t storeReg4 = 0u;
-            std::memcpy(&storeReg1, rdram + runtime.guestHeapBase() + 24u, sizeof(storeReg1));
-            std::memcpy(&storeReg2, rdram + runtime.guestHeapBase() + 40u, sizeof(storeReg2));
-            std::memcpy(&storeReg3, rdram + runtime.guestHeapBase() + 56u, sizeof(storeReg3));
-            std::memcpy(&storeReg4, rdram + runtime.guestHeapBase() + 72u, sizeof(storeReg4));
+            std::memcpy(&storeReg1, rdram + packetAddr + 24u, sizeof(storeReg1));
+            std::memcpy(&storeReg2, rdram + packetAddr + 40u, sizeof(storeReg2));
+            std::memcpy(&storeReg3, rdram + packetAddr + 56u, sizeof(storeReg3));
+            std::memcpy(&storeReg4, rdram + packetAddr + 72u, sizeof(storeReg4));
             t.Equals(storeReg1, 0x50ull, "sceGsExecStoreImage should encode BITBLTBUF as A+D register 0x50");
             t.Equals(storeReg2, 0x51ull, "sceGsExecStoreImage should encode TRXPOS as A+D register 0x51");
             t.Equals(storeReg3, 0x52ull, "sceGsExecStoreImage should encode TRXREG as A+D register 0x52");
@@ -4139,7 +4153,10 @@ void register_ps2_gs_tests()
                      "VSync callback should receive a positive tick value");
             t.Equals(g_gsSyncCallbackGp.load(std::memory_order_acquire), kGsCallbackGp,
                      "callback invocation should preserve the registered GP");
-            t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) >= 0x01F00000u,
+            // Callback stacks are carved from kernel RAM (0x10000-0x80000), not
+            // the top of user RAM where they aliased the game's stacks (2aea131).
+            const uint32_t callbackSp = g_gsSyncCallbackSp.load(std::memory_order_acquire);
+            t.IsTrue(callbackSp >= 0x00010000u && callbackSp < 0x00080000u,
                      "callback invocation should use the reserved async stack pool");
             t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) != kGsCallbackCallerSp,
                      "callback invocation must not reuse the caller stack");
@@ -4466,8 +4483,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull | (16ull << 16))); // 1x1 sprite: [X0, X1) must not be empty
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
 
             uint32_t pixelHL = 0u;
             std::memcpy(&pixelHL, vram.data(), sizeof(pixelHL));
@@ -4489,8 +4506,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_TEX0_1, kTex0HH);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull | (16ull << 16))); // 1x1 sprite: [X0, X1) must not be empty
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
 
             uint32_t pixelHH = 0u;
             std::memcpy(&pixelHH, vram.data(), sizeof(pixelHH));

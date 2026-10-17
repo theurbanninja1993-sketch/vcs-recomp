@@ -31,7 +31,12 @@ int main()
     // present back one latch later, so a test that latches once got no frame
     // and then read past an empty buffer (the suite segfaulted). The async VIF1
     // worker does the same to the DMA tests, which expect a transfer to be done
-    // when processPendingTransfers() returns.
+    // when processPendingTransfers() returns. The VU1 tests check the exact
+    // pipeline timing the game skips by default (PS2X_VU1_EXACT_PIPELINE), and
+    // the interlaced presentation test the line-doubled field output the port
+    // replaced with full frames (65e22b2; PS2X_FIELD_BOB). The texture page
+    // buffer test needs the snapshotting texture cache (PS2X_GS_TEXCACHE),
+    // which the port replaced with direct VRAM reads (5abf73e).
 #if defined(_WIN32)
     if (std::getenv("PS2X_GS_GPU") == nullptr)
         _putenv_s("PS2X_GS_GPU", "0");
@@ -39,10 +44,19 @@ int main()
         _putenv_s("PS2X_GS_SYNC", "1");
     if (std::getenv("PS2X_SYNC_VIF1") == nullptr)
         _putenv_s("PS2X_SYNC_VIF1", "1");
+    if (std::getenv("PS2X_VU1_EXACT_PIPELINE") == nullptr)
+        _putenv_s("PS2X_VU1_EXACT_PIPELINE", "1");
+    if (std::getenv("PS2X_FIELD_BOB") == nullptr)
+        _putenv_s("PS2X_FIELD_BOB", "1");
+    if (std::getenv("PS2X_GS_TEXCACHE") == nullptr)
+        _putenv_s("PS2X_GS_TEXCACHE", "1");
 #else
     setenv("PS2X_GS_GPU", "0", 0);
     setenv("PS2X_GS_SYNC", "1", 0);
     setenv("PS2X_SYNC_VIF1", "1", 0);
+    setenv("PS2X_VU1_EXACT_PIPELINE", "1", 0);
+    setenv("PS2X_FIELD_BOB", "1", 0);
+    setenv("PS2X_GS_TEXCACHE", "1", 0);
 #endif
     MiniTest::BeforeEach(reset_ps2_test_function_table);
 

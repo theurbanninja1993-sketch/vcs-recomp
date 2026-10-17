@@ -1972,8 +1972,9 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         // Fallback: resolve to the nearest lower registered function. JAL+8
         // return sites and checkpoint-resume points inside a function do not
         // always have their own table slot; the containing function's entry
-        // switch routes the PC to the correct internal label.
-        uint32_t scan = slot;
+        // switch routes the PC to the correct internal label. The strict policy
+        // (tests/CI) wants exact registration only.
+        uint32_t scan = missingFunctionPolicy() == MissingFunctionPolicy::Stop ? 0u : slot;
         while (scan > 0u)
         {
             --scan;

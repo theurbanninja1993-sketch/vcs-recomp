@@ -17,6 +17,7 @@
 #include "Stubs/GS.h"
 #include "Stubs/VU.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -177,6 +178,7 @@ namespace
     std::atomic<uint32_t> gMpegStreamCallbackMpeg{0u};
     std::atomic<uint32_t> gMpegStreamCallbackType{0u};
     std::atomic<uint32_t> gMpegStreamCallbackDataAddr{0u};
+    std::atomic<uint64_t> gMpegStreamCallbackDataHead{0u}; // first (up to) 8 payload bytes
     std::atomic<uint32_t> gMpegStreamCallbackLen{0u};
     std::atomic<uint32_t> gMpegStreamCallbackUserData{0u};
     constexpr uint32_t kMpegCallbackStopPc = 0x00124FF0u;
@@ -302,6 +304,10 @@ namespace
         gMpegStreamCallbackMpeg.store(::getRegU32(ctx, 4), std::memory_order_release);
         gMpegStreamCallbackType.store(type, std::memory_order_release);
         gMpegStreamCallbackDataAddr.store(dataAddr, std::memory_order_release);
+        uint64_t head = 0u;
+        if (dataAddr != 0u && dataAddr < PS2_RAM_SIZE - 8u)
+            std::memcpy(&head, rdram + dataAddr, std::min<uint32_t>(len, 8u));
+        gMpegStreamCallbackDataHead.store(head, std::memory_order_release);
         gMpegStreamCallbackLen.store(len, std::memory_order_release);
         gMpegStreamCallbackUserData.store(::getRegU32(ctx, 6), std::memory_order_release);
         gMpegStreamCallbackCount.fetch_add(1u, std::memory_order_acq_rel);
@@ -660,8 +666,12 @@ void register_ps2_runtime_expansion_tests()
                      "registered audio stream callback should be invoked");
             t.Equals(gMpegStreamCallbackType.load(std::memory_order_acquire), 2u,
                      "audio callback data should report PCM stream type");
-            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire), kAudioPacketAddr + 9u,
-                     "audio callback data should point at PES payload");
+            // Audio callbacks get a stable copy of the PES payload in an HLE
+            // buffer (libmpeg-style delivery, 42e532b), not a ring pointer.
+            uint64_t expectedAudioHead = 0u;
+            std::memcpy(&expectedAudioHead, audioPayload.data(), audioPayload.size());
+            t.Equals(gMpegStreamCallbackDataHead.load(std::memory_order_acquire), expectedAudioHead,
+                     "audio callback data should hold the PES payload");
             t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire),
                      static_cast<uint32_t>(audioPayload.size()),
                      "audio callback data should report PES payload length");
@@ -728,6 +738,9 @@ void register_ps2_runtime_expansion_tests()
             ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, &runtime);
             t.IsTrue(::getRegU32(&createCtx, 2) != 0u,
                      "sceMpegCreate should reopen the MPEG handle after an ended reset");
+            // Create starts a fresh movie object without the old callbacks, as
+            // libmpeg's does; the game registers them again.
+            registerStreamCallback(0u, kVideoUserData);
 
             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
             prepareCallbackDispatch();
@@ -1293,9 +1306,11 @@ void register_ps2_runtime_expansion_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0xFF3214C8ull); // RGBA=(200,20,50,255)
 
             // With XYOFFSET=(1,1), vertex at (2,2) draws to pixel (1,1).
+            // Sprite (2,2)-(3,3) covers one pixel: [X0, X1) x [Y0, Y1).
             const uint64_t xyz = (32ull) | (32ull << 16) | (0ull << 32);
+            const uint64_t xyzEnd = (48ull) | (48ull << 16) | (0ull << 32);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyzEnd);
 
             const uint32_t insideOff = frameOffsetBytes(1u, 1u, 1u);
             t.Equals(vram[insideOff + 0u], static_cast<uint8_t>(200u), "inside draw should write R");
@@ -1309,7 +1324,7 @@ void register_ps2_runtime_expansion_tests()
             const uint64_t scissorOutside = (3ull) | (4ull << 16) | (3ull << 32) | (4ull << 48);
             gs.writeRegister(GS_REG_SCISSOR_1, scissorOutside);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyzEnd);
 
             bool anyWrite = false;
             for (size_t i = 0; i < 1024u; ++i)
@@ -1356,9 +1371,11 @@ void register_ps2_runtime_expansion_tests()
             gs.writeRegister(GS_REG_ALPHA_1, alpha);
             gs.writeRegister(GS_REG_RGBAQ, 0xFFC8C8C8ull); // src RGB = 200
 
-            const uint64_t xyz = (16ull) | (16ull << 16) | (0ull << 32); // pixel (1,1)
+            // Sprite (1,1)-(2,2) covers pixel (1,1): [X0, X1) x [Y0, Y1).
+            const uint64_t xyz = (16ull) | (16ull << 16) | (0ull << 32);
+            const uint64_t xyzEnd = (32ull) | (32ull << 16) | (0ull << 32);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyzEnd);
 
             // ((200 - 40) * 64 >> 7) + 40 = 120
             t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(120u), "alpha blend should update R with FIX factor");
