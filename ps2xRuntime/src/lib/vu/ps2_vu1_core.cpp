@@ -1714,6 +1714,12 @@ std::atomic<uint64_t> g_ps2Vu1ExitEnded{0}, g_ps2Vu1ExitBudget{0}, g_ps2Vu1ExitC
 // are the same code for both.
 std::atomic<uint64_t> g_vuRunMicros[2];
 std::atomic<uint64_t> g_vuRunCalls[2];
+// The VU's own cycle counter, accumulated per run the same way as the host time.
+// Two numbers together say what the emulation costs per unit of *emulated* work
+// rather than per call, which is what decides whether the VU path is wasteful or
+// simply doing a lot: host cycles per VU cycle. The pipeline model issues one
+// instruction per cycle, so this is also instructions issued.
+std::atomic<uint64_t> g_vuRunCycles[2];
 
 void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
@@ -1724,14 +1730,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     {
         std::chrono::steady_clock::time_point start;
         uint32_t index;
+        const uint64_t *cycle;
+        uint64_t startCycle;
         ~VuRunScope()
         {
             const uint64_t micros = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
             g_vuRunMicros[index].fetch_add(micros, std::memory_order_relaxed);
             g_vuRunCalls[index].fetch_add(1u, std::memory_order_relaxed);
+            g_vuRunCycles[index].fetch_add(*cycle - startCycle, std::memory_order_relaxed);
         }
-    } vuRunScope{vuRunStart, static_cast<uint32_t>(m_unit == Unit::VU0 ? 0u : 1u)};
+    } vuRunScope{vuRunStart, static_cast<uint32_t>(m_unit == Unit::VU0 ? 0u : 1u), &m_cycle, m_cycle};
     m_activeVuData = vuData;
     m_activeVuDataSize = dataSize;
     m_activeGs = &gs;

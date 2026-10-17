@@ -760,17 +760,24 @@ void ps2PerfLogVBlank(double lateMs, uint64_t eeCycle)
     static uint64_t s_lastRevalidations = 0, s_lastRecomputes = 0;
     const uint64_t revalidations = g_ps2Vu1LookupRevalidations.load(), recomputes = g_ps2Vu1LookupRecomputes.load();
     {
-        // Host CPU ms inside the VU interpreter's run(), per unit, plus calls.
-        extern std::atomic<uint64_t> g_vuRunMicros[2], g_vuRunCalls[2];
-        static uint64_t s_lastVuMicros[2] = {}, s_lastVuCalls[2] = {};
+        // Host CPU ms inside the VU interpreter's run(), per unit, plus calls and
+        // the VU's own cycles. micros over cycles is the host cost of one emulated
+        // VU cycle, which is the number that says whether the VU path is expensive
+        // because it does a lot of work or because it does it wastefully.
+        extern std::atomic<uint64_t> g_vuRunMicros[2], g_vuRunCalls[2], g_vuRunCycles[2];
+        static uint64_t s_lastVuMicros[2] = {}, s_lastVuCalls[2] = {}, s_lastVuCycles[2] = {};
         for (int unit = 0; unit < 2; ++unit)
         {
             const uint64_t micros = g_vuRunMicros[unit].load(std::memory_order_relaxed);
             const uint64_t calls = g_vuRunCalls[unit].load(std::memory_order_relaxed);
-            std::fprintf(s_file, " vu%dMs=%llu vu%dCalls=%llu", unit, static_cast<unsigned long long>((micros - s_lastVuMicros[unit]) / 1000u),
-                         unit, static_cast<unsigned long long>(calls - s_lastVuCalls[unit]));
+            const uint64_t cycles = g_vuRunCycles[unit].load(std::memory_order_relaxed);
+            std::fprintf(s_file, " vu%dMs=%llu vu%dCalls=%llu vu%dCyc=%llu", unit,
+                         static_cast<unsigned long long>((micros - s_lastVuMicros[unit]) / 1000u), unit,
+                         static_cast<unsigned long long>(calls - s_lastVuCalls[unit]), unit,
+                         static_cast<unsigned long long>(cycles - s_lastVuCycles[unit]));
             s_lastVuMicros[unit] = micros;
             s_lastVuCalls[unit] = calls;
+            s_lastVuCycles[unit] = cycles;
         }
     }
     {
