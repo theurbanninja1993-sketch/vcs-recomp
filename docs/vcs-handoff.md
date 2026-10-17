@@ -1688,6 +1688,54 @@ disables the wall stop; `PS2X_CARLOOK_DEBUG=<file>` logs the whole path
       player who sets `PS2X_FRAME_RATE` should expect a broken picture, not an
       interpolated one.
 
+      **Where Claude left it (2026-10-17, commits `7e5bf2d`, `cc5abea`,
+      `c16e562`, `d2df272`).** Measured facts, so nobody re-derives them:
+      - **VCS draws a new view every 2-4 VBlanks** (15-30 fps), while a picture
+        is composed every VBlank. The interpolation must work in game frames.
+        `PS2X_INTERP_SEQ=1` shows it per compose: `p` = picture changed, `c` =
+        its camera arrived, `B` = both.
+      - **The camera that comes with a picture can be a compose early or
+        late.** Cameras are now stamped into the VIF1 stream order
+        (`ps2CameraStreamPush` after the camera update, looked up by the
+        stream position of the latest scene-buffer draw). The renderer pairs
+        by *picture change* (the composed source's `drawSeq`) and waits at
+        most one compose for the camera.
+      - **The overlay mask covers almost none of VCS's HUD** (a dot and some
+        text boxes), and `m_overlayMaskOriginX/Y` were never assigned. What
+        keeps the HUD and the orbited player still is the static-pixel rule in
+        the synthesis shader (a pixel equal in place in both pictures, with
+        its four neighbours, is shown unwarped).
+      - **Depth 15**: the camera orbits the player at close range.
+        `PS2X_INTERP_ALIGN=1` measured the warp removing ~25% of the frame
+        difference at depth 8-20 vs ~10% at 200. The FOV scale sweep in the
+        same diagnostic puts the best fit at 1.0 and the reversed direction
+        2-3x worse, so the projection and direction are right.
+      - **Pacing**: VSync now paces alone when interpolating, and the host
+        requests frames without blocking (`RequestSynthesis` /
+        `LatestSynthesis`). `PS2X_HOST_TIMING=1` with the owner's settings
+        (4x, VSync, 180 Hz display): 5.56 ms frames, p99 <= 7 ms through a
+        scene that used to spike to 30 ms.
+      - **A real interpolated frame looks right:**
+        `PS2X_INTERP_ALIGN=1 PS2X_INTERP_DUMP_PAIR=<prefix>` writes
+        prev/mid/next PPMs and the two mask PGMs. After `cc5abea` the HUD and
+        the player are crisp and single and the world sits between the two
+        pictures.
+      - **Still unexplained:** the owner still saw judder and tearing after
+        `c16e562`, and none of the measurements above reproduces it. Not
+        covered yet: driving (an object that moves on screen), the static-pixel
+        rule on flat surfaces (seams), the async path showing each result one
+        host frame after it was requested for, and motion blur on top. The next
+        useful instrument is a recording of the *screen* at the display rate
+        (OBS at 180), or an in-memory ring of host frames written out
+        afterwards (PNG writes during capture slow the host 6x, so
+        `PS2X_HOST_CAPTURE` is not representative).
+
+      **Attribution:** `aa6ede8` ("handoff: bring it up to date...") also
+      contains Claude's first interpolation change (game frames, renderer-owned
+      phase). OpenCode committed it from the shared working tree. It is
+      published (in `vcs-bringup`, `release` and the `stories-v0.1.1` tag), so
+      history was not rewritten; this note is the record.
+
       **(Previous notes, kept for the record.) PARKED 2026-10-16: the
       interpolated picture warps. FOR THE NEXT PAIR OF EYES.** Everything else about interpolation works - no black frames, the
       HUD is protected, cutscenes and FMVs play, the picture stream is correct -
