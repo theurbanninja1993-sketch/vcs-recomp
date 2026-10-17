@@ -134,6 +134,40 @@ Two smaller finds from the same run, neither urgent:
   "time: readback= draw= present=" never appears. The numbers would be useful for
   settling the present cost; the host timing answered it instead.
 
+### The VU1 harness exists, and what it says
+
+`ps2xRuntime/tools/vu1_replay` replays a `PS2X_VU1_CAPTURE` of MSCALs offline and
+checks the final VU1 state, VU1 data memory and the XGKICK output **bit for bit**
+(`mismatches=0`), and it carries its own RIP profiler (`VU1_PROFILE=<file>`, samples
+of the host RIP relative to `profileHandler`). Build it with the runtime; it is
+`build/ps2xRuntime/vu1_replay`.
+
+Measure it against the game: a 900-MSCAL gameplay capture (frames 2500-3400, `PS2X_VU1_CAPTURE=<file>,2500,900`)
+replays at **7.5-8.2 us a call**, while the same machine spends **38-63 us a call** on
+VU1 inside the game. That gap is the finding, and it is not what the per-call figure
+suggested on its own: the emulation is several times cheaper than what the game pays
+for it, so the in-game cost is dominated by what happens *around* the instructions -
+memory behaviour against the other threads, and the handshake - rather than by the
+instruction emulation. Worth knowing before optimising either. The profile puts ~60%
+of the replay's time in the ten most-used generated programs, and
+`VU1Interpreter::calculateFmacExactResult` (an 80-bit `long double` path) at 3%.
+
+Two A/Bs from the same run, both worth not repeating: `PS2X_SYNC_GS=1` is *worse*
+(46.9 us a call against 37.8) because it moves the GS work inside `run()`, and the CPU
+rasterizer is worse again (63.0 us a call, 46.6 fps against 60) - so the GPU renderer
+is not costing the VU1 anything, it is paying for itself.
+
+**`vu1Ms` is wall time inside `run()`, not pure emulation time** - it includes any
+handshake waiting, and with a synchronous GS it includes the GS work too. That is why
+the earlier "21 ns per emulated VU cycle" should be read as host time *while inside*
+`run()`, and why the replay figure (7.5-8.2 us, uncontended) is the honest measure of
+the emulation itself.
+
+So the way in is to iterate the per-instruction code against `vu1_replay` as the
+benchmark - bit-exactness comes free with it, and `65ebb08` already took 1.4x out of
+the pipeline bookkeeping the same way - and to establish what the in-game 5x is
+actually made of before spending it on instructions.
+
 Two leads this file used to recommend are **dead**, measured on this machine by
 running the same scripted scene twice:
 
