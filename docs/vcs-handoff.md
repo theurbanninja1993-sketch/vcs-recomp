@@ -134,39 +134,65 @@ Two smaller finds from the same run, neither urgent:
   "time: readback= draw= present=" never appears. The numbers would be useful for
   settling the present cost; the host timing answered it instead.
 
-### The VU1 harness exists, and what it says
+### The VU1 harness exists - use it, and watch the build basis
 
 `ps2xRuntime/tools/vu1_replay` replays a `PS2X_VU1_CAPTURE` of MSCALs offline and
 checks the final VU1 state, VU1 data memory and the XGKICK output **bit for bit**
-(`mismatches=0`), and it carries its own RIP profiler (`VU1_PROFILE=<file>`, samples
-of the host RIP relative to `profileHandler`). Build it with the runtime; it is
-`build/ps2xRuntime/vu1_replay`.
+(`mismatches=0`), and it carries its own RIP profiler (`VU1_PROFILE=<file>`, host RIP
+samples relative to `profileHandler`). Record a capture with
+`PS2X_VU1_CAPTURE=<file>,<startFrame>,<count>`; 900 MSCALs is a few game frames' worth
+and replays in under a second. The tool now prints cycles, calls and **ns per emulated
+VU cycle** beside us/record, because per-call figures are not comparable across scenes
+(a call is 1600-2400 cycles and varies by more than an order of magnitude).
 
-Measure it against the game: a 900-MSCAL gameplay capture (frames 2500-3400, `PS2X_VU1_CAPTURE=<file>,2500,900`)
-replays at **7.5-8.2 us a call**, while the same machine spends **38-63 us a call** on
-VU1 inside the game. That gap is the finding, and it is not what the per-call figure
-suggested on its own: the emulation is several times cheaper than what the game pays
-for it, so the in-game cost is dominated by what happens *around* the instructions -
-memory behaviour against the other threads, and the handshake - rather than by the
-instruction emulation. Worth knowing before optimising either. The profile puts ~60%
-of the replay's time in the ten most-used generated programs, and
-`VU1Interpreter::calculateFmacExactResult` (an 80-bit `long double` path) at 3%.
+**Its figures are only comparable within one build basis, and there is a trap.**
+`build/` is configured `PS2X_PGO=use` with a profile collected 2026-10-07, and GCC
+consumes a *stale* profile silently - no warning. Recompiling the VU core against it
+(which any change after that date does) made the very same capture replay **five times
+slower in the same tool**. So before trusting any before/after: regenerate the profile
+(`PS2X_PGO=generate`, run `vu1_replay` plus a gameplay session, then `PS2X_PGO=use` -
+the workflow the CMake comment describes), or build `PS2X_PGO=off` and treat the
+figure as conservative. Regenerating is the right answer for anything shipped.
 
-Two A/Bs from the same run, both worth not repeating: `PS2X_SYNC_GS=1` is *worse*
-(46.9 us a call against 37.8) because it moves the GS work inside `run()`, and the CPU
-rasterizer is worse again (63.0 us a call, 46.6 fps against 60) - so the GPU renderer
-is not costing the VU1 anything, it is paying for itself.
+Solid regardless, because these are from single builds:
 
-**`vu1Ms` is wall time inside `run()`, not pure emulation time** - it includes any
-handshake waiting, and with a synchronous GS it includes the GS work too. That is why
-the earlier "21 ns per emulated VU cycle" should be read as host time *while inside*
-`run()`, and why the replay figure (7.5-8.2 us, uncontended) is the honest measure of
-the emulation itself.
+- **The cost is in the generated per-instruction code**, not in the interpreter choice:
+  compiled VU1 is only 1.35x faster than interpreted, so whatever dominates is shared
+  by both paths rather than being instruction dispatch.
+- `VU1Interpreter::calculateFmacExactResult` (an 80-bit `long double` path) is ~3% of
+  replay samples - small, but it is inside the hot loop and worth a look.
+- **Two dead A/Bs, both measured:** `PS2X_SYNC_GS=1` is worse (46.9 us a call against
+  37.8, because the GS work then happens inside `run()`), and the CPU rasterizer is
+  worse again (63.0 us a call, 46.6 fps against 60) - so the GPU renderer is not
+  costing VU1 anything, it is paying for itself.
+- **Contention is not the explanation.** Eight spinning threads and seven concurrent
+  replays moved the replay's per-record time by under 3% (7.5 to 7.7 us). Note this was
+  measured before the build-basis problem above was found, so re-take it on a clean
+  baseline before relying on it.
+- **`vu1Ms` is wall time inside `run()`, not pure emulation time** - it includes
+  handshake waiting, and with a synchronous GS it includes the GS work. The replay
+  figure is the honest measure of the emulation itself.
 
-So the way in is to iterate the per-instruction code against `vu1_replay` as the
-benchmark - bit-exactness comes free with it, and `65ebb08` already took 1.4x out of
-the pipeline bookkeeping the same way - and to establish what the in-game 5x is
-actually made of before spending it on instructions.
+**And there is an unexplained factor of five.** The tool binary that was sitting in
+`build/` before any of this replayed each of these captures at **7.5-8.2 us a call**;
+every build made from the current source since replays the *same files* at **42-49 us**
+(`mismatches=0` either way, and 329 `vu1p_` symbols present, so both really run the
+compiled programs - 42.1 us with them against 75.1 us with `PS2X_VU1_NO_COMPILED`).
+Removing my own instrumentation changed it by 2%, and switching PGO off by another
+little, so neither explains it. The likeliest reading is that the binary was older than
+the tree it sat in - which would mean the VU1 path got several times slower over the
+days of changes since, and that is worth much more than any micro-optimisation.
+
+**Next step, running: a bisect.** `git worktree add --detach <dir> 65ebb08` plus a
+`vu1_replay` build, configured with the same VU1 programs directory, then the same
+captures. If the old commit is fast, bisect the range; if it is also ~42 us, the fast
+baseline was a build artefact and the absolute figures here are not trustworthy at all
+until a clean, regenerated profile exists.
+
+One admission for whoever reads this next: the fast baseline binary was overwritten by
+these rebuilds before its timestamp or build flags were recorded, so the fast number
+cannot be re-taken. Capture `stat` output before rebuilding anything that is being used
+as a baseline.
 
 Two leads this file used to recommend are **dead**, measured on this machine by
 running the same scripted scene twice:
