@@ -15,7 +15,7 @@ void ps2InterpEvent(char event); // gs_frontend.cpp
 #include "runtime/ps2_camera.h"
 #include "runtime/ps2_platform.h"
 #include "runtime/ps2_host_settings.h"
-#include "runtime/ps2_pad.h" // the live trigger positions (PS2X_THROTTLE_SCAN)
+#include "runtime/ps2_pad.h"
 #include <algorithm>
 #include <cmath>
 #include <array>
@@ -422,50 +422,6 @@ namespace
         const uint32_t vehicle = findPlayerVehicle(rdram);
         if (vehicle == 0u)
             return false;
-        // PS2X_THROTTLE_SCAN=1: dump the vehicle's state while driving so the
-        // gas-pedal field can be found from a real drive (hold the trigger,
-        // release, hold again). Written to throttle_scan.txt in the config
-        // folder and the working directory, like padlog.txt.
-        if (std::getenv("PS2X_THROTTLE_SCAN") != nullptr)
-        {
-            static uint64_t s_last = 0;
-            const uint64_t frame = g_ps2PresentedFrameCounter.load(std::memory_order_relaxed);
-            if (frame >= s_last + 30u)
-            {
-                s_last = frame;
-                static FILE *s_file = std::fopen("throttle_scan.txt", "a");
-                static FILE *s_config = []() -> FILE *
-                {
-                    const std::filesystem::path path =
-                        std::filesystem::path(ps2HostSettingsPath()).parent_path() / "throttle_scan.txt";
-                    return std::fopen(path.string().c_str(), "a");
-                }();
-                static bool s_noted = false;
-                if (!s_noted)
-                {
-                    s_noted = true;
-                    std::fprintf(stderr, "[thr] writing throttle_scan.txt (config folder + working directory)\n");
-                }
-                std::string line = "[thr] f=" + std::to_string(frame) + " trig=" +
-                                   std::to_string(g_ps2PadTriggerRight.load(std::memory_order_relaxed)) +
-                                   " veh=" + std::to_string(vehicle) + " ";
-                char word[9];
-                for (uint32_t off = 0; off < 0x700u; off += 4u)
-                {
-                    uint32_t value = 0;
-                    std::memcpy(&value, rdram + vehicle + off, 4);
-                    std::snprintf(word, sizeof word, "%08x", value);
-                    line += word;
-                }
-                line += "\n";
-                for (FILE *sink : {s_file, s_config})
-                    if (sink != nullptr)
-                    {
-                        std::fputs(line.c_str(), sink);
-                        std::fflush(sink);
-                    }
-            }
-        }
         return true;
     }
 
