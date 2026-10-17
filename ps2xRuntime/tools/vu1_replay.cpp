@@ -142,6 +142,10 @@ int main(int argc, char **argv)
 
     size_t mismatches = 0;
     double seconds = 0.0;
+    // Counters for the per-cycle comparison with the game's perf log.
+    extern std::atomic<uint64_t> g_vuRunCycles[2], g_vuRunCalls[2];
+    const uint64_t cyclesBefore = g_vuRunCycles[1].load();
+    const uint64_t callsBefore = g_vuRunCalls[1].load();
     for (int pass = 0; pass < passes; ++pass)
     {
         for (size_t index = 0; index < records.size(); ++index)
@@ -178,6 +182,19 @@ int main(int argc, char **argv)
     std::printf("mismatches=%zu time=%.3fs (%.1f us/record) gifBytes=%llu gifHash=%016llx\n", mismatches, seconds,
                 seconds * 1e6 / static_cast<double>(records.size() * passes), static_cast<unsigned long long>(gifBytes / passes),
                 static_cast<unsigned long long>(gifHash));
+    {
+        // The VU's own cycle count over the same work, so this can be compared with
+        // the game's perf log per *cycle* rather than per call: a call's length
+        // varies by more than an order of magnitude between scenes, so per-call
+        // figures taken from different scenes are not comparable.
+        const uint64_t cycles = g_vuRunCycles[1].load() - cyclesBefore;
+        const uint64_t vuCalls = g_vuRunCalls[1].load() - callsBefore;
+        if (cycles != 0u)
+            std::printf("cycles=%llu vuCalls=%llu cyc/call=%.1f us/call=%.2f ns/cycle=%.3f\n",
+                        static_cast<unsigned long long>(cycles), static_cast<unsigned long long>(vuCalls),
+                        static_cast<double>(cycles) / static_cast<double>(vuCalls), seconds * 1e6 / static_cast<double>(vuCalls),
+                        seconds * 1e9 / static_cast<double>(cycles));
+    }
     if (profilePath)
     {
         itimerval off{};

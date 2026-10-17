@@ -1664,6 +1664,10 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
     m_stopRequested = true;
 }
 
+// Accumulated in execute()/resume() below and defined further down; this file
+// declares it here so those two can reach it.
+extern std::atomic<uint64_t> g_vuRunCycles[2];
+
 void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint8_t *vuData, uint32_t dataSize,
                              GS &gs, PS2Memory *memory,
@@ -1689,7 +1693,15 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_compiledEntry = fastCommitEnabled() ? lookupCompiled(vuCode, codeSize, memory, m_state.pc) : nullptr;
     if (m_unit == Unit::VU1)
         (m_compiledEntry ? g_ps2Vu1CompiledCalls : g_ps2Vu1InterpretedCalls).fetch_add(1, std::memory_order_relaxed);
+    // The VU's own cycles over this run, accumulated once per call. Read here
+    // rather than from inside run(): a pointer to m_cycle there would force the
+    // interpreter's hot counter out of a register, which measured five times
+    // slower on a replay benchmark. Saturating, because a mid-call reset() would
+    // otherwise wrap the difference.
+    const uint64_t cycleBefore = m_cycle;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    if (m_cycle > cycleBefore)
+        g_vuRunCycles[m_unit == Unit::VU0 ? 0u : 1u].fetch_add(m_cycle - cycleBefore, std::memory_order_relaxed);
 }
 
 void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
@@ -1701,7 +1713,10 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.itop = itop;
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
+    const uint64_t cycleBefore = m_cycle;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    if (m_cycle > cycleBefore)
+        g_vuRunCycles[m_unit == Unit::VU0 ? 0u : 1u].fetch_add(m_cycle - cycleBefore, std::memory_order_relaxed);
 }
 
 // Defined here, read by the perf log.
@@ -1730,17 +1745,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     {
         std::chrono::steady_clock::time_point start;
         uint32_t index;
-        const uint64_t *cycle;
-        uint64_t startCycle;
         ~VuRunScope()
         {
             const uint64_t micros = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
             g_vuRunMicros[index].fetch_add(micros, std::memory_order_relaxed);
             g_vuRunCalls[index].fetch_add(1u, std::memory_order_relaxed);
-            g_vuRunCycles[index].fetch_add(*cycle - startCycle, std::memory_order_relaxed);
         }
-    } vuRunScope{vuRunStart, static_cast<uint32_t>(m_unit == Unit::VU0 ? 0u : 1u), &m_cycle, m_cycle};
+    } vuRunScope{vuRunStart, static_cast<uint32_t>(m_unit == Unit::VU0 ? 0u : 1u)};
     m_activeVuData = vuData;
     m_activeVuDataSize = dataSize;
     m_activeGs = &gs;
