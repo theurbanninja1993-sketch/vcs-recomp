@@ -141,6 +141,107 @@ int main(int argc, char **argv)
         setitimer(ITIMER_PROF, &timer, nullptr);
     }
 
+    // PS2X_VU1_FOOTPRINT=1: report which bytes of VU1 data memory each program
+    // writes, by diffing the captured before/after images. Two programs can only be
+    // run on different threads if their writes do not overlap - and if the dominant
+    // pair turns out to be double-buffered (each writing its own half), that is the
+    // evidence for doing it.
+    if (std::getenv("PS2X_VU1_FOOTPRINT") != nullptr)
+    {
+        struct Range
+        {
+            uint32_t lo = 0xFFFFFFFFu, hi = 0u, touches = 0u, records = 0u;
+        };
+        std::map<uint32_t, Range> byProgram;
+        for (const Record &r : records)
+        {
+            if (r.vu0 || r.dataBefore.size() != r.dataAfter.size())
+                continue;
+            Range &range = byProgram[r.startPC];
+            ++range.records;
+            for (size_t b = 0; b < r.dataBefore.size(); ++b)
+            {
+                if (r.dataBefore[b] == r.dataAfter[b])
+                    continue;
+                ++range.touches;
+                range.lo = std::min<uint32_t>(range.lo, static_cast<uint32_t>(b & ~0x0Fu));
+                range.hi = std::max<uint32_t>(range.hi, static_cast<uint32_t>(b | 0x0Fu));
+            }
+        }
+        std::printf("\nVU1 data memory written, per program (bytes, 16-aligned):\n");
+        std::printf("   %-10s %8s %10s %14s %14s\n", "pc", "records", "changed", "writes from", "writes to");
+        std::vector<std::pair<uint32_t, Range>> ranked(byProgram.begin(), byProgram.end());
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto &a, const auto &b) { return a.second.touches > b.second.touches; });
+        for (const auto &entry : ranked)
+            if (entry.second.touches != 0u)
+                std::printf("   0x%-8x %8u %10u      0x%06x      0x%06x\n", entry.first, entry.second.records,
+                            entry.second.touches, entry.second.lo, entry.second.hi);
+        // What decides whether two programs can run on different threads is not
+        // whether their writes overlap over a whole capture, but whether the ones
+        // that run next to each other do. A double-buffered pair shows up here as
+        // adjacent records touching disjoint bytes.
+        std::vector<std::vector<uint8_t>> written;
+        written.reserve(records.size());
+        for (const Record &r : records)
+        {
+            std::vector<uint8_t> touched(r.vu0 ? 0u : r.dataBefore.size(), 0u);
+            if (!r.vu0 && r.dataBefore.size() == r.dataAfter.size())
+                for (size_t b = 0; b < touched.size(); ++b)
+                    touched[b] = r.dataBefore[b] != r.dataAfter[b] ? 1u : 0u;
+            written.push_back(std::move(touched));
+        }
+        size_t pairs = 0, disjoint = 0, overlapPairs = 0;
+        size_t overlapBytesTotal = 0, overlapWorst = 0;
+        for (size_t i = 0; i + 1 < written.size(); ++i)
+        {
+            if (written[i].empty() || written[i + 1].empty())
+                continue;
+            ++pairs;
+            size_t overlap = 0;
+            const size_t n = std::min(written[i].size(), written[i + 1].size());
+            for (size_t b = 0; b < n; ++b)
+                overlap += (written[i][b] & written[i + 1][b]);
+            if (overlap == 0u)
+                ++disjoint;
+            else
+            {
+                ++overlapPairs;
+                overlapBytesTotal += overlap;
+                overlapWorst = std::max(overlapWorst, overlap);
+            }
+        }
+        std::printf("\nadjacent pairs: %zu checked, %zu disjoint (%.1f%%), %zu overlapping, median overlap %zu bytes, worst %zu\n",
+                    pairs, disjoint, pairs ? 100.0 * static_cast<double>(disjoint) / static_cast<double>(pairs) : 0.0,
+                    overlapPairs, overlapPairs ? overlapBytesTotal / overlapPairs : 0u, overlapWorst);
+        // Where the overlaps actually are. A handful of fixed words is a handshake
+        // that a parallel runner can order or own; a wide scatter is a shared buffer
+        // and means these two programs genuinely interact.
+        std::map<uint32_t, size_t> hotBytes;
+        for (size_t i = 0; i + 1 < written.size(); ++i)
+        {
+            if (written[i].empty() || written[i + 1].empty())
+                continue;
+            const size_t n = std::min(written[i].size(), written[i + 1].size());
+            for (size_t b = 0; b < n; ++b)
+                if (written[i][b] & written[i + 1][b])
+                    ++hotBytes[static_cast<uint32_t>(b & ~0x0Fu)];
+        }
+        std::vector<std::pair<size_t, uint32_t>> hot(hotBytes.begin(), hotBytes.end());
+        std::sort(hot.begin(), hot.end(), std::greater<>());
+        std::printf("\nwhere the overlaps are (16-byte blocks, most frequent first):\n");
+        for (size_t i = 0; i < hot.size() && i < 12u; ++i)
+            std::printf("    0x%06x  overlaps in %zu of the %zu overlapping pairs\n", hot[i].second, hot[i].first,
+                        overlapPairs);
+        const Range *a = ranked.size() > 0 ? &ranked[0].second : nullptr;
+        const Range *b = ranked.size() > 1 ? &ranked[1].second : nullptr;
+        if (a != nullptr && b != nullptr)
+            std::printf("\nthe two busiest programs %s\n",
+                        (a->hi < b->lo || b->hi < a->lo) ? "write disjoint ranges - plausible to run in parallel"
+                                                        : "OVERLAP - not independent as they stand");
+        return 0;
+    }
+
     size_t mismatches = 0;
     double seconds = 0.0;
     // Per-program VU1 time, so the cost can be read by *what* is being run rather
