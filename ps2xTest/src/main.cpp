@@ -23,6 +23,16 @@ void reset_ps2_test_function_table();
 
 int main()
 {
+    // The GS tests check the CPU rasterizer's behaviour (VRAM straight after a
+    // draw, its texture and blend paths). The port defaults to the GPU renderer
+    // since 37b0bd4, which silently moved these tests onto it and failed 25 of
+    // them; pin the CPU renderer unless PS2X_GS_GPU is already set.
+#if defined(_WIN32)
+    if (std::getenv("PS2X_GS_GPU") == nullptr)
+        _putenv_s("PS2X_GS_GPU", "0");
+#else
+    setenv("PS2X_GS_GPU", "0", 0);
+#endif
     MiniTest::BeforeEach(reset_ps2_test_function_table);
 
     register_code_generator_tests();
