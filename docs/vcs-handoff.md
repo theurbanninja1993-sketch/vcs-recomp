@@ -1,8 +1,8 @@
 # GTA Vice City Stories (SLUS_215.90) recomp: handoff notes
 
-State as of 2026-10-17 (last commit `50e1556`, and the launcher is its own repo at
-`11245ef`). Read this before changing anything. A reviewer will check work against
-it.
+State as of 2026-10-17 (`vcs-bringup` is `9b42cc6`; the `release` branch players build
+from is `f4a8c39` = `stories-v0.1.1`, and the launcher is its own repo at `8211126`).
+Read this before changing anything. A reviewer will check work against it.
 
 ## If you are reviewing this
 
