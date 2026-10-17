@@ -162,6 +162,11 @@ struct ProgramHeader
 extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
 // Present only in -fprofile-generate builds.
 extern "C" void __gcov_dump(void) __attribute__((weak));
+// And clang's equivalent, which both of its profiling modes provide. The port is
+// built with clang on Windows, and until this was here an instrumented Windows run
+// created an empty .profraw and stopped there: the exit below asked GCC's runtime
+// to dump and nobody asked clang's.
+extern "C" void __llvm_profile_write_file(void) __attribute__((weak));
 extern std::atomic<int> g_ps2GsWorkerTid; // gs_threaded_backend.cpp
 // Async VIF1: FBRST snapshot taken on the EE thread, and VU1 stop bits the
 // worker defers to the EE thread (bit 31 = pending).
@@ -1174,6 +1179,11 @@ bool PS2Runtime::syncCoreSubsystems()
                                          std::fwrite(m_memory.getVU1Data(), 1, PS2_VU1_DATA_SIZE, recordTo);
                                          if (recordTo == s_learn)
                                              std::fflush(s_learn);
+                                             // The capture is written with fwrite and only closed when it fills, so a run
+                                             // that ends first - which is what PS2X_EXIT_AFTER_FRAME does - went through
+                                             // _Exit with the buffer still in libc, and the file came out empty.
+                                             if (recordTo == s_capture)
+                                                 std::fflush(s_capture);
                                      }
                                      if (capture)
                                      {
@@ -3906,6 +3916,8 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
                     writePcSamples();
                     if (__gcov_dump)
                         __gcov_dump();
+                    if (__llvm_profile_write_file)
+                        __llvm_profile_write_file();
                     std::_Exit(0);
                 }
             }
