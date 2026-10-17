@@ -89,6 +89,11 @@ public:
         std::ostringstream o;
         o << "static int vu1p_" << std::hex << key << std::dec << "(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n"
           << "    using J = VU1Jit;\n    VU1State &S = J::st(vu);\n    uint32_t jumpTarget = 0;\n    uint64_t cyc = J::now(vu);\n"
+          << "    // A run does not change the VU's data pointer or its size, so the address\n"
+          << "    // arithmetic below uses these instead of re-reading them per access.\n"
+          << "    uint8_t *const vuData = J::data(vu);\n"
+          << "    const uint32_t vuDataSize = J::dataSize(vu);\n"
+          << "    const uint32_t vuDataMask = vuDataSize - 1u;\n"
           << (m_skipsFlags ? "    J::noteFlagless(vu);\n" : "")
           << "    switch (S.pc)\n    {\n    case " << m_start << "u: goto L_" << m_start
           << ";\n    default: return VU1CompiledContinue;\n    }\n";
@@ -1014,16 +1019,16 @@ private:
         const uint32_t branchTarget = (pc + 8u + static_cast<uint32_t>(imm * 8)) & 0x3FFFu;
         auto addr = [&](const std::string &base) -> std::string
         {
-            return "uint32_t a = (" + base + ") * 16u; a &= (J::dataSize(vu) - 1u);";
+            return "uint32_t a = (" + base + ") * 16u; a &= vuDataMask;";
         };
         auto load = [&](const std::string &base, uint32_t reg)
         {
-            o << "        { " << addr(base) << " if (a + 16u <= J::dataSize(vu)) { float t[4]; std::memcpy(t, J::data(vu) + a, 16); J::applyDest<"
+            o << "        { " << addr(base) << " if (a + 16u <= vuDataSize) { float t[4]; std::memcpy(t, vuData + a, 16); J::applyDest<"
               << dest << ">(S.vf[" << reg << "], t); } }\n";
         };
         auto storeVf = [&](const std::string &base, uint32_t reg)
         {
-            o << "        { " << addr(base) << " if (a + 16u <= J::dataSize(vu)) { uint32_t w[4]; std::memcpy(w, S.vf[" << reg
+            o << "        { " << addr(base) << " if (a + 16u <= vuDataSize) { uint32_t w[4]; std::memcpy(w, S.vf[" << reg
               << "], 16); J::store(vu, cyc, a, w, " << dest << "u); } }\n";
         };
         const std::string imm11 = std::to_string(imm);
@@ -1039,7 +1044,7 @@ private:
         {
             const uint32_t comp = (dest & 8u) ? 0u : (dest & 4u) ? 1u : (dest & 2u) ? 2u : 3u;
             o << "        { " << addr("static_cast<uint32_t>(static_cast<int32_t>(S.vi[" + std::to_string(viS) + "] + (" + imm11 + ")))")
-              << " if (a + 16u <= J::dataSize(vu)) { uint32_t v; std::memcpy(&v, J::data(vu) + a + " << comp * 4u << ", 4);";
+              << " if (a + 16u <= vuDataSize) { uint32_t v; std::memcpy(&v, vuData + a + " << comp * 4u << ", 4);";
             if (viT != 0u)
                 o << " S.vi[" << viT << "] = static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFFu));";
             o << " (void)v; } }\n";
@@ -1047,7 +1052,7 @@ private:
         }
         case 0x05u: // ISW
             o << "        { " << addr("static_cast<uint32_t>(static_cast<int32_t>(S.vi[" + std::to_string(viS) + "] + (" + imm11 + ")))")
-              << " if (a + 16u <= J::dataSize(vu)) { const uint32_t v = static_cast<uint16_t>(S.vi[" << viT
+              << " if (a + 16u <= vuDataSize) { const uint32_t v = static_cast<uint16_t>(S.vi[" << viT
               << "] & 0xFFFF); const uint32_t w[4] = {v, v, v, v}; J::store(vu, cyc, a, w, " << dest << "u); } }\n";
             return;
         case 0x08u: // IADDIU
