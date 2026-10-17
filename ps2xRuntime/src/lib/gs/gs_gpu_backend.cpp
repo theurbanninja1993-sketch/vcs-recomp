@@ -378,10 +378,36 @@ void GSGpuBackend::RequestSynthesis(double displayTime)
             m_synthResultWidth = w;
             m_synthResultHeight = h;
             ++m_synthResultSeq;
+            // Swapped, not copied: the renderer ends up holding the buffer this one
+            // had, and fills it again next round.
+            m_synthResultPixelsValid = false;
+            if (m_renderer != nullptr)
+            {
+                uint32_t pw = 0, ph = 0;
+                bool pvalid = false;
+                std::vector<uint8_t> &pixels = m_renderer->synthPixels(pw, ph, pvalid);
+                if (pvalid && pw == w && ph == h)
+                {
+                    m_synthResultPixels.swap(pixels);
+                    m_synthResultPixelsValid = true;
+                }
+            }
         }
         m_synthInFlight.store(false);
     };
     enqueue(std::move(command), true);
+}
+
+bool GSGpuBackend::LatestSynthesisPixels(std::vector<uint8_t> &pixels)
+{
+    std::lock_guard<std::mutex> lock(m_synthResultMutex);
+    if (!m_synthResultPixelsValid)
+    {
+        pixels.clear();
+        return false;
+    }
+    pixels = m_synthResultPixels; // the host uploads it straight away
+    return true;
 }
 
 bool GSGpuBackend::LatestSynthesis(uint32_t &texture, uint32_t &width, uint32_t &height, uint64_t &seq)

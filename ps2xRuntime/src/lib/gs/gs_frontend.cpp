@@ -864,6 +864,11 @@ bool GS::latestSynthesis(uint32_t &texture, uint32_t &width, uint32_t &height, u
     return m_backend && m_backend->LatestSynthesis(texture, width, height, seq);
 }
 
+bool GS::latestSynthesisPixels(std::vector<uint8_t> &pixels)
+{
+    return m_backend && m_backend->LatestSynthesisPixels(pixels);
+}
+
 uint32_t GS::synthesizeFrame(float phase, uint32_t &outWidth, uint32_t &outHeight)
 {
     outWidth = 0;

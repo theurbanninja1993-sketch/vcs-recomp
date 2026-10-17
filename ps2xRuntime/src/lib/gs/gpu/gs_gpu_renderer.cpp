@@ -4137,6 +4137,26 @@ void main()
         }
         outWidth = rw;
         outHeight = rh;
+        // If the host cannot see our textures, come back as pixels instead. The host
+        // draws the frame with its own context, so a texture we own is a name it
+        // cannot resolve - which is why interpolation does not work on Windows today.
+        // PS2X_INTERP_READBACK=1 forces this route anywhere, for testing it on Linux
+        // where the share does work.
+        m_synthPixelsValid = false;
+        static const bool s_forceReadback = std::getenv("PS2X_INTERP_READBACK") != nullptr;
+        if (!m_context.sharedWithHost() || s_forceReadback)
+        {
+            const size_t bytes = static_cast<size_t>(rw) * rh * 4u;
+            m_synthPixels.resize(bytes);
+            gl.glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+            gl.glPixelStorei(GL_PACK_ALIGNMENT, 4);
+            gl.glGetTextureSubImage(m_synthTexture[m_synthIndex], 0, 0, 0, 0, static_cast<GLsizei>(rw),
+                                    static_cast<GLsizei>(rh), 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                                    static_cast<GLsizei>(bytes), m_synthPixels.data());
+            m_synthPixelsWidth = rw;
+            m_synthPixelsHeight = rh;
+            m_synthPixelsValid = true;
+        }
         return m_synthTexture[m_synthIndex];
     }
 

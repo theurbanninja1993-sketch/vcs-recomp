@@ -3528,7 +3528,11 @@ void PS2Runtime::run()
             }
             s_synthMs = 0.0;
         }
-        float synthPhase = -1.0f;
+                // The synthesized frame as pixels, when this platform cannot be handed a
+        // texture - filled below, used when the draw happens.
+        static std::vector<uint8_t> s_synthPixels;
+        s_synthPixels.clear();
+float synthPhase = -1.0f;
         // Every frame is synthesized when interpolating: the display runs one
         // picture behind the game, and each host frame shows the position
         // between the previous picture and the current one. The phase sweeps
@@ -3569,10 +3573,51 @@ void PS2Runtime::run()
                 uint64_t seq = 0;
                 if (!m_gs.latestSynthesis(synthTexture, synthWidth, synthHeight, seq))
                     synthTexture = 0;
+                // Where the renderer cannot hand a texture over - its context cannot be
+                // shared on Windows - the frame arrives as pixels instead and is uploaded
+                // below. Both calls describe the same latest frame; pixels win when present.
+                                if (!m_gs.latestSynthesisPixels(s_synthPixels))
+                    s_synthPixels.clear();
             }
             s_synthMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - synthStart).count();
-            if (synthTexture != 0u && synthWidth != 0u && synthHeight != 0u)
+                        if (!s_synthPixels.empty() && synthWidth != 0u && synthHeight != 0u)
             {
+                // Pixels, not a texture: upload into a host texture sized to match exactly,
+                // which is what the composed frames do on this platform too.
+                static Texture2D s_synthTex{};
+                if (s_synthTex.id != 0 && (s_synthTex.width != static_cast<int>(synthWidth) ||
+                                           s_synthTex.height != static_cast<int>(synthHeight)))
+                {
+                    UnloadTexture(s_synthTex);
+                    s_synthTex.id = 0;
+                }
+                if (s_synthTex.id == 0)
+                {
+                    Image blank = GenImageColor(static_cast<int>(synthWidth), static_cast<int>(synthHeight), BLANK);
+                    s_synthTex = LoadTextureFromImage(blank);
+                    UnloadImage(blank);
+                }
+                if (s_synthPixels.size() == static_cast<size_t>(synthWidth) * synthHeight * 4u)
+                {
+                                        {
+                        static bool s_reported = false;
+                        if (!s_reported)
+                        {
+                            s_reported = true;
+                            std::cerr << "[gs] frame interp: synthesized frames arrive as pixels (this platform "
+                                         "cannot share the GL context), uploaded at " << synthWidth << "x"
+                                      << synthHeight << std::endl;
+                        }
+                    }
+UpdateTexture(s_synthTex, s_synthPixels.data());
+                    presentDraw = s_synthTex;
+                    drewSynth = true;
+                    presentWidth = synthWidth;
+                    presentHeight = synthHeight;
+                }
+            }
+            else if (synthTexture != 0u && synthWidth != 0u && synthHeight != 0u)
+{
                 {
                     static bool s_reported = false;
                     if (!s_reported)

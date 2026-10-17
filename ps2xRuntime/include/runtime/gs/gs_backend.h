@@ -42,6 +42,15 @@ public:
     // one. The host then never waits on a busy render thread - it shows the
     // latest result, repeating it for a frame at worst.
     virtual void RequestSynthesis(double displayTime) { (void)displayTime; }
+    // The same frame as pixels, for a host that cannot be handed a texture - see
+    // the note in gs_gpu_renderer.h. Empty (`false`) means the texture route is in
+    // use, which is every backend that is not the GPU one and every platform where
+    // the contexts share. A default here so no other backend needs to know.
+    virtual bool LatestSynthesisPixels(std::vector<uint8_t> &pixels)
+    {
+        pixels.clear();
+        return false;
+    }
     virtual bool LatestSynthesis(uint32_t &texture, uint32_t &width, uint32_t &height, uint64_t &seq)
     {
         (void)texture;

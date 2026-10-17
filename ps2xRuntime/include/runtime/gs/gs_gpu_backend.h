@@ -84,6 +84,7 @@ public:
     uint32_t SynthesizeFrame(float phase, uint32_t &width, uint32_t &height) override;
     void RequestSynthesis(double displayTime) override;
     bool LatestSynthesis(uint32_t &texture, uint32_t &width, uint32_t &height, uint64_t &seq) override;
+    bool LatestSynthesisPixels(std::vector<uint8_t> &pixels) override;
 
     bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
     uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
@@ -98,6 +99,8 @@ private:
     std::atomic<bool> m_synthInFlight{false};
     std::mutex m_synthResultMutex;
     uint32_t m_synthResultTexture = 0, m_synthResultWidth = 0, m_synthResultHeight = 0;
+    std::vector<uint8_t> m_synthResultPixels; // non-empty when the host gets pixels, not a texture
+    bool m_synthResultPixelsValid = false;
     uint64_t m_synthResultSeq = 0;
     enum class CommandType : uint8_t
     {

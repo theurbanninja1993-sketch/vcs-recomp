@@ -157,6 +157,9 @@ public:
     // plain picture).
     void requestSynthesis(double displayTime);
     bool latestSynthesis(uint32_t &texture, uint32_t &width, uint32_t &height, uint64_t &seq);
+    // The same frame as pixels, when the platform cannot share GL contexts (see
+    // gs_gpu_renderer.h). False and an empty buffer when the texture route is used.
+    bool latestSynthesisPixels(std::vector<uint8_t> &pixels);
 
     // Hands the latched frame to the caller (no copy when it is already packed
     // at its width, which the upscaled GPU path always is), so this is not

@@ -66,6 +66,15 @@ namespace gsgpu
             m_synthDisplayTime = 0.0;
             return texture;
         }
+        // The synthesized frame as pixels, for a host that cannot see our textures.
+        // `valid` is false whenever the texture route was used instead.
+        std::vector<uint8_t> &synthPixels(uint32_t &outWidth, uint32_t &outHeight, bool &valid)
+        {
+            outWidth = m_synthPixelsWidth;
+            outHeight = m_synthPixelsHeight;
+            valid = m_synthPixelsValid;
+            return m_synthPixels;
+        }
         bool clearFramebuffer(const GSContext &context, uint32_t rgba);
         uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
 
@@ -398,6 +407,13 @@ namespace gsgpu
         // draw of it has even executed - the draw then shows a later frame, or a
         // partly rewritten one.
         static constexpr int kSynthRing = 6;
+        // A synthesized frame comes back as pixels when the host's context cannot
+        // be shared - on Windows the driver refuses, so handing over a texture would
+        // be handing over a name the host's context cannot see. Same route the
+        // composed frames already take. Sized drawWidth*drawHeight*4.
+        std::vector<uint8_t> m_synthPixels;
+        uint32_t m_synthPixelsWidth = 0, m_synthPixelsHeight = 0;
+        bool m_synthPixelsValid = false;
         GLuint m_synthTexture[kSynthRing] = {}, m_synthFramebuffer[kSynthRing] = {};
         uint32_t m_synthWidth = 0, m_synthHeight = 0;
         double m_synthDisplayTime = 0.0; // > 0: the phase is for this moment
