@@ -123,6 +123,46 @@ Still open, in order of what they are worth:
 - **The VU cost itself** (~72% of a core here, more there). Real, deep, and the only
   thing that moves the laptop's ceiling rather than its headroom.
 
+### The window-present path, and why it is not just a blit
+
+The share refusal looks like it ought to have an easy answer. A window's back buffer
+belongs to its DC, not to a context, and on Windows the renderer *already* creates
+its context on the host's DC - `publishHostGlContext` publishes `GetDC(hwnd)` for
+exactly that reason, and the private-window fallback is only for when the DC itself
+refuses. So a renderer context current on that DC can draw into the window's back
+buffer with no share at all: blit the composed frame to framebuffer 0, let the host
+draw its overlay on top, swap once. The diagnostic already proved the half that
+looked doubtful - "4.6 core works on this DC when unshared".
+
+Working the sequencing through, two things make it more than a blit, and both come
+from the same place: **the swap rotates the back buffer, and only the renderer can
+redraw the game frame into the new one.**
+
+1. **Every host frame needs its own blit.** The renderer composes at the game's rate
+   (60); the host presents at up to 240. On the readback path the host redraws the
+   same latched texture into each new back buffer, which is fine because a texture
+   can be drawn any number of times. A blit cannot: after a swap the new back buffer
+   holds what was there two frames ago, so a frame blitted once is shown once and
+   then replaced by stale content. The renderer therefore has to blit once per *host*
+   frame, which means the host drives it.
+2. **Which means a handshake, not a flag.** The host has to ask and *wait* for the
+   blit before drawing its own overlay, or a blit landing between the overlay draw
+   and the swap wipes the overlay. A "do not blit while I draw" flag does not close
+   it: a blit already issued still completes.
+
+So the shape is: at the point where the host draws the frame today, publish a request
+and wait - bounded, with the frame from the readback path as the fallback if it is not
+answered; the renderer's thread blits the newest composed frame to framebuffer 0 and
+acknowledges; the host draws its overlay with no background clear and swaps. Worst
+case the host ends up running at the game's rate, which on Windows is 60 anyway
+(interpolation needs the share and cannot run there), so there is nothing to lose at
+the top.
+
+That is a change to the threading contract of the present path rather than a change
+of destination, which is why it wants hardware and a second pair of eyes in front of
+it - and why the asynchronous readback is worth doing first: nothing can block it, and
+it removes the stall, which is half the measured cost.
+
 ## Layout (project root `/mnt/2TBSSD/projects/Vice City Stories Recomp`)
 
 | Path | What |
