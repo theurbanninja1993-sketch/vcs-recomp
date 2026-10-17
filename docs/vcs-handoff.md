@@ -178,6 +178,41 @@ Solid regardless, because these are from single builds:
   handshake waiting, and with a synchronous GS it includes the GS work. The replay
   figure is the honest measure of the emulation itself.
 
+### What the VU1 cost is not (measured by ablation)
+
+Seven variants, each with one piece switched off, min of six interleaved runs, one build
+basis (PGO off, so these are conservative), against a gameplay capture whose baseline is
+38.3 us a call and 2359 emulated cycles a call:
+
+| switched off | effect | usable? |
+|---|---|---|
+| the per-instruction pipeline commit | 1.6% faster | yes |
+| the register marks (VF/VI/ACC ready) | 0.7% | yes, and mismatches=0 |
+| the per-instruction budget check | 1.1% | yes, mismatches=0 |
+| the pipeline stall on a read | 1.9% | no, the run diverged |
+| the FMAC 80-bit exact path | 1.4% | yes, mismatches=0 |
+| the flag commit (`syncFlags`) | 15% faster | **no** - it ran 45% fewer cycles |
+| the branch-backup clear | 8.5% slower | no, the run diverged |
+
+Every identifiable per-instruction component is worth about 1%; all of them together are
+roughly 6%. **There is no hot line to remove.** Note the first row: ablating the *entire*
+pipeline commit moves 1.6% while the RIP profiler attributed 39% of VU1 to it. That is
+the second time the sampler's line attribution pointed somewhere wrong - the first cost
+a day chasing the present path - so **trust the ablations over the profile.** Two of the
+clean results are clean because of the file's own design (the tool hands the VU a huge
+budget; normal values take the plain float route), which also says the 80-bit
+recomputation is dead weight on normal data - worth 1.4% at most, not the prize.
+
+**The shape is what matters.** Two generated programs are 99.5% of VU1 time on gameplay
+(62.7% and 36.8%), at 15.0 and 19.2 ns per emulated cycle; the other ten are rounding.
+The cost is spread evenly over the instructions of those two rather than concentrated -
+~17 ns per emulated VU cycle, about 50-60 host cycles per emulated instruction, and about
+42% of one core here at 60 fps. On the owner's laptop, roughly twice as slow per core,
+that is the 83%-of-a-core that makes the frame VU1-shaped. **A 1.5x VU1 speedup would put
+that laptop at 60** - and since no single component is worth more than 2%, it needs a
+systemic change (VU1 across threads, or a generator that keeps VU state in registers
+instead of in memory), not another pass of micro-optimisation.
+
 **And there is an unexplained factor of five.** The tool binary that was sitting in
 `build/` before any of this replayed each of these captures at **7.5-8.2 us a call**;
 every build made from the current source since replays the *same files* at **42-49 us**
