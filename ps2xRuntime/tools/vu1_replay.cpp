@@ -145,6 +145,8 @@ int main(int argc, char **argv)
     // Counters for the per-cycle comparison with the game's perf log.
     extern std::atomic<uint64_t> g_vuRunCycles[2], g_vuRunCalls[2];
     const uint64_t cyclesBefore = g_vuRunCycles[1].load();
+    extern std::atomic<uint64_t> g_vuRunMicros[2];
+    const uint64_t microsBefore = g_vuRunMicros[1].load();
     const uint64_t callsBefore = g_vuRunCalls[1].load();
     for (int pass = 0; pass < passes; ++pass)
     {
@@ -194,6 +196,23 @@ int main(int argc, char **argv)
                         static_cast<unsigned long long>(cycles), static_cast<unsigned long long>(vuCalls),
                         static_cast<double>(cycles) / static_cast<double>(vuCalls), seconds * 1e6 / static_cast<double>(vuCalls),
                         seconds * 1e9 / static_cast<double>(cycles));
+    }
+    {
+        // VU1's own host time, which is *not* what `seconds` above measures.
+        //
+        // `execute()` returns only after the XGKICK output has been handed to a
+        // real GS backend, so `seconds` is the cost of the VU1 work *and* the GS
+        // work that consumes its output: a profile of this tool is dominated by
+        // gsgpu::Renderer::* rather than by the generated VU1 programs. Timing the
+        // VU1 emulation alone has to come from the runtime's own counter, and this
+        // is the figure that lines up with the game's perf log, whose vu1Ms is the
+        // same quantity measured inside the running game.
+        extern std::atomic<uint64_t> g_vuRunMicros[2];
+        const uint64_t micros = g_vuRunMicros[1].load() - microsBefore;
+        const uint64_t vuCalls = g_vuRunCalls[1].load() - callsBefore;
+        if (vuCalls != 0u)
+            std::printf("vu1Only: us/call=%.2f total=%.3fs  (execute()=%.1f us/record includes the GS)\n",
+                        static_cast<double>(micros) / static_cast<double>(vuCalls), micros / 1e6, seconds * 1e6 / static_cast<double>(records.size() * passes));
     }
     if (profilePath)
     {
