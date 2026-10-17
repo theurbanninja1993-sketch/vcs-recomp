@@ -58,10 +58,21 @@ say() { printf '%s\n' "$*"; }
 # Clears a platform folder before writing it, but keeps config/: that is the
 # player's settings, and re-running this script to update a build must not
 # throw them away.
+# Only a folder this script made (it carries a marker) or an empty one is
+# cleared: --out pointed somewhere unexpected (a home folder that happens to
+# have a "linux" directory) must not lose unrelated files.
 reset_dest() {
-    local dest="$1"
+    local dest="$1" marker=".ps2x-portable-build"
     mkdir -p "$dest"
-    find "$dest" -mindepth 1 -maxdepth 1 ! -name config -exec rm -rf {} +
+    # A build made before the marker existed is recognised by its executable.
+    if [ -n "$(ls -A "$dest")" ] && [ ! -e "$dest/$marker" ] && [ ! -e "$dest/ps2EntryRunner" ] &&
+        [ ! -e "$dest/ps2EntryRunner.exe" ]; then
+        echo "refusing to clear $dest: it has files this script did not put there" >&2
+        echo "(choose an empty --out, or delete the folder first)" >&2
+        exit 1
+    fi
+    find "$dest" -mindepth 1 -maxdepth 1 ! -name config ! -name "$marker" -exec rm -rf {} +
+    : > "$dest/$marker"
 }
 
 # Assets the port reads from its own folder (see ps2ExecutableDirectory users).
