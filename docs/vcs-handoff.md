@@ -32,9 +32,14 @@ heavy AI assistance, which the READMEs state plainly.
 - **Never `git push`** without the owner's explicit OK. Commit locally on
   `main` in `PS2Recomp/`, one logical change per commit, with a message that
   says what changed, why, and how it was verified.
-- **Never commit `ps2xRuntime/src/runner/register_functions.cpp`.** It's the
-  generated function registry (240k lines), and the tracked file is upstream's
-  stub. Stage files explicitly; never `git add -A`.
+- **Never stage `ps2xRuntime/src/runner/register_functions.cpp`, and never
+  `git checkout` it back either.** The tracked file is upstream's 6-line stub and the
+  build generates the real 240k-line registry into the same path, so `git status`
+  reports it as modified permanently. That is the normal state, not something to
+  clean up. Staging it commits 19 MB of generated code; reverting it leaves the
+  *next* game build with an empty function table, and nothing complains until the
+  game runs. On 2026-10-17 a clean-up pass did exactly that, and the game was
+  rebuilt from `build-pipeline/generated/register_functions.cpp`, an identical copy.
 - Never commit game code or data: generated `FUN_*.cpp`, `vcs-vu1/`, VU1/GS
   captures, ISO contents, texture packs.
 - Test runs must use a **visible window** (no `PS2X_HIDDEN_WINDOW`). The owner
