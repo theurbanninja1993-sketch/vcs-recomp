@@ -101,6 +101,39 @@ std::vector<Ps2ThreadCpu> ps2ThreadCpuTicks()
                 Ps2ThreadCpu cpu;
                 cpu.id = entry.th32ThreadID;
                 cpu.ticks = ticksOf(kernel) + ticksOf(user);
+                // Which module owns the thread's entry point, whatever else is known
+                // about it. A thread that named itself but belongs to neither us nor
+                // a library we know is the case worth naming: on the owner's Windows
+                // laptop one such thread held 58% of a core, and with no module there
+                // was nothing to go on. It cost a release cycle to find that out.
+                using NtQueryInformationThreadFn = LONG(WINAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+                static const auto s_query = []() -> NtQueryInformationThreadFn
+                {
+                    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+                    return ntdll != nullptr
+                               ? reinterpret_cast<NtQueryInformationThreadFn>(GetProcAddress(ntdll, "NtQueryInformationThread"))
+                               : nullptr;
+                }();
+                void *start = nullptr;
+                if (s_query != nullptr)
+                    s_query(thread, 9u /* ThreadQuerySetWin32StartAddress */, &start, sizeof(start), nullptr);
+                std::string module;
+                if (start != nullptr)
+                {
+                    HMODULE owner = nullptr;
+                    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           reinterpret_cast<LPCWSTR>(start), &owner) &&
+                        owner != nullptr)
+                    {
+                        wchar_t name[MAX_PATH] = {};
+                        if (GetModuleBaseNameW(GetCurrentProcess(), owner, name, MAX_PATH) > 0)
+                        {
+                            std::wstring wide(name);
+                            module.assign(wide.begin(), wide.end());
+                        }
+                    }
+                }
                 if (s_getDescription != nullptr)
                 {
                     PWSTR description = nullptr;
@@ -111,42 +144,13 @@ std::vector<Ps2ThreadCpu> ps2ThreadCpuTicks()
                         cpu.label.assign(wide.begin(), wide.end());
                     }
                 }
+                // "module:what it calls itself", or "module:id" when it does not name
+                // itself. We name every thread we create, so a module we do not know
+                // is the OS, an injected hook, the audio device or the GPU driver.
                 if (cpu.label.empty())
-                {
-                    // Not one of ours (we name every thread we create), so it is
-                    // the OS, the audio device or the GPU driver. Say which DLL
-                    // owns it: that is the difference between "a driver thread is
-                    // saturated" and "we forgot to name a thread".
-                    using NtQueryInformationThreadFn = LONG(WINAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-                    static const auto s_query = []() -> NtQueryInformationThreadFn
-                    {
-                        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-                        return ntdll != nullptr
-                                   ? reinterpret_cast<NtQueryInformationThreadFn>(GetProcAddress(ntdll, "NtQueryInformationThread"))
-                                   : nullptr;
-                    }();
-                    void *start = nullptr;
-                    if (s_query != nullptr)
-                        s_query(thread, 9u /* ThreadQuerySetWin32StartAddress */, &start, sizeof(start), nullptr);
-                    std::string module;
-                    if (start != nullptr)
-                    {
-                        HMODULE owner = nullptr;
-                        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                               reinterpret_cast<LPCWSTR>(start), &owner) &&
-                            owner != nullptr)
-                        {
-                            wchar_t name[MAX_PATH] = {};
-                            if (GetModuleBaseNameW(GetCurrentProcess(), owner, name, MAX_PATH) > 0)
-                            {
-                                std::wstring wide(name);
-                                module.assign(wide.begin(), wide.end());
-                            }
-                        }
-                    }
                     cpu.label = module.empty() ? ("thread" + std::to_string(cpu.id)) : (module + ":" + std::to_string(cpu.id));
-                }
+                else if (!module.empty())
+                    cpu.label = module + ":" + cpu.label;
                 out.push_back(std::move(cpu));
             }
             CloseHandle(thread);
