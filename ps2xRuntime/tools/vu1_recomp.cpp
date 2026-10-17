@@ -163,14 +163,30 @@ public:
         }
 
         bool dispatch = false;
-        for (uint32_t pc : m_normal)
+        // Straight-line blocks, split at the entry points a jump can reach (and the
+        // program start). Nothing else can enter a block part-way, so the block is a
+        // place where state can live in locals - which is what the register caching
+        // below will use. For now the only thing the split buys is one budget check
+        // per block instead of one per instruction.
+        const std::vector<uint32_t> normal(m_normal.begin(), m_normal.end());
+        for (size_t index = 0; index < normal.size();)
         {
-            const auto it = labelState.find(pc);
-            History history = (it != labelState.end() ? it->second : Rel::unknown()).toHistory();
-            o << "L_" << pc << ":\n    {\n";
-            dispatch |= emitInstance(o, pc, history, nullptr);
-            o << "    }\n";
+            size_t end = index + 1;
+            while (end < normal.size() && !jumpEntries.count(normal[end]))
+                ++end;
+            for (size_t i = index; i < end; ++i)
+            {
+                const uint32_t pc = normal[i];
+                const auto it = labelState.find(pc);
+                History history = (it != labelState.end() ? it->second : Rel::unknown()).toHistory();
+                m_suppressBudget = (i + 1 < end);
+                o << "L_" << pc << ":\n    {\n";
+                dispatch |= emitInstance(o, pc, history, nullptr);
+                o << "    }\n";
+            }
+            index = end;
         }
+        m_suppressBudget = false;
         if (dispatch)
         {
             o << "L_dispatch:\n    switch (jumpTarget)\n    {\n";
@@ -189,6 +205,11 @@ public:
     }
 
 private:
+    // Suppressed while emitting a straight-line block: the budget is checked once,
+    // on the block's last instruction, instead of before every one. The check only
+    // decides when the host regains control, not what the program computes, so the
+    // slice boundary moves by at most a block's worth of cycles.
+    bool m_suppressBudget = false;
     uint32_t m_codeSize = PS2_VU1_CODE_SIZE;
 
     enum class Context
@@ -502,7 +523,8 @@ private:
         const std::string exitCode = ctx == Context::BranchDelay
                                          ? "return J::exitInDelaySlot(vu, cyc, " + std::to_string(pc) + "u, taken, target);"
                                          : "return J::exitAt(vu, cyc, " + std::to_string(pc) + "u);";
-        o << "        if (J::atBudget(vu, cyc, budgetEnd)) " << exitCode << "\n";
+        if (!m_suppressBudget)
+            o << "        if (J::atBudget(vu, cyc, budgetEnd)) " << exitCode << "\n";
 
         // Stall until operands are ready (calculatePairReadyCycle).
         std::ostringstream ready;
