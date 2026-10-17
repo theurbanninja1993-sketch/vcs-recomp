@@ -242,6 +242,112 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    // PS2X_VU1_SCHEDULE=1: simulate an in-order, out-of-order-completion parallel
+    // runner over the captured workload, using each record's real write set and its
+    // real VU1 duration, and report the speedup against running them serially.
+    //
+    // This is an upper bound and worth knowing it: it enforces write-after-write only.
+    // A consumer that *reads* what an earlier program wrote is invisible to it, and
+    // that handshake is exactly what a double-buffered VU1 stream is full of, so the
+    // real design will do worse. If the bound is not comfortably above the ~1.45x
+    // this machine needs, there is no point building it.
+    if (std::getenv("PS2X_VU1_SCHEDULE") != nullptr)
+    {
+        struct Job
+        {
+            std::vector<uint8_t> writes;
+            double seconds = 0.0;
+        };
+        extern std::atomic<uint64_t> g_vuRunMicros[2];
+        std::vector<Job> jobs(records.size());
+        for (size_t i = 0; i < records.size(); ++i)
+        {
+            const Record &r = records[i];
+            Job &job = jobs[i];
+            job.writes.assign(r.vu0 ? 0u : r.dataBefore.size(), 0u);
+            if (!r.vu0 && r.dataBefore.size() == r.dataAfter.size())
+                for (size_t b = 0; b < job.writes.size(); ++b)
+                    job.writes[b] = r.dataBefore[b] != r.dataAfter[b] ? 1u : 0u;
+            uint8_t *const code = r.vu0 ? memory.getVU0Code() : memory.getVU1Code();
+            uint8_t *const data = r.vu0 ? memory.getVU0Data() : memory.getVU1Data();
+            if (std::memcmp(code, r.code.data(), r.codeSize) != 0)
+            {
+                std::memcpy(code, r.code.data(), r.codeSize);
+                if (r.vu0)
+                    memory.markVU0CodeModified();
+                else
+                    memory.markVU1CodeModified();
+            }
+            std::memcpy(data, r.dataBefore.data(), r.dataSize);
+            VU1Interpreter &vu = r.vu0 ? vu0 : vu1;
+            vu.state() = r.before;
+            vu.clearRanFlagless();
+            const uint64_t before = g_vuRunMicros[r.vu0 ? 0 : 1].load(std::memory_order_relaxed);
+            vu.execute(code, r.codeSize, data, r.dataSize, gs, &memory, r.startPC, r.top, r.itop, 65536);
+            job.seconds = static_cast<double>(g_vuRunMicros[r.vu0 ? 0 : 1].load(std::memory_order_relaxed) - before) / 1e6;
+        }
+        double serial = 0.0;
+        for (const Job &job : jobs)
+            serial += job.seconds;
+        const auto conflict = [&](size_t a, size_t b)
+        {
+            const size_t n = std::min(jobs[a].writes.size(), jobs[b].writes.size());
+            for (size_t i = 0; i < n; ++i)
+                if (jobs[a].writes[i] & jobs[b].writes[i])
+                    return true;
+            return false;
+        };
+        std::printf("\nparallel schedule over %zu records, serial VU1 time %.4f s\n", jobs.size(), serial);
+        for (const int workers : {2, 3, 4, 6})
+        {
+            std::vector<char> started(jobs.size(), 0);
+            std::vector<double> remaining(jobs.size(), 0.0);
+            std::vector<size_t> running;
+            double now = 0.0;
+            for (;;)
+            {
+                bool progress = true;
+                while (progress && static_cast<int>(running.size()) < workers)
+                {
+                    progress = false;
+                    for (size_t i = 0; i < jobs.size(); ++i)
+                    {
+                        if (started[i] != 0)
+                            continue;
+                        bool blocked = false;
+                        for (const size_t j : running)
+                            if (conflict(j, i))
+                                blocked = true;
+                        if (blocked)
+                            break; // in order: this one must go first
+                        started[i] = 1;
+                        remaining[i] = jobs[i].seconds;
+                        running.push_back(i);
+                        progress = true;
+                        break;
+                    }
+                }
+                if (running.empty())
+                    break;
+                double step = 1e300;
+                for (const size_t j : running)
+                    step = std::min(step, remaining[j]);
+                now += step;
+                for (size_t k = 0; k < running.size();)
+                {
+                    remaining[running[k]] -= step;
+                    if (remaining[running[k]] <= 1e-12)
+                        running.erase(running.begin() + static_cast<std::ptrdiff_t>(k));
+                    else
+                        ++k;
+                }
+            }
+            std::printf("    %d workers: %.4f s  ->  %.2fx (bound, write-after-write only)\n", workers, now,
+                        now > 0.0 ? serial / now : 0.0);
+        }
+        return 0;
+    }
+
     size_t mismatches = 0;
     double seconds = 0.0;
     // Per-program VU1 time, so the cost can be read by *what* is being run rather
