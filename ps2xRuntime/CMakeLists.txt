@@ -468,9 +468,16 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set(PS2X_PGO_GENERATE_LINK_FLAGS -fprofile-generate=${PS2X_PGO_DIR})
     set(PS2X_PGO_USE_FLAGS -fprofile-use=${PS2X_PGO_DIR} -fprofile-correction -fprofile-partial-training -Wno-missing-profile -Wno-coverage-mismatch)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    set(PS2X_PGO_GENERATE_FLAGS -fprofile-instr-generate)
-    set(PS2X_PGO_GENERATE_LINK_FLAGS -fprofile-instr-generate)
-    set(PS2X_PGO_USE_FLAGS -fprofile-instr-use=${PS2X_PGO_DIR}/default.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled)
+    # -fprofile-generate, not -fprofile-instr-generate. The front-end mode registers
+    # its counters object by object through constructors, and on the llvm-mingw cross
+    # build those registrations do not survive into the executable: the profile
+    # runtime links, initialises, creates the file, and then reports "Total
+    # functions: 0". The IR mode puts its counters in a section the runtime walks
+    # directly, so it does not depend on any of that. Same LLVM_PROFILE_FILE, same
+    # llvm-profdata merge, same default.profdata.
+    set(PS2X_PGO_GENERATE_FLAGS -fprofile-generate)
+    set(PS2X_PGO_GENERATE_LINK_FLAGS -fprofile-generate)
+    set(PS2X_PGO_USE_FLAGS -fprofile-use=${PS2X_PGO_DIR}/default.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled)
 endif()
 if(NOT PS2X_PGO STREQUAL "off" AND DEFINED PS2X_PGO_GENERATE_FLAGS)
     foreach(PS2X_PGO_TARGET ps2_runtime ps2_iop)
