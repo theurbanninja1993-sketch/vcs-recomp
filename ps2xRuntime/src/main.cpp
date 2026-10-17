@@ -187,6 +187,15 @@ namespace
     }
 }
 
+#if defined(__clang__)
+// clang's profile runtime writes its counters on the way out, but main ends in
+// std::_Exit, which terminates without running atexit handlers - so an instrumented
+// run left a 0-byte .profraw on both Proton and Windows. Asking for the write
+// explicitly is one call and does not depend on exit ordering. The reference is weak,
+// so it does nothing at all in a build that is not instrumented.
+extern "C" void __llvm_profile_write_file(void) __attribute__((weak));
+#endif
+
 int main(int argc, char *argv[])
 {
 #if defined(__linux__)
@@ -261,7 +270,11 @@ int main(int argc, char *argv[])
 #endif
         std::cout.flush();
         std::cerr.flush();
-        std::_Exit(0);
+#if defined(__clang__)
+        if (__llvm_profile_write_file != nullptr)
+            __llvm_profile_write_file();
+#endif
+std::_Exit(0);
     }
     catch (const std::exception &e)
     {
@@ -274,5 +287,9 @@ int main(int argc, char *argv[])
 
     std::cout.flush();
     std::cerr.flush();
-    std::_Exit(1);
+#if defined(__clang__)
+    if (__llvm_profile_write_file != nullptr)
+        __llvm_profile_write_file();
+#endif
+std::_Exit(1);
 }
