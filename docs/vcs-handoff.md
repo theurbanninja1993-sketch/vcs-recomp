@@ -94,6 +94,46 @@ own at 58%. On this machine the same build runs at 60 with the driver threads at
 cores to spend. Resolution changes nothing because none of it is fill: the readback
 is capped to the window, and VU1 does not care.
 
+**Measured again with the host timing on (2026-10-17, `play-perfstats.cmd`).** Three
+things came out of one run, and the first two retire work that was next in line:
+
+- **The unnamed thread was the NVIDIA driver.** With the module named for every
+  thread, `0xdd100001` is `nvoglv64.dll:0xdd100001` (7% of a core) beside
+  `nvoglv64.dll:2912` (35%). It was never an overlay or a recorder, and no vendor
+  setting is going to remove it. `0xdd100001` is a description several of the
+  driver's threads share, which is why it looked like one thread on two ids.
+- **The host loop is a rock-steady 60 fps.** `[hosttiming] frameMs avg=16.67
+  p50=16.67 p99=16.7 max=16.9` through a busy stretch. The host draws the latched
+  frame, so a perfect host does not prove the renderer is comfortable - but the
+  renderer's thread was 13% of wall and the driver ~25%, so **the present path is
+  not the critical path.** That deprioritises both the asynchronous readback and the
+  window-present path below: neither is what the frame rate is waiting for.
+- **What it is waiting for is VU1, on one thread.** `Vu1Worker=144%` of its budget
+  with `vu1Ms=14043` in a 16.9 s interval: **83% of a full core on a single thread**,
+  while the frame itself is 28 ms. Per call, 126 us here against 47.8 us on this
+  machine - and the busy samples read 18.0, 22.6, 19.6, 26.2 fps, i.e. ~185 VU1
+  calls a frame at 126 us, which is the whole frame. The game is VU1-bound and VU1
+  is serial.
+
+**PGO does not exist on Windows, and cannot.** The CMake gate is
+`CMAKE_CXX_COMPILER_ID STREQUAL "GNU"`, so `PS2X_PGO=use` applies to the Linux build
+(GCC) and never to the Windows one (clang/llvm-mingw) - confirmed in the caches:
+`build/CMakeCache.txt: PS2X_PGO=use`, `build-win/CMakeCache.txt: PS2X_PGO=off`, and
+`-fprofile-use=...` on the Linux runtime target only. So every Windows player runs an
+unprofiled build while Linux does not. clang can do PGO; the gate is simply written
+for GCC, and collecting a profile needs an instrumented run on the target.
+
+Two smaller finds from the same run, neither urgent:
+
+- **The texture-replacement worker is enormously expensive.** A callgrind profile
+  puts 34% of its instructions in `stbi_zlib_compress` alone (it writes PNG caches).
+  It runs even with the HD pack disabled, and its own decode of what it wrote is
+  already failing on Windows (`cannot decode PNG`).
+- **`PS2X_GS_GPU_STATS` prints nothing on Windows.** Its totals come from the
+  renderer's destructor, which is evidently not reached on the normal exit path, so
+  "time: readback= draw= present=" never appears. The numbers would be useful for
+  settling the present cost; the host timing answered it instead.
+
 Two leads this file used to recommend are **dead**, measured on this machine by
 running the same scripted scene twice:
 
@@ -108,20 +148,24 @@ running the same scripted scene twice:
 
 Still open, in order of what they are worth:
 
-- **The Windows present path.** The NVIDIA driver costs about a core there against
-  ~0.06 here, and the readback is synchronous - a full flush and a driver copy every
-  frame (`glMemoryBarrier` + `glGetTextureSubImage` into a client pointer). An
-  asynchronous pixel-buffer readback is the first thing to try; it is the one route
-  left that cannot be blocked by the share refusal above.
-- **An unidentified in-process thread at 58%** of a core on the laptop. The log
-  names threads it can: ours by name, everyone else's by owning module
-  (`nvoglv64.dll:20504`). This one has a thread description and no module, so
-  something outside the port named it - an overlay or a recorder hook is the first
-  guess. Naming its module would settle it.
-- **LTO and PGO** are still untried on Windows. Neither is likely to be more than a
-  tenth, and LTO has the duplicate-symbol question in its way.
-- **The VU cost itself** (~72% of a core here, more there). Real, deep, and the only
-  thing that moves the laptop's ceiling rather than its headroom.
+- **VU1 throughput, and it is the only thing that moves the laptop's ceiling.** It is
+  the critical path - 83% of a core, on one thread, 126 us a call - and the frame is
+  VU1-shaped. Two ways in: find what the per-call cost is actually spent on, or spread
+  it over threads. The compiled/interpreted ratio being only 1.35x says the cost is
+  *shared* between the two paths rather than in the instruction dispatch, which is
+  worth knowing before optimising either. Cycles per call (`m_cycle` delta per run,
+  reported in the perf log) would say whether the emulation spends a sane number of
+  host cycles on a VU cycle or a silly number, and that is cheap to add.
+- **PGO (and LTO) for the Windows build.** The gate is GCC-only, so this is a small
+  CMake change plus a way to collect a clang profile on the target. It is a tenth-ish
+  on every Windows machine rather than a fix for this one, and the pipeline already
+  runs the game twice for the VU1 passes, which is where a profile could be collected.
+- **The Windows present path** - the asynchronous readback, and the window-present
+  design written up above. Both are real; both are now *below* the two items above,
+  because the host is already a steady 60 and the renderer's thread is 13% of wall.
+  This buys headroom, not frame rate.
+- **The texture-replacement worker**, which is expensive and writes PNGs it then
+  cannot decode.
 
 ### The window-present path, and why it is not just a blit
 
