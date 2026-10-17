@@ -449,16 +449,39 @@ endif()
 #   PS2X_PGO=use      -> rebuild with the collected profile in PS2X_PGO_DIR.
 set(PS2X_PGO "off" CACHE STRING "Runtime PGO mode: off, generate or use")
 set(PS2X_PGO_DIR "${CMAKE_BINARY_DIR}/pgo" CACHE PATH "Runtime PGO profile directory")
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT PS2X_PGO STREQUAL "off")
+# PGO for both compilers this project builds with. The gate here used to be GCC-only,
+# which meant the one platform with a performance problem - Windows, built with clang -
+# was the one platform that could not be profiled at all.
+#
+#   GCC   : -fprofile-generate=<dir> writes .gcda into the directory and
+#           -fprofile-use=<dir> reads them.
+#   clang : -fprofile-instr-generate writes .profraw where LLVM_PROFILE_FILE points at
+#           run time; -fprofile-instr-use wants the merged file, so collect with
+#           LLVM_PROFILE_FILE=<PS2X_PGO_DIR>/%p.profraw, run tools/make_pgo_profile.sh,
+#           then rebuild. llvm-mingw ships both the profile runtime and llvm-profdata.
+#
+# A profile is platform specific. The clang route usually transfers between an x86-64
+# host build and the llvm-mingw cross build of the same source, but the honest profile
+# is the one collected by running the game on the machine being built for.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set(PS2X_PGO_GENERATE_FLAGS -fprofile-generate=${PS2X_PGO_DIR} -fprofile-update=single)
+    set(PS2X_PGO_GENERATE_LINK_FLAGS -fprofile-generate=${PS2X_PGO_DIR})
+    set(PS2X_PGO_USE_FLAGS -fprofile-use=${PS2X_PGO_DIR} -fprofile-correction -fprofile-partial-training -Wno-missing-profile -Wno-coverage-mismatch)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(PS2X_PGO_GENERATE_FLAGS -fprofile-instr-generate)
+    set(PS2X_PGO_GENERATE_LINK_FLAGS -fprofile-instr-generate)
+    set(PS2X_PGO_USE_FLAGS -fprofile-instr-use=${PS2X_PGO_DIR}/default.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled)
+endif()
+if(NOT PS2X_PGO STREQUAL "off" AND DEFINED PS2X_PGO_GENERATE_FLAGS)
     foreach(PS2X_PGO_TARGET ps2_runtime ps2_iop)
         if(TARGET ${PS2X_PGO_TARGET})
             # Compiler caches don't hash profile data; always compile these.
             set_target_properties(${PS2X_PGO_TARGET} PROPERTIES CXX_COMPILER_LAUNCHER "" C_COMPILER_LAUNCHER "")
             if(PS2X_PGO STREQUAL "generate")
-                target_compile_options(${PS2X_PGO_TARGET} PRIVATE -fprofile-generate=${PS2X_PGO_DIR} -fprofile-update=single)
-                target_link_options(${PS2X_PGO_TARGET} INTERFACE -fprofile-generate=${PS2X_PGO_DIR})
+                target_compile_options(${PS2X_PGO_TARGET} PRIVATE ${PS2X_PGO_GENERATE_FLAGS})
+                target_link_options(${PS2X_PGO_TARGET} INTERFACE ${PS2X_PGO_GENERATE_LINK_FLAGS})
             elseif(PS2X_PGO STREQUAL "use")
-                target_compile_options(${PS2X_PGO_TARGET} PRIVATE -fprofile-use=${PS2X_PGO_DIR} -fprofile-correction -fprofile-partial-training -Wno-missing-profile -Wno-coverage-mismatch)
+                target_compile_options(${PS2X_PGO_TARGET} PRIVATE ${PS2X_PGO_USE_FLAGS})
             endif()
         endif()
     endforeach()
