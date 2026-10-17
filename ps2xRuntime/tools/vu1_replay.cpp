@@ -14,6 +14,7 @@
 #include <sys/time.h>
 #include <ucontext.h>
 #include <chrono>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -142,6 +143,17 @@ int main(int argc, char **argv)
 
     size_t mismatches = 0;
     double seconds = 0.0;
+    // Per-program VU1 time, so the cost can be read by *what* is being run rather
+    // than as one average over a capture. The average hides the thing that decides
+    // where to work: a program can be expensive because it is long, or because it is
+    // expensive per cycle, and those are different problems.
+    struct ProgramStat
+    {
+        uint64_t calls = 0;
+        uint64_t cycles = 0;
+        uint64_t micros = 0;
+    };
+    std::map<uint32_t, ProgramStat> byProgram;
     // Counters for the per-cycle comparison with the game's perf log.
     extern std::atomic<uint64_t> g_vuRunCycles[2], g_vuRunCalls[2];
     const uint64_t cyclesBefore = g_vuRunCycles[1].load();
@@ -168,9 +180,18 @@ int main(int argc, char **argv)
             vu.state() = r.before;
             vu.clearRanFlagless();
 
+            const uint64_t recordCycles0 = g_vuRunCycles[1].load(std::memory_order_relaxed);
+            const uint64_t recordMicros0 = g_vuRunMicros[1].load(std::memory_order_relaxed);
             const auto t0 = std::chrono::steady_clock::now();
             vu.execute(code, r.codeSize, data, r.dataSize, gs, &memory, r.startPC, r.top, r.itop, 65536);
             seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (!r.vu0)
+            {
+                ProgramStat &stat = byProgram[r.startPC];
+                ++stat.calls;
+                stat.cycles += g_vuRunCycles[1].load(std::memory_order_relaxed) - recordCycles0;
+                stat.micros += g_vuRunMicros[1].load(std::memory_order_relaxed) - recordMicros0;
+            }
 
             if (pass == 0 && (!sameState(vu.state(), r.after, vu.ranFlaglessProgram()) ||
                               std::memcmp(data, r.dataAfter.data(), r.dataSize) != 0))
@@ -213,6 +234,31 @@ int main(int argc, char **argv)
         if (vuCalls != 0u)
             std::printf("vu1Only: us/call=%.2f total=%.3fs  (execute()=%.1f us/record includes the GS)\n",
                         static_cast<double>(micros) / static_cast<double>(vuCalls), micros / 1e6, seconds * 1e6 / static_cast<double>(records.size() * passes));
+    }
+    {
+        // Ranked by total VU1 time: which programs pay for the capture, and whether
+        // they pay because they run a lot or because each cycle costs more.
+        std::vector<std::pair<double, uint32_t>> ranked;
+        for (const auto &entry : byProgram)
+            ranked.emplace_back(static_cast<double>(entry.second.micros) / passes, entry.first);
+        std::sort(ranked.begin(), ranked.end(), std::greater<>());
+        std::printf("\nper program (VU1 only, top %d of %zu):\n", std::min<size_t>(ranked.size(), 12u), ranked.size());
+        std::printf("   %-10s %8s %9s %9s %9s %8s\n", "pc", "share", "calls", "cyc/call", "us/call", "ns/cyc");
+        double total = 0.0;
+        for (const auto &entry : ranked)
+            total += entry.first;
+        for (size_t i = 0; i < ranked.size() && i < 12u; ++i)
+        {
+            const ProgramStat &stat = byProgram[ranked[i].second];
+            const uint64_t calls = stat.calls / static_cast<uint64_t>(passes);
+            const uint64_t cycles = stat.cycles / static_cast<uint64_t>(passes);
+            const double micros = static_cast<double>(stat.micros) / passes;
+            std::printf("   0x%-8x %7.1f%% %9llu %9.1f %9.2f %8.2f\n", ranked[i].second,
+                        total > 0.0 ? 100.0 * micros / total : 0.0, static_cast<unsigned long long>(calls),
+                        calls != 0u ? static_cast<double>(cycles) / static_cast<double>(calls) : 0.0,
+                        calls != 0u ? micros / static_cast<double>(calls) : 0.0,
+                        cycles != 0u ? micros * 1000.0 / static_cast<double>(cycles) : 0.0);
+        }
     }
     if (profilePath)
     {
