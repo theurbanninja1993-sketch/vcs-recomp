@@ -227,7 +227,19 @@ namespace ps2x
         }
         else
         {
-            layouts = {{2048u, 0u}, {2352u, 0u}, {2352u, 16u}, {2352u, 24u}};
+            // Every way an image can lay its sectors out, and the reader tries them
+            // in turn - the volume descriptor check is what decides, so trying more
+            // costs nothing and a wrong guess is never accepted.
+            //
+            // 2048 is a plain ISO. 2064 is a raw DVD sector (12 of sync, 4 of
+            // header, 2048 of data, 4 of EDC) - the console is a DVD one, so a raw
+            // dump of a PlayStation 2 disc looks like this. 2352 is a raw CD sector
+            // and 2448 is a CD frame with its 96 bytes of subcode, which is what
+            // `chdman extractdvd` writes when it is handed a CD-based CHD - a
+            // mistake worth reading anyway. 0/16/24 covers where a tool can have
+            // put the user data inside one.
+            layouts = {{2048u, 0u},  {2064u, 16u}, {2352u, 0u},  {2352u, 16u}, {2352u, 24u},
+                       {2448u, 0u},  {2448u, 16u}, {2448u, 24u}};
         }
 
         uint8_t pvd[2048];
