@@ -860,7 +860,9 @@ RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
     {
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            setMcCommandResultLocked(kMcCmdGetEntSpace, 1024);
+                        // Same unit and value GetInfo reports: a full 8 MB card has 8192 free
+            // clusters. 1024 here was a placeholder that under-reported it 8x.
+            setMcCommandResultLocked(kMcCmdGetEntSpace, kMcFreeClusters);
         }
         setReturnS32(ctx, 0);
     }
