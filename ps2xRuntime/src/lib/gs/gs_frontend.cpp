@@ -765,6 +765,7 @@ void GS::latchHostPresentationFrame()
 {
     GSPresentationRequest request{};
     const uint64_t inputSeq = m_gsInputSeq;
+    bool repeat = false;
     {
         std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
         if (m_privRegs && gsCaptureActive(m_backend.get(), m_localMemoryStorage != nullptr))
@@ -782,25 +783,36 @@ void GS::latchHostPresentationFrame()
         // a repeat of the picture already latched (the game renders at ~30 Hz
         // and presents at 60 Hz, so half of the presents are repeats). Skip
         // the recompose; the host keeps drawing the texture it already has (or
-        // is handed no frame, which it treats the same way).
-        if (inputSeq == m_hostPresentationInputSeq)
-            return;
-        request = buildPresentationRequestUnlocked();
-        ps2InterpEvent('L');
-        if (m_hasDisplayCamera)
+        // is handed no frame, which it treats the same way). The backend may
+        // still have a newer finished frame for it, though (below).
+        repeat = inputSeq == m_hostPresentationInputSeq;
+        if (!repeat)
         {
-            // The camera paired with the picture at the display copy.
-            request.camera = m_displayCamera;
-            request.hasCamera = true;
+            request = buildPresentationRequestUnlocked();
+            ps2InterpEvent('L');
+            if (m_hasDisplayCamera)
+            {
+                // The camera paired with the picture at the display copy.
+                request.camera = m_displayCamera;
+                request.hasCamera = true;
+            }
+            else if (g_gsCameraSampler)
+                request.hasCamera = g_gsCameraSampler(request.camera);
         }
-        else if (g_gsCameraSampler)
-            request.hasCamera = g_gsCameraSampler(request.camera);
     }
 
     PresentationFrame frame{};
     {
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
-        if (m_backend)
+        if (repeat)
+        {
+            // The queued present of the last picture (and its asynchronous
+            // readback) finish after the call that queued them returned; pick
+            // that frame up now rather than when the next picture arrives.
+            if (!m_backend || !m_backend->PollPresentation(frame))
+                return;
+        }
+        else if (m_backend)
         {
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Presentation);

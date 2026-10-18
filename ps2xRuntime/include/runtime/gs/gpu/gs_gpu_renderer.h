@@ -53,6 +53,9 @@ namespace gsgpu
         // Brings CPU local memory up to date with the GPU.
         void syncLocalMemory();
         PresentationFrame present(const GSPresentationRequest &request);
+        // The newest asynchronous presentation readback not handed over yet, if
+        // any (see m_readbackRing). Render thread.
+        bool collectPendingReadback(PresentationFrame &frame);
         // Frame interpolation: warp the last composed frame forward by half the
         // last camera motion and write it into its own texture, leaving the
         // overlays alone. Returns the texture (0 if it cannot make one). Called
@@ -223,10 +226,13 @@ namespace gsgpu
         // Rows of `target` (within its used rows) stored in [begin, end).
         bool bytesToRows(const Target &target, uint32_t begin, uint32_t end, uint32_t &y0, uint32_t &y1) const;
         void markStaleRows(Target &target, uint32_t beginByte, uint32_t endByte);
-        void loadStaleRows(Target &target);
+        // Reloads the stale rows within [needY0, needY1] (all of them by
+        // default); the rest stay stale until something needs them.
+        void loadStaleRows(Target &target, uint32_t needY0 = 0u, uint32_t needY1 = ~0u);
         // Colour target a draw can sample directly (instead of local memory)
         // for texture TBP0/TBW/PSM covering `rows`; brought up to date.
-        Target *textureSourceTarget(uint32_t tbp0, uint32_t tbw, uint32_t tpsm, uint32_t rows);
+        Target *textureSourceTarget(uint32_t tbp0, uint32_t tbw, uint32_t tpsm, uint32_t rows, uint32_t needY0,
+                                    uint32_t needY1);
         // Scaled copy of `target` for draws sampling the target they render to.
         GLuint feedbackCopy(const Target &target);
         // High-resolution version of the CPU-composed presentation frame.
@@ -438,6 +444,53 @@ namespace gsgpu
         // Downscale target for the presentation readback (see upscalePresentation).
         GLuint m_readbackTexture = 0, m_readbackFramebuffer = 0;
         uint32_t m_readbackWidth = 0, m_readbackHeight = 0;
+        // Asynchronous presentation readback: each present copies into the next
+        // pack buffer of this ring and fences it, and hands over the copy made
+        // one present earlier, which the GPU has normally finished by then. A
+        // synchronous read made the renderer wait for the whole frame on the GPU
+        // before it could submit the next one (see upscalePresentation).
+        struct ReadbackSlot
+        {
+            GLuint buffer = 0;
+            size_t capacity = 0;
+            GLsync fence = nullptr;
+            uint32_t width = 0, height = 0;
+            uint32_t displayFbp = 0;
+        };
+        ReadbackSlot m_readbackRing[3];
+        uint32_t m_readbackNext = 0;
+        void destroyReadbackRing();
+        // PS2X_GS_GPU_TIMERS=1: where the GPU's time goes. Each draw / dispatch /
+        // copy is bracketed by a GL_TIME_ELAPSED query (gpuMark ... gpuEnd), and
+        // every 300 presents the milliseconds per present each kind took on the
+        // GPU are printed. Diagnostic only.
+        enum class GpuWork : uint8_t
+        {
+            Draw,
+            Load,
+            Resolve,
+            Feedback,
+            Transfer,
+            Present,
+            Idle,
+            Count
+        };
+        void gpuMark(GpuWork work);
+        void gpuEnd();
+        bool m_gpuQueryOpen = false;
+        void gpuTimersFrameEnd();
+        bool m_gpuTimers = false;
+        GpuWork m_gpuWork = GpuWork::Idle;
+        struct GpuMark
+        {
+            GLuint query;
+            GpuWork work;
+        };
+        std::vector<GpuMark> m_gpuMarks;      // issued, oldest first
+        std::vector<GLuint> m_gpuFreeQueries;
+        double m_gpuWorkNs[static_cast<int>(GpuWork::Count)] = {};
+        uint32_t m_gpuTimerFrames = 0;
+        void takeReadback(ReadbackSlot &slot, PresentationFrame &frame);
         // Double-buffered composed display handed to the host as a texture when
         // the renderer shares the window's GL context (no readback, no upload).
         GLuint m_presentShared[2] = {0u, 0u};

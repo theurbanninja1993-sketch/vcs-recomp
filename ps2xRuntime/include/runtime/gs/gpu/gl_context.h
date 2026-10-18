@@ -97,6 +97,17 @@ namespace gsgpu
     X(PFNGLDISPATCHCOMPUTEPROC, glDispatchCompute)                         \
     X(PFNGLMEMORYBARRIERPROC, glMemoryBarrier)                             \
     X(PFNGLGETNAMEDBUFFERSUBDATAPROC, glGetNamedBufferSubData)             \
+    X(PFNGLBINDBUFFERPROC, glBindBuffer)                                   \
+    X(PFNGLMAPNAMEDBUFFERRANGEPROC, glMapNamedBufferRange)                 \
+    X(PFNGLUNMAPNAMEDBUFFERPROC, glUnmapNamedBuffer)                       \
+    X(PFNGLFENCESYNCPROC, glFenceSync)                                     \
+    X(PFNGLCLIENTWAITSYNCPROC, glClientWaitSync)                           \
+    X(PFNGLDELETESYNCPROC, glDeleteSync)                                   \
+    X(PFNGLGENQUERIESPROC, glGenQueries)                                   \
+    X(PFNGLBEGINQUERYPROC, glBeginQuery)                                   \
+    X(PFNGLENDQUERYPROC, glEndQuery)                                       \
+    X(PFNGLGETQUERYOBJECTIVPROC, glGetQueryObjectiv)                       \
+    X(PFNGLGETQUERYOBJECTUI64VPROC, glGetQueryObjectui64v)                 \
     X(PFNGLPROGRAMUNIFORM2UIPROC, glProgramUniform2ui)                     \
     X(PFNGLPROGRAMUNIFORM2IPROC, glProgramUniform2i)                       \
     X(PFNGLPROGRAMUNIFORM3UIPROC, glProgramUniform3ui)                     \

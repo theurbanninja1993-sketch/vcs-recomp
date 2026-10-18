@@ -331,15 +331,46 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
             PresentationFrame frame = m_renderer->present(request);
             std::lock_guard<std::mutex> lock(m_frameMutex);
             m_lastFrame = std::move(frame);
+            ++m_lastFrameSeq;
         };
         enqueue(std::move(command), true);
         std::lock_guard<std::mutex> lock(m_frameMutex);
+        m_lastHandedSeq = m_lastFrameSeq;
         return m_lastFrame;
     }
     PresentationFrame frame;
     runSync([&]()
             { frame = m_renderer->present(request); }, "present");
     return frame;
+}
+
+bool GSGpuBackend::PollPresentation(PresentationFrame &out)
+{
+    static const bool s_sync = std::getenv("PS2X_GS_GPU_SYNC_PRESENT") != nullptr;
+    if (s_sync)
+        return false;
+    // Collect a readback still in flight (the renderer hands each present the
+    // copy made one present earlier, so the newest picture is waiting there
+    // when the game repeats it), for the next VBlank to pick up.
+    Command command = Command::make(CommandType::Call);
+    command.payload->call = [this]()
+    {
+        PresentationFrame frame;
+        if (!m_renderer->collectPendingReadback(frame))
+            return;
+        std::lock_guard<std::mutex> lock(m_frameMutex);
+        m_lastFrame = std::move(frame);
+        ++m_lastFrameSeq;
+    };
+    enqueue(std::move(command), true);
+    // Hand over a frame finished since the caller last had one - the queued
+    // present's own result included, which used to wait for the next new picture.
+    std::lock_guard<std::mutex> lock(m_frameMutex);
+    if (m_lastHandedSeq == m_lastFrameSeq || !m_lastFrame)
+        return false;
+    m_lastHandedSeq = m_lastFrameSeq;
+    out = m_lastFrame;
+    return true;
 }
 
 uint32_t GSGpuBackend::SynthesizeFrame(float phase, uint32_t &width, uint32_t &height)

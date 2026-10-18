@@ -23,6 +23,14 @@ public:
     virtual void TextureFlush() = 0;
     virtual void Sync(GSSyncReason reason) = 0;
     virtual PresentationFrame Present(const GSPresentationRequest &request) = 0;
+    // A VBlank with nothing new to present: lets a backend whose presents
+    // finish later (queued, or read back asynchronously) hand over the newest
+    // finished frame the caller has not had yet. False: keep the current one.
+    virtual bool PollPresentation(PresentationFrame &out)
+    {
+        (void)out;
+        return false;
+    }
 
     // Frame interpolation: warp the last composed frame forward by half the last
     // camera motion and return the texture to draw (0 if it cannot make one),

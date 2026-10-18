@@ -1191,6 +1191,8 @@ void main()
             flushBatch();
             readbackVram(); // leave local memory complete for the owner
         }
+        if (m_gpu)
+            destroyReadbackRing();
         if (std::getenv("PS2X_TEXREPL_STATS") && replacementsActive())
             emitTexreplStats();
         if (std::getenv("PS2X_GS_GPU_STATS"))
@@ -1441,6 +1443,11 @@ void main()
             return;
         vramBarrierBeforeRead(); // this reads VRAM
         ++m_statLoads;
+        // PS2X_GS_LOAD_TRACE=<present>: every load of that frame, with why.
+        static const char *s_loadTrace = std::getenv("PS2X_GS_LOAD_TRACE");
+        if (s_loadTrace != nullptr && std::strtoull(s_loadTrace, nullptr, 10) == m_presentIndex)
+            std::fprintf(stderr, "[gs:load] block=0x%x bw=%u psm=0x%x depth=%d y0=%u rows=%u of %u reason=%s\n", target.block,
+                         target.bw, target.psm, target.depth ? 1 : 0, y0, rows, target.usedRows, m_syncReason);
         g_gsGpuLoads.fetch_add(1u, std::memory_order_relaxed);
         g_gsGpuLoadRows.fetch_add(rows, std::memory_order_relaxed);
         GL &gl = m_context.gl;
@@ -1466,7 +1473,9 @@ void main()
             setColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         }
         bindVao(m_emptyVao);
+        gpuMark(GpuWork::Load);
         gl.glDrawArrays(GL_TRIANGLES, 0, 3);
+        gpuEnd();
         m_framebufferWriteSinceBarrier = true;
     }
 
@@ -1547,6 +1556,12 @@ void main()
             return;
         }
         ++m_statResolves;
+        {
+            static const char *s_loadTrace = std::getenv("PS2X_GS_LOAD_TRACE");
+            if (s_loadTrace != nullptr && std::strtoull(s_loadTrace, nullptr, 10) == m_presentIndex)
+                std::fprintf(stderr, "[gs:resolve] block=0x%x bw=%u psm=0x%x depth=%d y=%u..%u reason=%s\n", target.block,
+                             target.bw, target.psm, target.depth ? 1 : 0, target.dirtyY0, target.dirtyY1, m_syncReason);
+        }
         g_gsGpuResolveRows.fetch_add(std::min(target.dirtyY1, target.height - 1u) - target.dirtyY0 + 1u,
                                      std::memory_order_relaxed);
         ++m_statResolveReasons[m_syncReason];
@@ -1567,7 +1582,9 @@ void main()
         setUniform3ui(m_resolve, uniform(m_resolve, "u_rows"), y0, rows, target.width);
         setUniform1ui(m_resolve, uniform(m_resolve, "u_scale"), m_scale);
         gl.glBindTextureUnit(0, target.texture);
+        gpuMark(GpuWork::Resolve);
         gl.glDispatchCompute((target.width + 63u) / 64u, (rows + 3u) / 4u, 1u);
+        gpuEnd();
         // The matching barrier is issued by resolveGroupEnd() at the end of the
         // call site's group, not here.
         if (replacementsActive())
@@ -1633,6 +1650,12 @@ void main()
         uint32_t y0 = 0, y1 = 0;
         if (!bytesToRows(target, beginByte, endByte, y0, y1))
             return;
+        {
+            static const char *s_loadTrace = std::getenv("PS2X_GS_LOAD_TRACE");
+            if (s_loadTrace != nullptr && std::strtoull(s_loadTrace, nullptr, 10) == m_presentIndex)
+                std::fprintf(stderr, "[gs:stale] block=0x%x psm=0x%x depth=%d bytes=0x%x..0x%x rows=%u..%u reason=%s\n",
+                             target.block, target.psm, target.depth ? 1 : 0, beginByte, endByte, y0, y1, m_syncReason);
+        }
         if (target.gpuDirty())
         {
             // Attribute it here too: resolveTarget records m_syncReason, and
@@ -1646,15 +1669,49 @@ void main()
         target.staleY1 = std::max(target.staleY1, y1);
     }
 
-    void Renderer::loadStaleRows(Target &target)
+    void Renderer::loadStaleRows(Target &target, uint32_t needY0, uint32_t needY1)
     {
         if (!target.stale())
             return;
-        const uint32_t y0 = target.staleY0, y1 = std::min(target.staleY1, target.usedRows - 1u);
-        target.staleY0 = ~0u;
-        target.staleY1 = 0;
+        // PS2X_GS_FULL_STALE_LOAD=1: the old behaviour, every stale row on any
+        // need (a fallback, and the A/B for the change below).
+        static const bool s_fullLoad = std::getenv("PS2X_GS_FULL_STALE_LOAD") != nullptr;
+        if (s_fullLoad)
+        {
+            needY0 = 0u;
+            needY1 = ~0u;
+        }
+        uint32_t y0 = target.staleY0, y1 = std::min(target.staleY1, target.usedRows - 1u);
         if (y0 > y1)
+        {
+            target.staleY0 = ~0u;
+            target.staleY1 = 0;
             return;
+        }
+        // Only the rows the caller needs. A target is often taller than what is
+        // drawn or shown (the display buffer gets grown into the memory below
+        // it, where the game streams textures every frame), and reloading that
+        // part on every draw was most of the GPU's load work - at an upscaled
+        // size, 16x the pixels at 4x. The stale range is one interval, so only
+        // a cut at either end can be kept; a window inside it loads it all.
+        const uint32_t a = std::max(y0, needY0), b = std::min(y1, needY1);
+        if (a > b)
+            return; // nothing needed is stale
+        if (a == y0 && b < y1)
+        {
+            target.staleY0 = b + 1u; // the tail stays stale
+            y1 = b;
+        }
+        else if (b == y1 && a > y0)
+        {
+            target.staleY1 = a - 1u; // the head stays stale
+            y0 = a;
+        }
+        else
+        {
+            target.staleY0 = ~0u;
+            target.staleY1 = 0;
+        }
         uint32_t begin = 0, end = 0;
         rowsToBytes(target, y0, y1, begin, end);
         m_syncReason = "stale";
@@ -1662,7 +1719,8 @@ void main()
         loadRows(target, y0, y1 - y0 + 1u);
     }
 
-    Renderer::Target *Renderer::textureSourceTarget(uint32_t tbp0, uint32_t tbw, uint32_t tpsm, uint32_t rows)
+    Renderer::Target *Renderer::textureSourceTarget(uint32_t tbp0, uint32_t tbw, uint32_t tpsm, uint32_t rows,
+                                                    uint32_t needY0, uint32_t needY1)
     {
         const bool tex16 = tpsm == PSM_CT16 || tpsm == PSM_CT16S;
         const bool tex32 = tpsm == PSM_CT32 || tpsm == PSM_CT24;
@@ -1678,9 +1736,13 @@ void main()
             if (rows > target.height)
                 return nullptr;
             // Rows it doesn't mirror yet come from VRAM; rows another view of
-            // the memory changed since (tracked as stale) are reloaded.
-            growTarget(target, rows);
-            loadStaleRows(target);
+            // the memory changed since (tracked as stale) are reloaded. Only the
+            // rows this draw samples: a texture's height is a power of two, so a
+            // 448-row display read as a texture is 1024 rows tall.
+            static const bool s_fullLoad = std::getenv("PS2X_GS_FULL_STALE_LOAD") != nullptr;
+            needY1 = s_fullLoad ? rows - 1u : std::min(needY1, rows - 1u);
+            growTarget(target, needY1 + 1u);
+            loadStaleRows(target, needY0, needY1);
             return &target;
         }
         return nullptr;
@@ -1700,8 +1762,10 @@ void main()
             gl.glTextureStorage2D(m_feedbackTexture, 1, GL_RGBA8, static_cast<GLsizei>(m_feedbackWidth),
                                   static_cast<GLsizei>(m_feedbackHeight));
         }
+        gpuMark(GpuWork::Feedback);
         gl.glCopyImageSubData(target.texture, GL_TEXTURE_2D, 0, 0, 0, 0, m_feedbackTexture, GL_TEXTURE_2D, 0, 0, 0, 0,
                               static_cast<GLsizei>(width), static_cast<GLsizei>(target.usedRows * m_scale), 1);
+        gpuEnd();
         return m_feedbackTexture;
     }
 
@@ -1773,6 +1837,18 @@ void main()
             for (auto &other : m_targets)
                 if (other.get() != &target)
                     markStaleRows(*other, begin, end);
+            // The rows drawn must be current; the rest of the target can stay
+            // stale - unless the dirty range (one interval) would then span
+            // stale rows, which a resolve would write back over newer memory.
+            const uint32_t y0 = static_cast<uint32_t>(std::max(0, drawY0)), y1 = static_cast<uint32_t>(drawY1);
+            loadStaleRows(target, y0, y1);
+            if (target.stale())
+            {
+                const uint32_t d0 = std::min(target.dirtyY0, y0), d1 = target.gpuDirty() ? std::max(target.dirtyY1, y1) : y1;
+                if (target.staleY0 <= d1 && d0 <= target.staleY1)
+                    loadStaleRows(target);
+            }
+            return;
         }
         loadStaleRows(target);
     }
@@ -1809,8 +1885,41 @@ void main()
             if (replacementsActive())
                 uploadLoadedReplacements();
             static const bool s_vramTextures = std::getenv("PS2X_GS_GPU_NO_RT_TEXTURE") != nullptr;
+            // The rows the batch samples, from its texture coordinates (texel
+            // v = t / q * height). Unknown (wrapping, region modes, q <= 0):
+            // the whole texture.
+            uint32_t needY0 = 0u, needY1 = state.textureHeight - 1u;
+            {
+                const uint32_t wmt = static_cast<uint32_t>((ctx.clamp >> 2) & 3u);
+                const float texH = static_cast<float>(state.textureHeight);
+                float vMin = 1e30f, vMax = -1e30f;
+                bool known = wmt <= 1u && !m_vertices.empty();
+                for (const Vertex &v : m_vertices)
+                {
+                    if (!(v.q > 0.0f))
+                    {
+                        known = false;
+                        break;
+                    }
+                    const float tv = v.t / v.q * texH;
+                    vMin = std::min(vMin, tv);
+                    vMax = std::max(vMax, tv);
+                }
+                // REPEAT only stays inside when the range does; CLAMP clamps.
+                if (known && wmt == 0u && (vMin < 0.0f || vMax > texH))
+                    known = false;
+                if (known && vMin == vMin && vMax == vMax)
+                {
+                    // A texel either side for bilinear filtering.
+                    const float lo = std::clamp(std::floor(vMin) - 1.0f, 0.0f, texH - 1.0f);
+                    const float hi = std::clamp(std::ceil(vMax) + 1.0f, 0.0f, texH - 1.0f);
+                    needY0 = static_cast<uint32_t>(lo);
+                    needY1 = static_cast<uint32_t>(hi);
+                }
+            }
             Target *source = s_vramTextures ? nullptr
-                                            : textureSourceTarget(key.tbp0, key.tbw, key.tpsm, state.textureHeight);
+                                            : textureSourceTarget(key.tbp0, key.tbw, key.tpsm, state.textureHeight,
+                                                                  needY0, needY1);
             if (source)
             {
                 m_textureSourceTarget = source;
@@ -2243,7 +2352,9 @@ void main()
         }
         gl.glNamedBufferSubData(m_vbo, 0, static_cast<GLsizeiptr>(bytes), m_vertices.data());
         gl.glVertexArrayVertexBuffer(m_vao, 0, m_vbo, 0, sizeof(Vertex));
+        gpuMark(GpuWork::Draw);
         gl.glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_vertices.size()));
+        gpuEnd();
         if (m_maskEnabled && m_drawColor != nullptr)
         {
             // An overlay marks itself; a copy of another target carries that
@@ -2548,7 +2659,9 @@ void main()
         setUniform4ui(m_clutLoad, uniform(m_clutLoad, "u_clut"), tex0.cpsm, tex0.cbp, tex0.csm, tex0.csa);
         setUniform4ui(m_clutLoad, uniform(m_clutLoad, "u_clut2"), texclut.cbw, texclut.cou, texclut.cov,
                                fourBit ? 1u : 0u);
+        gpuMark(GpuWork::Transfer);
         gl.glDispatchCompute(1u, 1u, 1u);
+        gpuEnd();
         gl.glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     }
 
@@ -2584,7 +2697,9 @@ void main()
         setUniform4ui(m_hostToLocal, uniform(m_hostToLocal, "u_pos"), m_transfer.trxpos.dsax,
                                m_transfer.trxpos.dsay, m_transferState.copiedPixels, pixels);
         setUniform1ui(m_hostToLocal, uniform(m_hostToLocal, "u_bits"), bitsPerPixel(buf.dpsm));
+        gpuMark(GpuWork::Transfer);
         gl.glDispatchCompute((pixels + 63u) / 64u, 1u, 1u);
+        gpuEnd();
         gl.glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
     }
 
@@ -2609,7 +2724,9 @@ void main()
                                command.trxpos.dsay);
         setUniform2ui(m_localToLocal, uniform(m_localToLocal, "u_mode"), command.trxpos.dir,
                                overlap ? 1u : 0u);
+        gpuMark(GpuWork::Transfer);
         gl.glDispatchCompute(overlap ? 1u : (rrw * rrh + 63u) / 64u, 1u, 1u);
+        gpuEnd();
         gl.glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
     }
 
@@ -3282,6 +3399,10 @@ void main()
 
     PresentationFrame Renderer::present(const GSPresentationRequest &request)
     {
+        {
+            static const bool s_timers = std::getenv("PS2X_GS_GPU_TIMERS") != nullptr;
+            m_gpuTimers = s_timers && m_gpu;
+        }
         ++m_presentIndex;
         m_frameDrawIndex = 0;
         // The overlay mask is what keeps the HUD out of the motion blur, so it is
@@ -3385,6 +3506,7 @@ void main()
             flushBatch();
             ScopeTimer timer{m_timePresent};
             upscalePresentation(request, frame);
+            gpuEnd();
         }
         if (!frame)
         {
@@ -3397,6 +3519,7 @@ void main()
         if (const uint32_t requested = g_gsGpuScaleRequest.load(std::memory_order_relaxed); requested != 0u)
             setScale(requested);
         applyPendingScale(); // between frames
+        gpuTimersFrameEnd();
         return frame;
     }
 
@@ -4165,6 +4288,7 @@ void main()
         // Every composed frame is a sample for the interpolation, whatever else is
         // enabled - so this runs before any early return.
         trackCamera(request);
+        gpuMark(GpuWork::Present);
         // The host draws the composed frame with raylib between our frames, and
         // if its context shares state with ours those calls change bindings
         // behind the cache's back. Dropping the cache here costs a handful of
@@ -4365,10 +4489,11 @@ void main()
             gl.glNamedFramebufferDrawBuffer(m_presentFramebuffer, GL_COLOR_ATTACHMENT0);
         }
         if (crt1)
-            loadStaleRows(*c1.target);
+            loadStaleRows(*c1.target, c1.y, c1.y + c1.height - 1u);
         if (crt2)
-            loadStaleRows(*c2.target);
+            loadStaleRows(*c2.target, c2.y, c2.y + c2.height - 1u);
 
+        gpuMark(GpuWork::Present); // the loads above closed it
         const bool both = crt1 && crt2;
         const Circuit &top = crt1 ? c1 : c2; // a lone circuit is drawn as "circuit 1" at full weight
         Program &p = m_compose;
@@ -4612,16 +4737,75 @@ void main()
                                       static_cast<GLint>(readHeight), GL_COLOR_BUFFER_BIT, GL_LINEAR);
             readTexture = m_readbackTexture;
         }
-        std::vector<uint8_t> out(static_cast<size_t>(readWidth) * readHeight * 4u);
         gl.glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
         gl.glPixelStorei(GL_PACK_ALIGNMENT, 4);
-        gl.glGetTextureSubImage(readTexture, 0, 0, 0, 0, static_cast<GLsizei>(readWidth), static_cast<GLsizei>(readHeight),
-                                1, GL_RGBA, GL_UNSIGNED_BYTE, static_cast<GLsizei>(out.size()), out.data());
-        frame.pixels = std::move(out);
-        frame.width = readWidth;
-        frame.height = readHeight;
-        frame.rowPixels = readWidth;
-        frame.displayFbp = frame.sourceFbp = (crt1 ? c1 : c2).target->block / 32u;
+        const uint32_t displayFbp = (crt1 ? c1 : c2).target->block / 32u;
+        // Asynchronous by default. A read straight into client memory makes the
+        // driver finish every command queued so far before it returns, so the
+        // renderer (and the game behind it) waited out the whole frame on the
+        // GPU before submitting the next: CPU and GPU never overlapped, and the
+        // wait grew with the internal scale. On NVIDIA the wait is a spin in the
+        // driver's own thread. Instead the copy goes into a pack buffer with a
+        // fence, and the frame handed over is the one copied a present earlier,
+        // which is done by the time it is wanted. One frame of display latency.
+        // PS2X_GS_ASYNC_READBACK=0 restores the synchronous read.
+        static const bool s_asyncReadback = []()
+        {
+            const char *env = std::getenv("PS2X_GS_ASYNC_READBACK");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        if (!s_asyncReadback)
+        {
+            std::vector<uint8_t> out(static_cast<size_t>(readWidth) * readHeight * 4u);
+            gl.glGetTextureSubImage(readTexture, 0, 0, 0, 0, static_cast<GLsizei>(readWidth),
+                                    static_cast<GLsizei>(readHeight), 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                                    static_cast<GLsizei>(out.size()), out.data());
+            frame.pixels = std::move(out);
+            frame.width = readWidth;
+            frame.height = readHeight;
+            frame.rowPixels = readWidth;
+            frame.displayFbp = frame.sourceFbp = displayFbp;
+        }
+        else
+        {
+            constexpr uint32_t kRing = sizeof(m_readbackRing) / sizeof(m_readbackRing[0]);
+            const size_t bytes = static_cast<size_t>(readWidth) * readHeight * 4u;
+            ReadbackSlot &slot = m_readbackRing[m_readbackNext];
+            if (slot.fence != nullptr)
+            {
+                // Not collected (the ring wrapped): it is overwritten below.
+                gl.glDeleteSync(slot.fence);
+                slot.fence = nullptr;
+            }
+            if (slot.buffer == 0 || slot.capacity < bytes)
+            {
+                if (slot.buffer != 0)
+                    gl.glDeleteBuffers(1, &slot.buffer);
+                gl.glCreateBuffers(1, &slot.buffer);
+                gl.glNamedBufferStorage(slot.buffer, static_cast<GLsizeiptr>(bytes), nullptr, GL_MAP_READ_BIT);
+                slot.capacity = bytes;
+            }
+            gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, slot.buffer);
+            gl.glGetTextureSubImage(readTexture, 0, 0, 0, 0, static_cast<GLsizei>(readWidth),
+                                    static_cast<GLsizei>(readHeight), 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                                    static_cast<GLsizei>(bytes), nullptr);
+            gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            slot.fence = gl.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            slot.width = readWidth;
+            slot.height = readHeight;
+            slot.displayFbp = displayFbp;
+            // Start the GPU on it now rather than at the next flush point.
+            gl.glFlush();
+
+            // Hand over the copy from the previous present. The first present
+            // has none yet, so it waits for its own (once).
+            const uint32_t prevIndex = (m_readbackNext + kRing - 1u) % kRing;
+            ReadbackSlot &ready = m_readbackRing[prevIndex].fence != nullptr ? m_readbackRing[prevIndex] : slot;
+            m_readbackNext = (m_readbackNext + 1u) % kRing;
+            takeReadback(ready, frame);
+            readWidth = ready.width;
+            readHeight = ready.height;
+        }
         // PS2X_GS_PRESENT_DUMP=<prefix>: write presented frames 20..80 as binary
         // PPMs <prefix>_NNN.ppm, for A/B checks. Every present, so consecutive
         // frames can be compared - the field alternation shows there.
@@ -4644,6 +4828,114 @@ void main()
                     std::fclose(f);
                 }
             }
+        }
+    }
+
+    void Renderer::takeReadback(ReadbackSlot &slot, PresentationFrame &frame)
+    {
+        GL &gl = m_context.gl;
+        gl.glClientWaitSync(slot.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+        gl.glDeleteSync(slot.fence);
+        slot.fence = nullptr;
+        const size_t bytes = static_cast<size_t>(slot.width) * slot.height * 4u;
+        frame.pixels.resize(bytes);
+        if (const void *mapped = gl.glMapNamedBufferRange(slot.buffer, 0, static_cast<GLsizeiptr>(bytes), GL_MAP_READ_BIT))
+        {
+            std::memcpy(frame.pixels.data(), mapped, bytes);
+            gl.glUnmapNamedBuffer(slot.buffer);
+        }
+        frame.width = slot.width;
+        frame.height = slot.height;
+        frame.rowPixels = slot.width;
+        frame.displayFbp = frame.sourceFbp = slot.displayFbp;
+    }
+
+    bool Renderer::collectPendingReadback(PresentationFrame &frame)
+    {
+        if (!m_gpu)
+            return false;
+        // At most one is pending after a present (the older ones were taken),
+        // and it is the one written last.
+        constexpr uint32_t kRing = sizeof(m_readbackRing) / sizeof(m_readbackRing[0]);
+        ReadbackSlot &newest = m_readbackRing[(m_readbackNext + kRing - 1u) % kRing];
+        if (newest.fence == nullptr)
+            return false;
+        takeReadback(newest, frame);
+        return true;
+    }
+
+    void Renderer::gpuMark(GpuWork work)
+    {
+        if (!m_gpuTimers)
+            return;
+        GL &gl = m_context.gl;
+        if (m_gpuQueryOpen)
+            gl.glEndQuery(GL_TIME_ELAPSED);
+        GLuint query = 0;
+        if (!m_gpuFreeQueries.empty())
+        {
+            query = m_gpuFreeQueries.back();
+            m_gpuFreeQueries.pop_back();
+        }
+        else
+            gl.glGenQueries(1, &query);
+        gl.glBeginQuery(GL_TIME_ELAPSED, query);
+        m_gpuQueryOpen = true;
+        m_gpuMarks.push_back({query, work});
+    }
+
+    void Renderer::gpuEnd()
+    {
+        if (!m_gpuQueryOpen)
+            return;
+        m_context.gl.glEndQuery(GL_TIME_ELAPSED);
+        m_gpuQueryOpen = false;
+    }
+
+    void Renderer::gpuTimersFrameEnd()
+    {
+        if (!m_gpuTimers)
+            return;
+        gpuEnd();
+        GL &gl = m_context.gl;
+        size_t done = 0;
+        for (; done < m_gpuMarks.size(); ++done)
+        {
+            GLint available = 0;
+            gl.glGetQueryObjectiv(m_gpuMarks[done].query, GL_QUERY_RESULT_AVAILABLE, &available);
+            if (!available)
+                break;
+            GLuint64 ns = 0;
+            gl.glGetQueryObjectui64v(m_gpuMarks[done].query, GL_QUERY_RESULT, &ns);
+            m_gpuWorkNs[static_cast<int>(m_gpuMarks[done].work)] += static_cast<double>(ns);
+            m_gpuFreeQueries.push_back(m_gpuMarks[done].query);
+        }
+        m_gpuMarks.erase(m_gpuMarks.begin(), m_gpuMarks.begin() + static_cast<std::ptrdiff_t>(done));
+        if (++m_gpuTimerFrames < 300u)
+            return;
+        static const char *kNames[] = {"draw", "load", "resolve", "feedback", "transfer", "present", "idle"};
+        double total = 0.0;
+        std::fprintf(stderr, "[gs:gputime] scale=%u ms/present:", m_scale);
+        for (int i = 0; i < static_cast<int>(GpuWork::Idle); ++i)
+        {
+            std::fprintf(stderr, " %s=%.2f", kNames[i], m_gpuWorkNs[i] / 1e6 / m_gpuTimerFrames);
+            total += m_gpuWorkNs[i];
+            m_gpuWorkNs[i] = 0.0;
+        }
+        std::fprintf(stderr, " busy=%.2f\n", total / 1e6 / m_gpuTimerFrames);
+        m_gpuTimerFrames = 0;
+    }
+
+    void Renderer::destroyReadbackRing()
+    {
+        GL &gl = m_context.gl;
+        for (ReadbackSlot &slot : m_readbackRing)
+        {
+            if (slot.fence != nullptr)
+                gl.glDeleteSync(slot.fence);
+            if (slot.buffer != 0)
+                gl.glDeleteBuffers(1, &slot.buffer);
+            slot = ReadbackSlot{};
         }
     }
 

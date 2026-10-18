@@ -79,6 +79,7 @@ public:
     void TextureFlush() override;
     void Sync(GSSyncReason reason) override;
     PresentationFrame Present(const GSPresentationRequest &request) override;
+    bool PollPresentation(PresentationFrame &out) override;
 
     // Blocking round trip to the render thread (see GSRasterBackend).
     uint32_t SynthesizeFrame(float phase, uint32_t &width, uint32_t &height) override;
@@ -161,6 +162,9 @@ private:
     // waiting; PS2X_GS_GPU_SYNC_PRESENT=1 presents synchronously).
     std::mutex m_frameMutex;
     PresentationFrame m_lastFrame;
+    // Bumped whenever m_lastFrame is replaced; m_lastHandedSeq is the one the
+    // caller was last given, so PollPresentation knows if it has a newer one.
+    uint64_t m_lastFrameSeq = 0, m_lastHandedSeq = 0;
 
     mutable std::mutex m_mutex;
     mutable std::condition_variable m_workAvailable;
