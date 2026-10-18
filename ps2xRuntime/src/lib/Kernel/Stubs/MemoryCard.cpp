@@ -789,14 +789,23 @@ namespace ps2_stubs
                             }
                             dirEntries.push_back(entry);
                         }
-
-                        std::sort(dirEntries.begin(), dirEntries.end(),
-                                  [](const std::filesystem::directory_entry &lhs,
-                                     const std::filesystem::directory_entry &rhs)
-                                  {
-                                      return toLowerAscii(lhs.path().filename().string()) <
-                                             toLowerAscii(rhs.path().filename().string());
-                                  });
+std::stable_sort(dirEntries.begin(), dirEntries.end(),
+                          [](const std::filesystem::directory_entry &lhs,
+                             const std::filesystem::directory_entry &rhs)
+                          {
+                              // A real card lists a directory in the order its entries
+                              // were created: fixed files first, numbered saves last.
+                              // VCS finds its saves by their position in the listing, so
+                              // alphabetising pulls them forward and it can no longer
+                              // load them. Keep named files ahead of numbered ones.
+                              const auto numbered = [](const std::filesystem::directory_entry &e)
+                              {
+                                  const std::string name = e.path().filename().string();
+                                  const char c = name.empty() ? '\0' : name[0];
+                                  return c >= '0' && c <= '9';
+                              };
+                              return !numbered(lhs) && numbered(rhs);
+                          });
 
                         for (const auto &entry : dirEntries)
                         {
@@ -842,7 +851,7 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdGetDir, result);
         }
-        RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
+RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
                                         << "' maxent=" << maxEntries << " -> result=" << result);
         setReturnS32(ctx, 0);
     }
