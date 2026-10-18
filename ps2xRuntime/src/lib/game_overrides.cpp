@@ -2500,9 +2500,17 @@ namespace
         // pause menu is closed (0x4CD2AC is set to 1 by the pause open/close
         // handlers at 0x2F4D64/0x2F4D70 on the START press). The music then
         // pauses and resumes with the game, on the same track.
+        // Never during an in-engine cutscene: the station is remembered across
+        // a new game started from the pause menu, and the opening cutscene puts
+        // Vic in a vehicle - the music folder then played over the intro's own
+        // song.
         ps2MusicStationSetQuery([](const uint8_t *rdram)
-                                { return g_vcsRadioStation.load(std::memory_order_relaxed) == 9u &&
-                                         vcsPlayerInVehicle(rdram) && rdram[0x004CD2ACu] == 0u; });
+                                {
+                                    uint32_t cutscene = 0;
+                                    std::memcpy(&cutscene, rdram + 0x006F4D14u, 4);
+                                    return g_vcsRadioStation.load(std::memory_order_relaxed) == 9u &&
+                                           vcsPlayerInVehicle(rdram) && rdram[0x004CD2ACu] == 0u && cutscene == 0u;
+                                });
 
         g_vcsOrigMovieFinished = runtime.lookupFunction(0x0031A6A8u);
         runtime.replaceFunction(0x0031A6A8u, &vcsMovieFinished);
