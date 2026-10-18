@@ -25,12 +25,12 @@ For everyone else, the licence is unchanged: GPL-3.0, inherited from PS2Recomp.
 
 ## Building it
 
-You need a PlayStation 2 copy of the game — the disc itself, or an `.iso` / `.bin`
-you made from it — and a C++ toolchain.
+You need a PlayStation 2 copy of the game — the disc itself, or an image you made
+from it (`.iso`, `.bin`, `.cue` or `.chd`) — and a C++ toolchain.
 
 ```sh
 ./build.sh --image /dev/sr0          # read straight from a disc drive
-./build.sh --image ~/vcs.iso         # or from an image
+./build.sh --image ~/vcs.chd         # or from an image: .iso / .bin / .cue / .chd
 ./build.sh --image /path/extracted   # or from a folder already extracted
 ```
 
