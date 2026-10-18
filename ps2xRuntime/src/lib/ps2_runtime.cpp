@@ -3758,7 +3758,12 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
         ps2ModsRefreshButtonPromptsIfNeeded(); // Auto prompt set follows the device
         ps2ModsApplyPatches(m_memory.getRDRAM());
         if (IsKeyPressed(KEY_F9))
+        {
             ps2GsRequestCapture(180u); // ~3 s of GS input for tools/gs_replay
+            // Also snapshot EE RAM here rather than relying on the pad layer's
+            // key handling, which some sessions never reach.
+            g_ps2DumpRamRequest.store(true, std::memory_order_relaxed);
+        }
         // F8: capture the next 24 frames the *host* draws. A synthesized frame only
         // exists there, so a flicker that is not in the composed frame will show
         // here and nowhere else. PS2X_HOST_CAPTURE sets the prefix.
