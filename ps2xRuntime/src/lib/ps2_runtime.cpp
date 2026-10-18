@@ -4090,12 +4090,17 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
             // F8 (ps2_pad.cpp): EE RAM snapshot on request.
             if (g_ps2DumpRamRequest.exchange(false, std::memory_order_relaxed))
             {
-                const std::string path = "ram_f8_" + std::to_string(s_presentedFrames) + ".bin";
+                const std::string name = "ram_f8_" + std::to_string(s_presentedFrames) + ".bin";
+                const std::filesystem::path path = std::filesystem::absolute(name);
                 if (FILE *f = std::fopen(path.c_str(), "wb"))
                 {
                     std::fwrite(m_memory.getRDRAM(), 1, PS2_RAM_SIZE, f);
                     std::fclose(f);
-                    std::cerr << "[dump] " << path << std::endl;
+                    std::cerr << "[dump] wrote " << path << std::endl;
+                }
+                else
+                {
+                    std::cerr << "[dump] FAILED to write " << path << std::endl;
                 }
             }
             // PS2X_DUMP_RAM_FRAME=<frame>: write EE RAM + scratchpad to ram_<frame>.bin / spr_<frame>.bin.
