@@ -46,6 +46,11 @@ void ps2AchievementsDrawOverlay();
 // open, and it is the only thing the panel needs from here.
 std::vector<Ps2AchievementView> ps2AchievementsView();
 
+// Whether the player is cheating - .pnach patches, or the game's own cheat codes
+// if the set names the flag they set - in which case nothing unlocks.
+bool ps2AchievementsCheating();
+bool ps2AchievementsCheatBlocked();
+
 // Forgets every unlock, and clears the hit counts with them.
 void ps2AchievementsReset();
 

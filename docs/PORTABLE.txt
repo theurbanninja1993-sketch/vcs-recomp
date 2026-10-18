@@ -62,12 +62,18 @@ Delete config/ to start over with defaults.
 
 Achievements
 ------------
-F2 -> Achievements lists the port's own set: 35 of them, following the shape of
+F2 -> Achievements lists the port's own set - 31 so far, with four more to come -
+following the shape of
 the official trilogy's - story milestones, side jobs, collectibles, stat tiers,
 the odd silly one, and 100% completion. They are evaluated locally against the
 game's own memory. Nothing about them goes online and no account is involved:
 the set is a file beside this one, and what you have earned is a file in config/.
-The same tab has an address watcher, which is the tool used to author them.
+The same tab has an address watcher and a memory search, which are the tools used
+to author them.
+
+Cheats turn achievements off. If a mod you enabled writes to memory with a .pnach
+patch, nothing unlocks while it is on - the panel says so rather than leaving you
+to wonder. Texture mods are not cheats and change nothing about this.
 
 Performance
 -----------

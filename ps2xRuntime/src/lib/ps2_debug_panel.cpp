@@ -9,6 +9,7 @@
 #include "runtime/ps2_platform.h"
 #include "runtime/ps2_mods.h"
 #include "runtime/ps2_achievements.h"
+#include "ps2_memory_search.h"
 
 #include <unordered_set>
 #include <utility>
@@ -2521,6 +2522,80 @@ void PS2DebugPanel::drawSettingsHint()
 #endif
 }
 
+// The value search, above the address watcher: search, narrow, then watch the one
+// that is left. This is the half of authoring a condition that the watcher cannot
+// do - the watcher answers "what is at this address", and this answers "where is
+// this value".
+static void drawMemorySearch(const uint8_t *rdram)
+{
+    static MemorySearch search;
+
+    ImGui::TextUnformatted("Memory search");
+    ImGui::TextWrapped("Find a number you can see in the game, then narrow it by what it does - do the thing in the "
+                       "game between presses. Most counters are not on screen at all: search for what you can see, "
+                       "or narrow by Changed after doing the thing.");
+
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::InputText("value", search.valueText, sizeof search.valueText);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110.0f);
+    const char *widths[] = {"byte", "16-bit", "32-bit", "float"};
+    ImGui::Combo("as", &search.width, widths, 4);
+    ImGui::SameLine();
+    if (ImGui::Button("Search"))
+        searchFor(rdram, search);
+
+    if (!search.candidates.empty())
+    {
+        ImGui::SameLine();
+        if (ImGui::Button("Changed"))
+            narrow(rdram, search, Narrow::Changed);
+        ImGui::SameLine();
+        if (ImGui::Button("Unchanged"))
+            narrow(rdram, search, Narrow::Unchanged);
+        ImGui::SameLine();
+        if (ImGui::Button("Increased"))
+            narrow(rdram, search, Narrow::Increased);
+        ImGui::SameLine();
+        if (ImGui::Button("Decreased"))
+            narrow(rdram, search, Narrow::Decreased);
+        ImGui::SameLine();
+        if (ImGui::Button("Clear"))
+        {
+            search.candidates.clear();
+            search.previous.clear();
+            search.note.clear();
+        }
+    }
+    if (!search.note.empty())
+        ImGui::TextDisabled("%s", search.note.c_str());
+
+    if (!search.candidates.empty() &&
+        ImGui::BeginTable("search-results", 3,
+                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit |
+                              ImGuiTableFlags_ScrollY,
+                          ImVec2(0.0f, 200.0f)))
+    {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("address");
+        ImGui::TableSetupColumn("now");
+        ImGui::TableSetupColumn("was");
+        ImGui::TableHeadersRow();
+        const size_t shown = search.candidates.size() < 256 ? search.candidates.size() : 256;
+        for (size_t i = 0; i < shown; ++i)
+        {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("0x%08X", search.candidates[i]);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(formatValue(readAs(rdram, search.candidates[i], search.width), search.width).c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(formatValue(search.previous[i], search.width).c_str());
+        }
+        ImGui::EndTable();
+    }
+}
+
 // --------------------------------------------------------------- achievements
 // The list, and the tool used to author the next one. A set is worth nothing
 // until its addresses are right, and watching a candidate address while playing
@@ -2534,6 +2609,16 @@ static void drawAchievementsTab(PS2Runtime &runtime)
 
     ImGui::TextWrapped("The port's own achievement set: a file beside the port, no account, and nothing that "
                        "goes online.");
+    if (ps2AchievementsCheating())
+    {
+        ImGui::TextColored(ImVec4(0.94f, 0.68f, 0.45f, 1.0f), "%s",
+                           "Cheats are on, so nothing will unlock. Turn them off in Mods and earn them properly.");
+    }
+    else if (ps2AchievementsCheatBlocked())
+    {
+        ImGui::TextColored(ImVec4(0.94f, 0.68f, 0.45f, 1.0f), "%s",
+                           "Something was earned while cheating, so it was not counted.");
+    }
     if (ps2AchievementsLoaded())
     {
         ImGui::TextDisabled("%s", ps2AchievementsSetPath().c_str());
@@ -2585,6 +2670,11 @@ static void drawAchievementsTab(PS2Runtime &runtime)
         if (!row.description.empty())
             ImGui::TextDisabled("        %s", row.description.c_str());
     }
+
+    ImGui::Separator();
+    const uint8_t *searchRam = runtime.memory().getRDRAM();
+    if (searchRam != nullptr)
+        drawMemorySearch(searchRam);
 
     ImGui::Separator();
     ImGui::TextUnformatted("Address watcher");

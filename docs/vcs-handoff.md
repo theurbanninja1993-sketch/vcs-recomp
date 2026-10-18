@@ -79,9 +79,40 @@ render. **Not verified:** the banner's on-screen appearance - the guest-frame
 screenshot mode deliberately excludes host UI, and the host capture needs a key
 press - and the real set's conditions, which do not exist yet.
 
+**Cheating stops unlocks (owner, 2026-10-18: "using cheats should prevent
+achievements from unlocking in the official release").** Two ways in, and the
+distinction matters:
+
+- **The port's own `.pnach` patches**: cheating is an *enabled mod that actually
+  writes to memory* (`mod.enabled && mod.patches > 0`), not the `pnach_cheats`
+  switch, which is on by default and only means "apply patches from the mods I
+  enabled". A texture mod is not cheating and must not block anything.
+- **The game's own cheat codes** - button sequences, whose meaning the port cannot
+  see - set a flag in the game's memory. The set names its address in
+  `cheat_flag` in `[set]`, and the rule reads it as a byte. **That address is not
+  found yet**, and finding it is a five-minute job with the memory search: enter a
+  cheat that changes almost nothing else (a weather one), search "Changed", and
+  take the address that latched. The file's comments say so where it belongs.
+
+A blocked unlock is not silent: the panel says cheats are on and nothing will
+unlock, and says if something was earned while cheating and not counted. The
+condition is still evaluated, so the list keeps showing progress - which is how a
+player tells a cheat block from a broken set.
+
 **One thing left for the set to be complete:** the four hidden mission challenges
 (ids 7-10) are held back on purpose, to be chosen against the missions once the
-playthrough has been done.
+playthrough has been done. That makes the set **31 defined and 4 to come** - the
+"35" in the design table below is the finished size, not what is in the file.
+
+**A memory search, not just a watcher, is in the panel now** - find a value, then
+narrow it by what it does (changed, increased, the same). That is the Cheat-Engine
+loop, and it is what makes the other thirty conditions a matter of minutes each
+rather than an afternoon of dump-diffing: the F9 dumps still work and are what the
+wanted level was found with, but live is faster. Its logic is covered by a test
+against a synthetic 32 MB guest, and the first real condition was found and
+verified with it - *Catch Me if You Can* is `0xH52FC74>=6`, found by entering the
+raise-wanted-level cheat twice and the lower one once with a dump after each:
+exactly one address in 32 MB goes 0, 2, 4, 0.
 
 ## 2026-10-18 (Claude): a converted image that would not read, and what a hash mismatch means
 

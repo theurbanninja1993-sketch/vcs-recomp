@@ -55,6 +55,12 @@
 [set]
 name = "Grand Theft Auto: Vice City Stories"
 version = 1
+# The game's own cheat codes set a flag in its memory, and naming its address here
+# makes using them stop unlocks, the way the port's .pnach patches already do. It
+# is not known yet; to find it, use a cheat that changes almost nothing else - a
+# weather one - and take a RAM dump before and after, or use the memory search in
+# Settings > Achievements with "Changed". Then:
+#   cheat_flag = 0x0052xxxx
 
 # ---------------------------------------------------------------- story (6)
 # One per act, first and last mission of each chapter, the way the official sets
@@ -227,6 +233,12 @@ title = Catch Me if You Can
 description = Achieve a six-star wanted level.
 category = Stat
 points = 10
+# Found with the F9 dumps: the raise-wanted-level cheat (up, right, square,
+# square, down, left, circle, circle) twice and the lower-wanted-level one (up,
+# right, triangle, triangle, down, left, cross, cross) once, with a dump after
+# each. Exactly one address in 32 MB goes 0, 2, 4, 0 through those four dumps,
+# which is the wanted level itself. Three cheat entries reach six.
+trigger = 0xH52FC74>=6
 
 [achievement]
 id = 27

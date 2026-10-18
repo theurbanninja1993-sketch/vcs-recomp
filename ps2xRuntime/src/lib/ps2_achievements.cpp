@@ -35,6 +35,8 @@
 
 #include "runtime/ps2_platform.h"
 #include "runtime/ps2_memory.h" // PS2_RAM_MASK: the guest's own wrap
+#include "runtime/ps2_host_settings.h" // the .pnach switch, for the cheat rule
+#include "runtime/ps2_mods.h"          // and whether any enabled mod patches memory
 
 #include <raylib.h>
 
@@ -76,8 +78,10 @@ namespace
     uint8_t *s_rdram = nullptr;
     rc_runtime_t s_runtime{};
     double s_savedAt = 0.0;
+    uint32_t s_cheatFlag = 0; // a guest address the set names, or 0 for none
     long s_peeks = 0;   // how many times the evaluator has read the guest's memory
     long s_events = 0;  // how many events the evaluator has raised
+    bool s_cheatBlocked = false; // an unlock was refused because of a cheat
 
     // Where the two little files live: beside the settings, so a portable folder
     // keeps its achievements with everything else it keeps.
@@ -227,6 +231,8 @@ namespace
             {
                 if (key == "name")
                     s_setName = value;
+                else if (key == "cheat_flag")
+                    s_cheatFlag = static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 0));
                 continue;
             }
             if (key == "id")
@@ -260,7 +266,8 @@ namespace
         return numBytes;
     }
 
-    void grantCapstones(); // defined below, and used by the unlock handler
+    bool cheating();       // defined below, and used by the unlock handler
+    void grantCapstones(); // likewise
 
     void RC_CCONV onRuntimeEvent(const rc_runtime_event_t *event)
     {
@@ -275,6 +282,14 @@ namespace
                          event->value);
         if (event->type != RC_RUNTIME_EVENT_ACHIEVEMENT_TRIGGERED)
             return;
+        if (cheating())
+        {
+            // Evaluated, but not earned: the condition is still met, and the list
+            // still shows it, which is how a player finds out why nothing is
+            // unlocking rather than wondering whether the set is broken.
+            s_cheatBlocked = true;
+            return;
+        }
         if (isUnlocked(event->id))
             return;
         s_unlocked.push_back(event->id);
@@ -290,6 +305,28 @@ namespace
             s_toasts.erase(s_toasts.begin());
         grantCapstones();
         saveState();
+    }
+
+    // Whether the player is cheating, in which case nothing unlocks.
+    //
+    // Two ways in. The port's own .pnach patches are a switch the port holds, so
+    // that one is certain. The game's own cheat codes - button sequences, which
+    // the port cannot see the meaning of - are a flag in the game's memory, and
+    // the set names its address in `cheat_flag` once it has been found; see the
+    // handoff for the recipe (a weather cheat and two dumps isolates it, because
+    // weather changes almost nothing else).
+    bool cheating()
+    {
+        // The .pnach switch is on by default and only means "apply patches from the
+        // mods I enabled" - most mods have none. What matters is whether an enabled
+        // mod actually writes to memory.
+        if (ps2HostSettings().pnachCheats)
+            for (const PS2ModInfo &mod : ps2Mods())
+                if (mod.enabled && mod.patches > 0)
+                    return true;
+        if (s_cheatFlag != 0 && s_rdram != nullptr)
+            return s_rdram[s_cheatFlag & PS2_RAM_MASK] != 0;
+        return false;
     }
 
     const Achievement *findAchievement(uint32_t id)
@@ -310,16 +347,20 @@ namespace
     // unlocks once every achievement that does have a condition is unlocked.
     void grantCapstones()
     {
-        bool anyWithTrigger = false;
+        // Every achievement, not just the ones with a condition: while the set is
+        // still being authored, most of them have none, and a capstone that fired
+        // as soon as the first one was earned would be a lie about the set.
+        bool anyToEarn = false;
         bool allUnlocked = true;
         for (const Achievement &achievement : s_achievements)
-            if (!achievement.trigger.empty())
-            {
-                anyWithTrigger = true;
-                if (!isUnlocked(achievement.id))
-                    allUnlocked = false;
-            }
-        if (!anyWithTrigger || !allUnlocked)
+        {
+            if (achievement.category == "Capstone")
+                continue;
+            anyToEarn = true;
+            if (!isUnlocked(achievement.id))
+                allUnlocked = false;
+        }
+        if (!anyToEarn || !allUnlocked)
             return;
         for (const Achievement &achievement : s_achievements)
             if (achievement.trigger.empty() && achievement.category == "Capstone" && !isUnlocked(achievement.id))
@@ -438,6 +479,9 @@ void ps2AchievementsFrame(uint8_t *rdram)
     if (GetTime() - s_savedAt > 30.0)
         saveState();
 }
+
+bool ps2AchievementsCheating() { return cheating(); }
+bool ps2AchievementsCheatBlocked() { return s_cheatBlocked; }
 
 void ps2AchievementsReset()
 {
