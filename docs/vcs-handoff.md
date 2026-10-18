@@ -4,6 +4,78 @@ State as of 2026-10-18 (`vcs-bringup` is the tip the `release` branch players bu
 from was cut at, tagged `stories-v0.1.2`; the launcher is its own repo at `d632394` =
 `v0.1.1`). Read this before changing anything. A reviewer will check work against it.
 
+## 2026-10-18 (Claude): CHD discs, and what the launcher does when a build breaks
+
+The owner played the 0.1.1 release as a player would and came back with three
+things. All three are fixed; the first two were the release's own fault, and the
+third is the one that made the release useless to him.
+
+**1. A source folder that a dead fetch or clone left behind could never be
+fetched again.** `fetchCommand` ran `git clone` into `port_dir`, and `git clone`
+refuses a directory that exists and is not empty, so a clone that died partway
+(leaving files, no HEAD) put the launcher in a state where the card said "source
+not fetched - press U", the Build key was refused because there was no revision,
+and `U` could not fix it either. The only way out was to find and delete the
+folder by hand - exactly what the owner did, and why "after deleting the VCS
+folder it started again". Now the folder is cleared first when there is no
+revision to keep, and an existing checkout that can no longer be updated falls
+back to a fresh clone rather than reporting a failure nobody can act on. Wiping
+is guarded (`safeToWipe`) because `port_dir` comes from a config file and
+`rm -rf` should not be able to follow a typo into a home directory.
+
+**2. A failed build dropped the player back on the menu and said nothing at
+all.** Everything the build printed went to `stderr`, which is nowhere when the
+launcher is started from a file manager, and there is no log. The wizard's own
+RECIPE error was the only failure ever surfaced. Now the whole build is written
+to `logs/<id>-build.log` beside the launcher (so it survives the source folder
+being deleted), and when a build ends - finished, failed *or* stopped - the
+launcher says which, puts the last line the build printed on the screen, and
+names the log. A stopped build is distinguished from a failed one.
+
+**3. The owner keeps his PS2 library as CHD, and the launcher could not see
+it.** The picker only offered `.iso`/`.bin`, and what he did instead - renaming a
+`.cue` sheet to `.iso` - was reported as "not an ISO9660 disc image", which is
+true and no help at all.
+
+`ps2x_iso` now sniffs the content rather than the extension:
+
+- `MComprHD` → a CHD, read with **libchdr** (fetched in `ps2xBuilder`, host
+  tools only: `ps2x_iso` is never cross-compiled, so a codec stack that never
+  runs on the target is not worth a configure that can fail). It brings its own
+  lzma, miniz and dr_flac, so it needs nothing installed - which is why it was
+  chosen over writing a reader against system liblzma/libFLAC.
+- text naming a `FILE`/`DATAFILE` → a `.cue` sheet, and the image beside it is
+  opened instead. `DATAFILE` is what the Windows tools write, and is what the
+  owner's own sheet used. A sheet whose image is missing says so by name.
+- otherwise → the image, exactly as before.
+
+**Where the sector data sits in a CHD unit is not fixed.** A CD CHD's unit is
+2448 bytes (2352 + 96 of subcode) and a DVD's is a flat 2048, but chdman passes
+2048-byte sectors *through*: the owner's VCS CHD has unitbytes 2448 with the ISO
+data at offset 0, not behind a 2352-byte sync header. The layout probe therefore
+tries offsets 0, 16 and 24 within the unit, guarded by the unit size. (`2048/0`
+and `2352/0` were added to the plain-image list for the same reason.) Finding
+this cost an hour: the first version only tried 16 and 24 and reported "not an
+ISO9660 disc image" for a CHD whose descriptor was plainly at 0.
+
+**Verified against the owner's own files**, since a wrong reader here is silent
+corruption in a game build:
+
+| what | result |
+|---|---|
+| VCS CHD boot ELF | `7f69b961cc427e3dcfd6582e25362be8` - matches the manifest |
+| LCS CHD boot ELF | `3d2280cadf1a74ce39e121d1ea6941b2` - matches the manifest |
+| `/SYSTEM.CNF` from the CHD vs the extracted folder | identical |
+| `/MAINLA.IMG` (282 MB) and `/BEACH.IMG` (230 MB) | identical to the folder |
+| the owner's `.cue` sheet, renamed `.iso` | reads, follows to its `.bin` |
+| a sheet whose `.bin` is missing | says which file it wants, by name |
+| a file that is not a disc image | says so instead of "not an ISO9660 image" |
+
+Also fixed on the way past: the probe cleared its read error *before* deciding
+the disc was unreadable, so every failure - a drive not ready, a permission
+problem, a short file - came out as "not an ISO9660 disc image". The reason now
+survives to the message.
+
 ## 2026-10-18 (Claude): cut `stories-v0.1.2`
 
 The release branch is a fast-forward of the dev tip, tagged `stories-v0.1.2`.
