@@ -4875,14 +4875,15 @@ void main()
             // VU1 worker and the game thread behind it. Nothing finished yet:
             // the host keeps the frame it has, and a later VBlank collects this
             // one (PollPresentation).
-            // But never more than two presents in flight: with nothing else
+            // But never more than three presents in flight: with nothing else
             // holding it back this thread could queue seconds of work ahead
             // of a busy driver, and the newest *finished* frame then lagged
             // just as far - the picture froze for seconds while the game ran
             // on (seen on the laptop once the stream rings stopped stalling).
-            // Waiting for the oldest copy keeps the GPU at most two frames
-            // behind.
-            constexpr int kMaxInFlight = 2;
+            // Waiting for the oldest copy keeps the GPU at most three frames
+            // behind (two was tight enough that a busy driver's short bursts
+            // stalled this thread, and the pipeline behind it, on the laptop).
+            constexpr int kMaxInFlight = 3;
             {
                 int pending = 0;
                 ReadbackSlot *oldest = nullptr;
@@ -4897,7 +4898,7 @@ void main()
                 if (pending > kMaxInFlight)
                     gl.glClientWaitSync(oldest->fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
             }
-            static uint32_t s_unchangedStreak = 0;
+            uint32_t &s_unchangedStreak = m_readbackUnchangedStreak;
             if (ReadbackSlot *ready = newestFinishedReadback())
             {
                 takeReadback(*ready, frame);
@@ -4998,6 +4999,7 @@ void main()
         if (ready == nullptr)
             return false;
         takeReadback(*ready, frame);
+        m_readbackUnchangedStreak = 0; // the picture moved on
         return true;
     }
 

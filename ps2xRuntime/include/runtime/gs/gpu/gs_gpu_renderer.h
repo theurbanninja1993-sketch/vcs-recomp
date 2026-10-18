@@ -459,9 +459,10 @@ namespace gsgpu
             const uint8_t *mapped = nullptr; // persistent client-side mapping, when available
             uint64_t serial = 0;             // issue order, to find the newest finished copy
         };
-        ReadbackSlot m_readbackRing[4];
+        ReadbackSlot m_readbackRing[5]; // up to three in flight plus room to issue
         uint32_t m_readbackNext = 0;
         uint64_t m_readbackSerial = 0;
+        uint32_t m_readbackUnchangedStreak = 0; // presents without a new picture (logged when long)
         // The newest copy the GPU has finished, without waiting; older pending
         // ones are dropped. nullptr: none is ready yet.
         ReadbackSlot *newestFinishedReadback();
