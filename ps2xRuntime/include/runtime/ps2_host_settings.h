@@ -111,7 +111,7 @@ struct PS2HostSettings
         Hz240 = 240,
     };
     FrameRate frameRate = FrameRate::Native;
-    int internalScale = 1;       // GPU renderer resolution multiplier (1 = native 640x448)
+    int internalScale = 1;       // GPU renderer resolution multiplier (1 = native 640x448; 0 = Auto, from the window height)
     bool flickerFilter = false;  // the game's interlace flicker filter (a vertical blur)
     // The game's motion blur (VCS accumulates previous frames into a pair of
     // 256x256 buffers and blends the result over the display). Off skips the
@@ -184,6 +184,9 @@ void ps2HostSettingsRequestWindowApply();
 void ps2HostSettingsApplyRenderer();
 // The GPU renderer is in use (internal resolution only applies to it).
 bool ps2HostSettingsGpuRenderer();
+// The internal resolution actually used: the setting, or for Auto (0) the
+// multiple picked from the window height.
+int ps2HostSettingsEffectiveScale();
 // What the GPU renderer reported at start-up ("" when it did not start).
 std::string ps2HostSettingsGpuInfo();
 

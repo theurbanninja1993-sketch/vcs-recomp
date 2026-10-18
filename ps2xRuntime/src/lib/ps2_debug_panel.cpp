@@ -2637,14 +2637,24 @@ void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
                 else
                     ImGui::TextDisabled("Renderer: CPU rasterizer (no texture replacement, no internal resolution).");
                 ImGui::BeginDisabled(!gpu);
-                static const char *kInternal[] = {"Native (640 x 448)", "2x (1280 x 896)", "3x (1920 x 1344)",
-                                                  "4x (2560 x 1792)"};
-                int internal = std::clamp(settings.internalScale, 1, 4) - 1;
+                // In display terms: the PS2 draws 448 lines, so each step is a
+                // multiple of that. Auto picks from the window height.
+                static const char *kInternal[] = {
+                    "Auto (match my display)", "Native - PS2 (about 480p)", "2x - about 900p (HD)",
+                    "3x - about 1350p (great for 1080p and 1440p)", "4x - about 1800p (great for 4K)"};
+                int internal = std::clamp(settings.internalScale, 0, 4);
                 if (ImGui::Combo("Internal resolution", &internal, kInternal, IM_ARRAYSIZE(kInternal)))
                 {
-                    settings.internalScale = internal + 1;
+                    settings.internalScale = internal;
                     changed = true;
                 }
+                if (settings.internalScale == 0)
+                {
+                    const int scale = ps2HostSettingsEffectiveScale();
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("now %dx (%d lines)", scale, 448 * scale);
+                }
+                ImGui::TextDisabled("Higher looks sharper but needs a faster graphics card.");
                 ImGui::EndDisabled();
                 if (!gpu)
                     ImGui::TextDisabled("Unavailable: the GPU renderer could not start (see the log).");

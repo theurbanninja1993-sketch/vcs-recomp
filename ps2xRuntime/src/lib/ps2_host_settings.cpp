@@ -328,7 +328,7 @@ void ps2HostSettingsLoad()
         else if (key == "mouse_sensitivity")
             s.mouseSensitivity = std::clamp(std::strtof(v, nullptr), 0.05f, 20.0f);
         else if (key == "internal_scale")
-            s.internalScale = std::clamp(std::atoi(v), 1, 4);
+            s.internalScale = std::clamp(std::atoi(v), 0, 4); // 0 = Auto
         else if (key == "flicker_filter")
             s.flickerFilter = std::atoi(v) != 0;
         else if (key == "vsync")
@@ -430,13 +430,26 @@ void ps2HostSettingsLoad()
     ps2HostSettingsApplyRenderer();
 }
 
+// Auto: the smallest whole multiple of the PS2's 448 lines that roughly covers
+// the window (90% of its height), 1x-4x. 720p -> 2x, 1080p -> 3x (rendered at
+// 1344 lines and scaled down, sharper than a fractional 2.25x would be), 1440p
+// -> 3x, 4K -> 4x. The renderer only works in whole multiples.
+int ps2HostSettingsEffectiveScale()
+{
+    if (g_settings.internalScale >= 1)
+        return g_settings.internalScale;
+    const int height = IsWindowReady() ? GetScreenHeight() : 1080;
+    const int wanted = static_cast<int>(std::ceil(0.9 * static_cast<double>(std::max(height, 1)) / 448.0));
+    return std::clamp(wanted, 1, 4);
+}
+
 void ps2HostSettingsApplyRenderer()
 {
     // PS2X_GS_SCALE (tests) wins over the saved value at startup.
     static const char *s_envScale = std::getenv("PS2X_GS_SCALE");
     static bool s_first = true;
     if (!(s_first && s_envScale))
-        g_gsGpuScaleRequest.store(static_cast<uint32_t>(g_settings.internalScale), std::memory_order_relaxed);
+        g_gsGpuScaleRequest.store(static_cast<uint32_t>(ps2HostSettingsEffectiveScale()), std::memory_order_relaxed);
     s_first = false;
     g_gsFlickerFilter.store(g_settings.flickerFilter, std::memory_order_relaxed);
     // PS2X_FRAME_RATE overrides it from the environment, like the other settings
@@ -546,6 +559,20 @@ void ps2HostSettingsRequestWindowApply()
 void ps2HostSettingsApplyWindow()
 {
     PS2HostSettings &s = g_settings;
+    // Auto internal resolution follows the window: re-evaluate when it
+    // changes size (a scale change rebuilds the render targets, so only then).
+    if (s.internalScale == 0)
+    {
+        static int s_lastAuto = 0;
+        const int scale = ps2HostSettingsEffectiveScale();
+        if (scale != s_lastAuto)
+        {
+            s_lastAuto = scale;
+            static const char *s_envScale = std::getenv("PS2X_GS_SCALE");
+            if (s_envScale == nullptr)
+                g_gsGpuScaleRequest.store(static_cast<uint32_t>(scale), std::memory_order_relaxed);
+        }
+    }
     // Applied every call (the host calls this each frame) so the toggle takes
     // effect at once; the static keeps the GL call from being re-issued.
     static int s_appliedVsync = -1;
