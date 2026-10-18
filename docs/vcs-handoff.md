@@ -4,6 +4,49 @@ State as of 2026-10-17 (`vcs-bringup` is `9b42cc6`; the `release` branch players
 from is `f4a8c39` = `stories-v0.1.1`, and the launcher is its own repo at `8211126`).
 Read this before changing anything. A reviewer will check work against it.
 
+## 2026-10-18 (Claude): memory card saves now load
+
+**The load never happened - not because of the save, but because the port's
+`GetDir` sorted the save folder's listing alphabetically.** On a real card the
+listing is in directory (creation) order: the game writes its fixed files first
+(`icon.sys`, `vcsicon.ico`, `BASLUS-21590GTA40001`) and its numbered save files
+last (`1 Soldier`). VCS finds its saves *by position*: it reads entries 5..14
+and matches the leading digit against the save slot ("%d"). Alphabetising
+pulled `1 Soldier` forward to position 2, so the game read `icon.sys`,
+concluded the card was valid, and silently started a new game - which looked
+exactly like "the save is not loading" because a fresh game and a save at
+mission 1 start in the same barracks. Fixed in `905abf2`: the listing keeps the
+two special entries first, then named files, then numbered saves (the split
+that reproduces the real creation order, deterministically, on any host
+filesystem). Verified from the card logs: the game now reads the full save file
+(98304 bytes, byte-exact). Owner-confirmed working on a real play session.
+
+**How this was found** (in case the save path breaks again): the port's card
+emulation was verified correct end to end - `GetInfo`/`Chdir`/`GetDir`/open/
+read all answer what the game asks, byte-perfect. The game's own recompiled
+card library (EE code at `0x274d40`-`0x276560`, files `runner/FUN_0027*.cpp`)
+validates the save: finds five files by name, memcmp's `icon.sys` against
+`"PS2D"`, then runs a date-record validator (24-byte records at
+`0x510940 + slot*0x4C0`, u32 Sec/Min/Hour/Day/Month/Year, needs a non-zero
+month). Those records stay zero unless the game's entry-table fill succeeds,
+and that fill only keeps entries whose leading digit matches the slot number -
+hence the positional dependency. The game's decision chain that matters:
+`FUN_277688` (card decision) -> `FUN_276AB0` (validate the save, returns 1) ->
+`FUN_2762A8` (date-record check) -> `FUN_277318` (entry-table scan, gates at
+`+0x120` name byte / `+0x114` attr &0x80 / `+0x110` size <= 0x17FFF).
+
+**Also on the card (`921e48b`, `402fc66`).** The card root no longer defaults
+to inside the game folder (updating game data would take saves with it);
+portable builds put it beside `portable.txt`, and a card already beside the ELF
+still wins. `GetEntSpace` now reports the real free space (8192 clusters)
+instead of a hardcoded 1024.
+
+**Not investigated further:** in headless test runs the post-load world stream
+sat on the loading screen for minutes (the game idles at ~4% CPU, so it is a
+wait, not work). The owner's real sessions load fine, so this was left alone;
+if loads ever feel slow in play, the CD stream timing model
+(`cdStreamWakeTickForSectors` in `CD.cpp`) is the suspect.
+
 ## 2026-10-18 (Claude): GPU renderer cost on weak GPUs, and free aim
 
 **Renderer (`1443223`, `675f2fb`).** The owner's Windows box is an RTX 3050
