@@ -4875,14 +4875,44 @@ void main()
             // VU1 worker and the game thread behind it. Nothing finished yet:
             // the host keeps the frame it has, and a later VBlank collects this
             // one (PollPresentation).
+            // But never more than two presents in flight: with nothing else
+            // holding it back this thread could queue seconds of work ahead
+            // of a busy driver, and the newest *finished* frame then lagged
+            // just as far - the picture froze for seconds while the game ran
+            // on (seen on the laptop once the stream rings stopped stalling).
+            // Waiting for the oldest copy keeps the GPU at most two frames
+            // behind.
+            constexpr int kMaxInFlight = 2;
+            {
+                int pending = 0;
+                ReadbackSlot *oldest = nullptr;
+                for (ReadbackSlot &other : m_readbackRing)
+                    if (other.fence != nullptr)
+                    {
+                        ++pending;
+                        if (oldest == nullptr || other.serial < oldest->serial)
+                            oldest = &other;
+                    }
+                // One copy is added per present, so one wait restores the cap.
+                if (pending > kMaxInFlight)
+                    gl.glClientWaitSync(oldest->fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+            }
+            static uint32_t s_unchangedStreak = 0;
             if (ReadbackSlot *ready = newestFinishedReadback())
             {
                 takeReadback(*ready, frame);
                 readWidth = ready->width;
                 readHeight = ready->height;
+                // A visible hold: the picture did not change for this many presents.
+                if (s_unchangedStreak >= 10u)
+                    std::fprintf(stderr, "[gs] display held for %u presents waiting for the GPU\n", s_unchangedStreak);
+                s_unchangedStreak = 0;
             }
             else
+            {
                 frame.unchanged = true;
+                ++s_unchangedStreak;
+            }
         }
         // PS2X_GS_PRESENT_DUMP=<prefix>: write presented frames 20..80 as binary
         // PPMs <prefix>_NNN.ppm, for A/B checks. Every present, so consecutive
