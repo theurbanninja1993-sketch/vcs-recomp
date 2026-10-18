@@ -1635,6 +1635,35 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
     runtimeIoPaths() = normalized;
 }
 
+namespace
+{
+    // Where this build's memory card lives. See the call site for why it is not simply
+    // the game folder.
+    std::filesystem::path pickMemoryCardRoot(const std::filesystem::path &gameDir)
+    {
+        const std::filesystem::path beside = gameDir / "mc0";
+        std::error_code ec;
+        bool besideHasSaves = false;
+        for (std::filesystem::directory_iterator it(beside, ec), last; !ec && it != last; it.increment(ec))
+        {
+            const std::string name = it->path().filename().string();
+            if (name != "." && name != "..")
+            {
+                besideHasSaves = true;
+                break;
+            }
+        }
+        if (besideHasSaves)
+            return beside;
+
+        const std::filesystem::path parent = gameDir.parent_path();
+        if (!parent.empty() && std::filesystem::exists(parent / "portable.txt", ec) && !ec)
+            return parent / "mc0";
+
+        return beside;
+    }
+}
+
 void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
 {
     IoPaths paths = runtimeIoPaths();
@@ -1648,7 +1677,15 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
     {
         paths.hostRoot = paths.elfDirectory;
         paths.cdRoot = paths.elfDirectory;
-        paths.mcRoot = paths.elfDirectory / "mc0";
+        // The disc root has to be the ELF's folder, but the memory card must not be.
+        // Putting it there buries the player's saves inside the game data, so updating
+        // the game - or using a read-only copy of it - takes them with it.
+        //
+        // A portable build ships `portable.txt` one level above the game folder, beside
+        // the mc0/mc1 its packaging creates, and that is where the card belongs. A card
+        // that already sits beside the ELF wins while it has anything in it, so existing
+        // saves keep working.
+        paths.mcRoot = pickMemoryCardRoot(paths.elfDirectory);
     }
 
     setIoPaths(paths);
