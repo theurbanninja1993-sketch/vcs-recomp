@@ -22,10 +22,16 @@ an A/B of each of those changed nothing.
   kept in `scratch/vcs-vu1.backup-20261017`). `build` is reconfigured to it.
   Same test after: cutscene 0-1/600 late, no underruns, VU1 worker 12-20%. The
   owner reports a locked 60.
-- **`build-win` still points at the 15-program `/tmp` set**: reconfigure it with
-  `-DPS2X_VU1_PROGRAMS=<root>/vcs-vu1` before the next Windows build. This is
-  likely part of the Windows 20-30 fps. `/tmp` is tmpfs, so that set also
-  vanishes on reboot.
+- **Windows: same cause, now fixed.** `build-win` is reconfigured to `vcs-vu1`
+  and rebuilt. The owner's last Windows perf log (RX 9070 XT, real Windows) had
+  17-49k interpreted VU1 calls per 10 s and VU0 ~2.5-3 s per 10 s, at 21-33 fps.
+  OpenCode's "126 us per VU1 call, VU1-bound and serial" in the Windows section
+  below is the interpreter, not compiled VU1. Under Proton with the owner's
+  settings (HD pack, 4x): old exe 45-49 fps in the opening cutscene, 98-117/600
+  late, 112k underruns; new exe 60 fps, 0-1/600 late, no underruns, VU1 worker
+  16-25%. The new exe is on the stick (`windows/ps2EntryRunner.exe`, old kept as
+  `ps2EntryRunner.before-vu-fix.exe.bak`, CHECKSUMS.txt regenerated). Pending:
+  the owner's test on real Windows.
 - **Player builds (`build.sh`):** the learn run now records VU0 programs too
   (`PS2X_VU0_CAPTURE`), and `games/vcs/game.toml` rides Sgt. Martinez's bike after
   the intro (7000 frames). Measured with this route: 22 programs (8 VU0) instead
