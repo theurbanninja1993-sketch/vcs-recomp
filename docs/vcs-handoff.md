@@ -4,6 +4,42 @@ State as of 2026-10-17 (`vcs-bringup` is `9b42cc6`; the `release` branch players
 from is `f4a8c39` = `stories-v0.1.1`, and the launcher is its own repo at `8211126`).
 Read this before changing anything. A reviewer will check work against it.
 
+## 2026-10-18 (Claude): GPU renderer cost on weak GPUs, and free aim
+
+**Renderer (`1443223`, `675f2fb`).** The owner's Windows box is an RTX 3050
+*Laptop*. Three costs fixed, each with an env switch back to the old path:
+- Presentation readback was a synchronous `glGetTextureSubImage` every frame
+  (CPU waited for the whole frame on the GPU). Now a fenced pack-buffer ring,
+  one present of latency; repeat VBlanks collect it via
+  `GSRasterBackend::PollPresentation`. `PS2X_GS_ASYNC_READBACK=0` = old.
+- Stale render-target rows were all reloaded on any draw/texture read/present;
+  the display target is grown to 1024 rows (pow2 texture reads) over the memory
+  the game streams textures into, so ~100 needless reloads a frame at the
+  upscaled size. Loads are now limited to the rows drawn/sampled/shown (dirty
+  and stale kept disjoint). `PS2X_GS_FULL_STALE_LOAD=1` = old. 4x GPU time per
+  game frame on a 9070: 9.5 -> 5.3 ms.
+- Per-draw driver CPU on NVIDIA (cutscenes late at *any* scale, driver thread
+  60-83%): vertices and upload data now stream through persistently mapped
+  rings (`PS2X_GS_STREAM_RING=0` = old `glBufferSubData` path), replacement
+  textures use sampler objects, and the overlay-mask draws no longer issue a
+  `glMemoryBarrier` each. Result on the laptop: gameplay locked 60 at 4x (owner
+  confirmed after the first two). Cutscene result for the third: awaiting the
+  owner's `play-cutscene-new.cmd` / `play-cutscene-old.cmd` A/B on the stick.
+- Measuring: `PS2X_GS_GPU_TIMERS=1` prints GPU ms per present by kind
+  (GL_TIME_ELAPSED) plus ring stalls; `PS2X_GS_LOAD_TRACE=<present>` logs one
+  frame's loads/resolves/stale marks. A fast desktop GPU does not reproduce
+  laptop behaviour - ask for the owner's logs.
+
+**Free aim (`49f137c`).** On foot with a gun the aim button (RMB; LT on the
+Modern/Custom pad layouts) no longer sends R1: crosshair (host overlay), camera
+over the shoulder and levelled, player faces the camera when standing, and the
+player's instant-hit shots are re-aimed at the crosshair ray's hit (rotation
+from the ped's facing, so shotgun spread is kept). Setting `free_aim` (Controls
+> Aiming, default on). Key addresses and hooks are in the commit message and
+next to `vcsFreeAimShot` in `game_overrides.cpp`. Not done: projectiles
+(rockets/grenades) still fly along the ped's heading; no strafe animation while
+moving (the game only strafes in lock-on); LCS parity.
+
 ## Read first: the compiled VU program set (2026-10-17, Claude)
 
 **Slowdown since 10-16 found and fixed in the dev build.** The owner saw dips to
