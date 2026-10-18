@@ -1376,6 +1376,38 @@ namespace
                 std::memcpy(rdram + ped + off, &heading, 4);
     }
 
+    // PS2X_VCS_PED_DUMP=<every>: dump the player ped (0x1000 bytes) to
+    // ped_<frame>_m<camera mode>.bin every that many frames (reverse
+    // engineering aid; runs from the per-frame hook, any camera mode).
+    void vcsPedDump(uint8_t *rdram)
+    {
+        {
+            static const uint64_t s_every = []()
+            {
+                const char *env = std::getenv("PS2X_VCS_PED_DUMP");
+                return env ? std::strtoull(env, nullptr, 10) : 0ull;
+            }();
+            static uint64_t s_next = 0;
+            const uint64_t frame = g_ps2PresentedFrameCounter.load(std::memory_order_relaxed);
+            if (s_every != 0u && frame >= s_next)
+            {
+                s_next = frame + s_every;
+                if (const uint32_t ped = vcsPlayerPed(rdram); ped != 0u && ped + 0x1000u <= PS2_RAM_SIZE)
+                {
+                    uint16_t mode = 0;
+                    std::memcpy(&mode, rdram + 0x006F4540u, 2);
+                    char path[64];
+                    std::snprintf(path, sizeof(path), "ped_%llu_m%u.bin", (unsigned long long)frame, mode);
+                    if (FILE *f = std::fopen(path, "wb"))
+                    {
+                        std::fwrite(rdram + ped, 1, 0x1000, f);
+                        std::fclose(f);
+                    }
+                }
+            }
+        }
+    }
+
     void vcsFollowPedCam(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         // Last update's shoulder offset comes off first: the camera logic
@@ -2160,6 +2192,7 @@ namespace
 
     void vcsFrameUpdate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        vcsPedDump(rdram);
         // The game's silent slot is our Custom Soundtracks station: keep its GXT
         // name "Custom" (or "Radio Off" while the radio is switched off).
         vcsKeepCustomName(rdram);
@@ -2402,8 +2435,31 @@ namespace
         g_vcsOrigLineOfSight(rdram, ctx, runtime);
     }
 
+    // PS2X_CAM_TRACE=1: which CCam CCam::Process (0x294540) runs, and its
+    // mode, whenever either changes (reverse engineering aid).
+    PS2Runtime::RecompiledFunction g_vcsOrigCamProcess = nullptr;
+    void vcsCamProcessTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t cam = getRegU32(ctx, 4);
+        static uint32_t s_lastCam = 0;
+        static uint16_t s_lastMode = 0xFFFFu;
+        uint16_t mode = 0;
+        if (cam >= 0x00100000u && cam + 2u <= PS2_RAM_SIZE)
+            std::memcpy(&mode, rdram + cam, 2);
+        if (cam != s_lastCam || mode != s_lastMode)
+        {
+            s_lastCam = cam;
+            s_lastMode = mode;
+            std::fprintf(stderr, "[camtrace] f=%llu cam=0x%x mode=%u\n",
+                         (unsigned long long)g_ps2PresentedFrameCounter.load(std::memory_order_relaxed), cam, mode);
+        }
+        g_vcsOrigCamProcess(rdram, ctx, runtime);
+    }
+
     void applyGtaVcsUs(PS2Runtime &runtime)
     {
+        if (std::getenv("PS2X_CAM_TRACE") && (g_vcsOrigCamProcess = runtime.lookupFunction(0x00294540u)))
+            runtime.replaceFunction(0x00294540u, &vcsCamProcessTrace);
         if ((g_vcsOrigFollowPedCam = runtime.lookupFunction(0x0029DAB0u)))
             runtime.replaceFunction(0x0029DAB0u, &vcsFollowPedCam);
         if ((g_vcsOrigFollowCarCam = runtime.lookupFunction(0x0029FAF0u)))
