@@ -47,6 +47,21 @@ wait, not work). The owner's real sessions load fine, so this was left alone;
 if loads ever feel slow in play, the CD stream timing model
 (`cdStreamWakeTickForSectors` in `CD.cpp`) is the suspect.
 
+## 2026-10-18 later (Claude): laptop cutscenes - profile, don't guess
+
+Perf-log thread % is of *emulated* time (>100% = can't keep up). On the owner's
+RTX 3050 laptop the game thread read 200-280% in dense cutscenes vs ~35% on the
+desktop. A Windows sampling profiler now exists: `PS2X_HOST_PROFILE=<file>`
+(stick: `play-profile.cmd`); symbolize with `llvm-nm -C` of the same
+`build-win` exe (nearest symbol; llvm-symbolizer fails on no-debug-info code).
+It cannot run under Wine (thread suspension breaks X). Fixed from its data:
+frame copies on the game thread (`b13553a`), the readback fence wait in the
+NVIDIA driver (`c17a5e6`: never wait, hand over the newest finished copy) and
+stream-ring stalls (`049ef80`: 64 MiB, 8 segments). Owner after `c17a5e6`:
+cutscenes ~60, desync mostly gone, some stutter near the end of the dense one.
+The profiler merges threads that share a name (the IOP worker is also called
+"GameThread").
+
 ## 2026-10-18 (Claude): GPU renderer cost on weak GPUs, and free aim
 
 **Renderer (`1443223`, `675f2fb`).** The owner's Windows box is an RTX 3050
