@@ -4,6 +4,42 @@ State as of 2026-10-18 (`vcs-bringup` is the tip the `release` branch players bu
 from was cut at, tagged `stories-v0.1.3`; the launcher is its own repo at `d964ca8` =
 `v0.1.2`). Read this before changing anything. A reviewer will check work against it.
 
+## 2026-10-18 (Claude): a converted image that would not read, and what a hash mismatch means
+
+The owner converted his CHD back to an image and the build rejected it. Working
+through it with his own CHD turned up two layouts the reader did not know, and
+one thing worth writing down about what the hash check can and cannot tell you.
+
+**Every conversion of *his* CHD, done here, reads correctly.** `chdman extractcd`
+writes a 2048-byte image and it hashes exactly like the CHD; so does the `.bin`
+his own Windows tool produced, and the `iso/vcs.iso` in this project. All four
+CHD copies on the machine are md5-identical. So the image that failed is not on
+this machine, and could not be reproduced from the CHD.
+
+**Two layouts were genuinely unreadable, and are now read** - both of them things
+a person converting a CHD can easily end up with:
+
+| what | stride | how it arises | before | now |
+|---|---|---|---|---|
+| `chdman extractdvd` output | 2448 | the wrong subcommand for a CD-based CHD | not an ISO9660 disc image | reads |
+| raw DVD sectors | 2064 | a raw dump of a PlayStation 2 DVD | not an ISO9660 disc image | reads |
+| 2048-byte ISO | 2048 | `chdman extractcd` | reads | reads |
+| raw CD, data at 0 / 16 / 24 | 2352 | mode 1, mode 2 form 1, or a pass-through tool | reads | reads |
+
+The reader now tries all of them and lets the volume descriptor decide, so a wrong
+guess is never accepted and a right one is never missed. Verified: all six report
+the same boot hash, and each is byte-identical on the boot ELF.
+
+**What a hash mismatch means, since the message said too little.** If an image
+parses as ISO9660 and the boot file still hashes differently, the bytes really do
+differ: it is a different region, a different pressing, or an image a tool has
+edited. That is a different problem from a layout the reader cannot handle, and
+the two used to look alike - "this disc is not the one this source is for" with no
+explanation. The launcher now says which, and `ps2x_iso check` already names the
+disc it found ("Recognised: Grand Theft Auto: Liberty City Stories", or "not one
+of the two games this is for"), which the build log carries. Tested by pointing
+the VCS recipe at the LCS disc.
+
 ## 2026-10-18 (Claude): cut `stories-v0.1.3`, with launcher `v0.1.2`
 
 Both are published. The port's `release` branch is a fast-forward of the dev tip,
