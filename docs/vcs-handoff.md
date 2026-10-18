@@ -1,8 +1,39 @@
 # GTA Vice City Stories (SLUS_215.90) recomp: handoff notes
 
 State as of 2026-10-18 (`vcs-bringup` is the tip the `release` branch players build
-from was cut at, tagged `stories-v0.1.2`; the launcher is its own repo at `d632394` =
-`v0.1.1`). Read this before changing anything. A reviewer will check work against it.
+from was cut at, tagged `stories-v0.1.3`; the launcher is its own repo at `d964ca8` =
+`v0.1.2`). Read this before changing anything. A reviewer will check work against it.
+
+## 2026-10-18 (Claude): cut `stories-v0.1.3`, with launcher `v0.1.2`
+
+Both are published. The port's `release` branch is a fast-forward of the dev tip,
+tagged `stories-v0.1.3`, and the launcher is `d964ca8` = `v0.1.2` with Linux and
+Windows folders attached to the release.
+
+What a player gets over `stories-v0.1.2`: their disc in whichever shape they keep
+it - `.iso`, `.bin`, `.cue` or `.chd` - plus everything in the launcher section
+below (the fetch recovery and the build log).
+
+Verified end to end, which is what makes this one safe to ship: the launcher's own
+build engine (driven headlessly, `builder::run` against a fresh clone) read the
+owner's **CHD** through every step - check, extract, recompile, install, compile,
+two VU1 learning passes - and the runner it produced boots and renders the game.
+The reads are correct rather than merely plausible: the boot ELF, `/SYSTEM.CNF`,
+`/MAINLA.IMG` (282 MB) and `/BEACH.IMG` (230 MB) all come out byte-identical to the
+same disc extracted from a `.bin`.
+
+**One thing to look at, and it is not something this release changed.** A fresh
+build's VU1 learning passes recorded **15** microprograms with an empty card and
+**13** with the owner's save on it, where `games/vcs/game.toml` documents 22 for
+that route ("the fast-boot script, the opening cutscene, then taking Sgt.
+Martinez's bike"). Same route, same 7000 frames, so the count is not about the
+card: the presses are frame-indexed, and if the game is still in its intro when
+they land, the route never reaches the bike. Only the disc path moved in this
+release, so a player's build has always behaved this way - but a first build
+compiling fewer microprograms than the manifest promises is precisely the thing
+that costs frame rate, so it is worth either re-tuning the route against a fresh
+boot or letting the launcher bake in what the player's own play records (which is
+what `build.sh --optimize` does, and how the 30-program builds were made).
 
 ## 2026-10-18 (Claude): CHD discs, and what the launcher does when a build breaks
 
