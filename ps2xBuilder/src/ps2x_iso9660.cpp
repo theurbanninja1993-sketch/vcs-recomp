@@ -111,6 +111,11 @@ namespace ps2x
         chd_file *chd = static_cast<chd_file *>(m_chd);
         const chd_header *head = chd_get_header(chd);
         const uint32_t framesPerHunk = head->hunkbytes / m_chdFrameBytes;
+        if (framesPerHunk == 0)
+        {
+            m_readError = "the CHD's hunks are smaller than one of its frames";
+            return false;
+        }
         for (uint32_t i = 0; i < count; ++i)
         {
             const uint32_t frame = lba + i;
