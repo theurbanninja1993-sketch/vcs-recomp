@@ -25,8 +25,11 @@ namespace
 
     // How far the IOP may fall behind before its backlog is dropped. A long
     // stall (a load, a disc read) must not come back as a burst of catch-up
-    // work; two VBlanks of slack is what the inline path allowed.
-    constexpr uint64_t kMaxLagEeCycles = 2u * kEeCyclesPerVBlank;
+    // work - but the backlog *is* audio, and two VBlanks (33 ms) of slack was
+    // less than a busy laptop delays this thread routinely: it lost ~7% of the
+    // cutscene audio for good, and the voices fell steadily behind the
+    // animation. Twenty VBlanks (~0.33 s) still fits the 0.68 s output ring.
+    constexpr uint64_t kMaxLagEeCycles = 20u * kEeCyclesPerVBlank;
 }
 
 // Sampled-thread bookkeeping and call counts for the perf log. The PC sampler

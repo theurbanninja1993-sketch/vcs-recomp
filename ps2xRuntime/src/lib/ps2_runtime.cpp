@@ -161,6 +161,7 @@ struct ProgramHeader
 
 extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
 std::atomic<bool> g_ps2Crosshair{false};
+bool (*g_ps2AudioFollowsGameClock)(const uint8_t *rdram) = nullptr;
 // Present only in -fprofile-generate builds.
 extern "C" void __gcov_dump(void) __attribute__((weak));
 // And clang's equivalent, which both of its profiling modes provide. The port is
@@ -1025,6 +1026,17 @@ void PS2Runtime::advanceIopVBlank() noexcept
         }
         const double elapsed = std::chrono::duration<double>(now - m_iopLastReal).count();
         m_iopLastReal = now;
+        // In a cutscene: one VBlank of IOP time per VBlank, so the dialogue
+        // and the animation advance together. On real time (below), a slow
+        // stretch let the voices run ahead of the pictures, and the 2-VBlank
+        // cap then also lost audio for good after a late VBlank - the cutscene
+        // desync on the owner's laptop. PS2X_AUDIO_REALTIME=1 keeps real time.
+        static const bool s_realtime = std::getenv("PS2X_AUDIO_REALTIME") != nullptr;
+        if (!s_realtime && g_ps2AudioFollowsGameClock != nullptr && g_ps2AudioFollowsGameClock(m_memory.getRDRAM()))
+        {
+            m_iopWorker->addAllowedEeCycles(kEeCyclesPerVBlank);
+            return;
+        }
         m_iopWorker->addAllowedEeCycles(std::min<uint64_t>(
             static_cast<uint64_t>(elapsed * static_cast<double>(kEeClockHz)), 2u * kEeCyclesPerVBlank));
         return;
@@ -1047,7 +1059,11 @@ void PS2Runtime::advanceIopVBlank() noexcept
     const double elapsed = std::chrono::duration<double>(now - m_iopLastReal).count();
     m_iopLastReal = now;
     const uint64_t realEeCycles = static_cast<uint64_t>(elapsed * static_cast<double>(kEeClockHz));
-    m_iopEeAllowed += std::min<uint64_t>(realEeCycles, 2u * kEeCyclesPerVBlank);
+    static const bool s_realtime = std::getenv("PS2X_AUDIO_REALTIME") != nullptr;
+    if (!s_realtime && g_ps2AudioFollowsGameClock != nullptr && g_ps2AudioFollowsGameClock(m_memory.getRDRAM()))
+        m_iopEeAllowed += kEeCyclesPerVBlank; // cutscene: game time (see the worker branch)
+    else
+        m_iopEeAllowed += std::min<uint64_t>(realEeCycles, 2u * kEeCyclesPerVBlank);
     // Keep within two VBlanks of real time when the EE reports too few cycles.
     if (m_iopEeAllowed > iopEe + 2u * kEeCyclesPerVBlank)
         m_iopSubsystem->runEeCycles(m_iopEeAllowed - iopEe - kEeCyclesPerVBlank);

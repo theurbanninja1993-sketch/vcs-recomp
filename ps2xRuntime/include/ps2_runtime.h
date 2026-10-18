@@ -248,6 +248,11 @@ extern bool g_ps2TraceBoolWrites;
 extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
 // Free aim: the host draws a crosshair at the centre of the picture.
 extern std::atomic<bool> g_ps2Crosshair;
+// When set and true, the IOP (and the sound chip it clocks) runs on game time
+// - one VBlank per VBlank - instead of real time. Game-specific: VCS sets it
+// to "a cutscene is playing", where the voices must stay with the animation
+// even if the emulation falls behind (the price is a gap, not drift).
+extern bool (*g_ps2AudioFollowsGameClock)(const uint8_t *rdram);
 
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,

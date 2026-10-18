@@ -2479,6 +2479,15 @@ namespace
         runtime.padBackend().setVehicleProbe(&vcsPlayerInVehicle, runtime.memory().getRDRAM());
         runtime.padBackend().setMenuProbe(&vcsPauseMenuOpen, runtime.memory().getRDRAM());
         runtime.padBackend().setCutsceneProbe(&vcsInCutscene, runtime.memory().getRDRAM());
+        // Cutscene dialogue stays with the animation (see g_ps2AudioFollowsGameClock).
+        g_ps2AudioFollowsGameClock = [](const uint8_t *rdram)
+        {
+            // In-engine cutscenes only: the FMV movies are paced by their own
+            // audio already (vcsInCutscene also counts a recent movie picture).
+            uint32_t value = 0;
+            std::memcpy(&value, rdram + 0x006F4D14u, 4);
+            return value != 0u;
+        };
         g_vcsFnRadioEntity = runtime.lookupFunction(0x001B5768u);
         if ((g_vcsOrigRadioUpdate = runtime.lookupFunction(0x0018AAD8u)))
             runtime.replaceFunction(0x0018AAD8u, &vcsRadioUpdate);
