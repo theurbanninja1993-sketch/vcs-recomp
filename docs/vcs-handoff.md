@@ -1,8 +1,8 @@
 # GTA Vice City Stories (SLUS_215.90) recomp: handoff notes
 
 State as of 2026-10-18 (`vcs-bringup` is the tip the `release` branch players build
-from was cut at, tagged `stories-v0.1.2`; the launcher is its own repo at `b8f8940`).
-Read this before changing anything. A reviewer will check work against it.
+from was cut at, tagged `stories-v0.1.2`; the launcher is its own repo at `d632394` =
+`v0.1.1`). Read this before changing anything. A reviewer will check work against it.
 
 ## 2026-10-18 (Claude): cut `stories-v0.1.2`
 
@@ -30,6 +30,11 @@ What a player gets over `stories-v0.1.1` (`f4a8c39`):
 Not in it: the game's own invert-look default, which the owner parked
 deliberately - the two RAM dumps taken to find its settings byte were not
 paused, so the byte never surfaced - and frame interpolation, parked earlier.
+
+The launcher is released with it as `v0.1.1` (`d632394`), carrying the
+dual-GPU Optimus/PowerXpress exports and nothing else new. That release is a
+courtesy, not the mechanism: the launcher already follows the port's `release`
+branch, so a player's update picks up `stories-v0.1.2` without a new download.
 
 ## 2026-10-18 (Claude): memory card saves now load
 
