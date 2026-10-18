@@ -1232,7 +1232,17 @@ void PSPadBackend::updateHostInput()
         }
         return false;
     };
-    if (g_ps2SettingsMenuOpen.load(std::memory_order_relaxed))
+    // Track the settings-menu open->close edge *before* the early return below,
+    // so a close is noticed even though the menu-open branch returns.
+    static bool s_settingsWasOpen = false;
+    static bool s_wantCapture = false;
+    const bool settingsOpenNow = g_ps2SettingsMenuOpen.load(std::memory_order_relaxed);
+    const bool settingsJustClosed = s_settingsWasOpen && !settingsOpenNow;
+    s_settingsWasOpen = settingsOpenNow;
+    const bool mouseLookMode =
+        ps2HostSettings().displayMode != PS2HostSettings::DisplayMode::Windowed;
+
+    if (settingsOpenNow)
     {
         if (captured)
             EnableCursor();
@@ -1240,30 +1250,34 @@ void PSPadBackend::updateHostInput()
         GetMouseDelta();
         return;
     }
-    // Auto-capture in fullscreen/borderless: once at launch and again whenever
-    // the settings menu closes. A click still captures in any mode, so windowed
-    // play keeps the cursor until it is clicked.
+    // Auto-capture in fullscreen/borderless: at launch and whenever the settings
+    // menu closes. The intent is kept until the window is focused and the
+    // capture actually happens, so a slow focus at launch is not lost. A click
+    // still captures in any display mode.
     static bool s_didLaunchCapture = false;
-    static bool s_settingsWasOpen = false;
-    const bool settingsOpenNow = g_ps2SettingsMenuOpen.load(std::memory_order_relaxed);
-    const bool settingsJustClosed = s_settingsWasOpen && !settingsOpenNow;
-    s_settingsWasOpen = settingsOpenNow;
-    const bool mouseLookMode =
-        ps2HostSettings().displayMode != PS2HostSettings::DisplayMode::Windowed;
-    if (!captured && IsWindowFocused() && mouseLookMode &&
-        (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || !s_didLaunchCapture || settingsJustClosed))
+    if (!s_didLaunchCapture)
+    {
+        s_didLaunchCapture = true;
+        if (mouseLookMode)
+            s_wantCapture = true;
+    }
+    if (settingsJustClosed)
+        s_wantCapture = true;
+
+    if (!captured && IsWindowFocused() &&
+        (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || (s_wantCapture && mouseLookMode)))
     {
         DisableCursor();
         GetMouseDelta(); // swallow motion made while the cursor was free
         captured = true;
+        s_wantCapture = false;
     }
     else if (captured && (releaseMousePressed() || !IsWindowFocused()))
     {
         EnableCursor();
         captured = false;
-    }
-    s_didLaunchCapture = true;
-    m_mouseCaptured.store(captured, std::memory_order_relaxed);
+        s_wantCapture = false;
+    }    m_mouseCaptured.store(captured, std::memory_order_relaxed);
     if (!captured)
         return;
     // Direct mouse look (applied to the camera by a game hook, see
