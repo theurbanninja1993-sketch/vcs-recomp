@@ -2367,7 +2367,7 @@ void main()
         if (m_streamRing)
         {
             bool recreated = false;
-            ringOffset = ringAlloc(m_vertexRing, bytes, sizeof(Vertex), 8u << 20, recreated);
+            ringOffset = ringAlloc(m_vertexRing, bytes, sizeof(Vertex), 64u << 20, recreated);
             if (ringOffset != SIZE_MAX)
             {
                 if (recreated)
@@ -2713,7 +2713,7 @@ void main()
         if (m_streamRing)
         {
             bool recreated = false;
-            ringOffset = ringAlloc(m_stagingRing, bytes, static_cast<size_t>(m_ssboAlign), 16u << 20, recreated);
+            ringOffset = ringAlloc(m_stagingRing, bytes, static_cast<size_t>(m_ssboAlign), 64u << 20, recreated);
             if (ringOffset != SIZE_MAX)
             {
                 std::memcpy(m_stagingRing.base + ringOffset, data, streamBytes);
@@ -5036,7 +5036,10 @@ void main()
 
     size_t Renderer::ringAlloc(StreamRing &ring, size_t bytes, size_t align, size_t initialSize, bool &recreated)
     {
-        constexpr int kSegments = 4;
+        // Eight segments of a 64 MiB ring: a stall needs the GPU most of a lap
+        // behind. (8 MiB in four stalled the NVIDIA laptop in dense cutscenes,
+        // where its driver runs well behind the render thread.)
+        constexpr int kSegments = 8;
         GL &gl = m_context.gl;
         recreated = false;
         if (ring.buffer == 0 || bytes > ring.size / kSegments)

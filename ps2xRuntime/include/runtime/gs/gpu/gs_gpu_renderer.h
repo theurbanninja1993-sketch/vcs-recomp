@@ -508,7 +508,7 @@ namespace gsgpu
         GLuint m_vbo = 0;
         size_t m_vboCapacity = 0;
         // Streaming without the driver's help: a persistently mapped buffer
-        // written ahead of the GPU in four fenced segments. Rewriting one buffer
+        // written ahead of the GPU in eight fenced segments. Rewriting one buffer
         // with glBufferSubData for every draw made the driver stage a hidden
         // copy each time - on NVIDIA most of its per-draw CPU cost, which bound
         // dense cutscenes on a laptop. PS2X_GS_STREAM_RING=0: the old path.
@@ -518,7 +518,7 @@ namespace gsgpu
             uint8_t *base = nullptr;
             size_t size = 0, head = 0;
             int segment = 0;
-            GLsync fence[4] = {};
+            GLsync fence[8] = {};
         };
         StreamRing m_vertexRing, m_stagingRing;
         // Offset of `bytes` in the ring (aligned, within one segment), or
