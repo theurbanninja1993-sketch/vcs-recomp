@@ -2370,6 +2370,62 @@ disables the wall stop; `PS2X_CARLOOK_DEBUG=<file>` logs the whole path
       obvious home, with unlocks as an in-game toast the way the game itself would
       show one.
 
+    **The set itself: what the official trilogy does, so ours feels the same.** The
+    reference is *The Trilogy - The Definitive Edition* (2021), which is the only
+    official achievement set these games have ever had. Pulled from Steam's public
+    achievement data (2026-10-18), complete lists:
+
+    | game | achievements | hidden |
+    |---|---|---|
+    | GTA III - Definitive Edition | **29** | 4 |
+    | GTA Vice City - Definitive Edition | **34** | 4 |
+    | GTA San Andreas - Definitive Edition | **35** | 3 |
+
+    **The categories are stable across all three**, which is the useful part - it is
+    a house style, not three unrelated sets. Counted across the trilogy:
+
+    | category | III | VC | SA | what it looks like |
+    |---|---|---|---|---|
+    | story milestones | 5 | 7 | 5 | one per act, named after the mission: *"Complete 'The Exchange'."* |
+    | mission challenges | 4 | 4 | 3 | a special way through one mission, almost always hidden: *"Keep the two mafia members alive during 'Triads and Tribulations'."* |
+    | side activities | 6 | 9 | 8 | the whole job ladder: Paramedic 12, Firefighter, Vigilante 12, taxi fares, pizza, RC races, import/export, properties, vehicle school |
+    | collectibles / sets | 3 | 3 | 0 | *"Collect 100 hidden packages."*, *"Complete 20 unique jumps."*, *"Use every weapon at least once."* - always the whole set in one achievement, never one per item |
+    | stat and rating milestones | 5 | 6 | 6 | criminal rating tiers, respect, sex appeal, weight, six-star wanted level, $1,000,000, property damage |
+    | quirky one-offs | 3 | 4 | 9 | the flavour: listen to every station, a 30-second wheelie, keepie-uppy, buy a meal 8 times, drown, win at roulette |
+    | capstones | 2 | 2 | 3 | 100% completion, unlock everything ("the platinum"), and SA's *"...Here we go again"* for a new game after 100% |
+
+    **The rules that make it feel official**, worth following exactly:
+
+    - **Broad, not deep.** ~30 achievements spanning every system in the game, one to
+      three each. There is *no* achievement per story mission (VC has 59 missions and
+      7 story achievements), and no grinding spam - the whole of a collectible set is
+      one achievement.
+    - **Name is a joke or a quote; the description is the instruction.** *"Wheels Up -
+      Complete 20 unique jumps."* Consistent to the letter across all three sets.
+    - **Hidden means a spoiler or a special method** - never just "secret".
+    - **Exactly two capstones** in III and VC (100%, and unlock-all), which is the
+      shape a player reads as "the platinum".
+    - **Nothing difficulty-based**: these games have no difficulty setting, so no
+      achievement references one.
+
+    **Ours, by that recipe - 34 achievements, the same mix** (VCS's own content, all
+    of it verified against the game's guides):
+
+    | category | count | proposed |
+    |---|---|---|
+    | story milestones | 6 | the opening (**Soldier**), **Conduct Unbecoming**, **Boomshine Blowout**, **From Zero to Hero**, **Turn on, Tune in, Bug out**, and the finale (**Last Stand**) - VCS has 59 missions, so milestones only |
+    | mission challenges | 4 | hidden, authored per mission: a no-damage delivery, keeping Lance alive, a kill with a named weapon, a stealth route - the same shape as *"Kill the property developer with a Golf Club during 'Four Iron'."* |
+    | side activities | 9 | **Vice Sights** (5 levels), **Beach Patrol** (15), **Air Rescue** (15), **Fire Copter** (15), Paramedic 15, Firefighter 15, Vigilante 15, taxi fares, the **Shooting Range** (5 rounds) - plus **Empire Builder: acquire all 30 Empire Building Sites**, which is VCS's own system and deserves its slot |
+    | collectibles / sets | 3 | all **99 Red Balloons**, all **36 unique stunt jumps**, every **Rampage** |
+    | stat and rating milestones | 6 | $1,000,000, the top criminal rating, a six-star wanted level, maximum empire reputation, 100 gang kills, $1,000,000 in property damage |
+    | quirky one-offs | 4 | listen to every radio station at least once, a long wheelie, a round of Golf, **Crash!** |
+    | capstones | 2 | 100% completion, and unlock everything |
+
+    That lands at **34**, level with Vice City DE, which is the right sibling to match.
+    For contrast, RA's community set for VCS has **167** - a different philosophy
+    (exhaustive, plus subsets), and a far bigger authoring job. The official scale is
+    both more authentic and much less work.
+
 ## Third-party assets (release-page credits)
 
 Both packs are by **AL2009man**, MIT-licensed, (c) 2024 Al. Lopez:
