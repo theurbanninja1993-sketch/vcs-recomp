@@ -1,8 +1,35 @@
 # GTA Vice City Stories (SLUS_215.90) recomp: handoff notes
 
-State as of 2026-10-17 (`vcs-bringup` is `9b42cc6`; the `release` branch players build
-from is `f4a8c39` = `stories-v0.1.1`, and the launcher is its own repo at `8211126`).
+State as of 2026-10-18 (`vcs-bringup` is the tip the `release` branch players build
+from was cut at, tagged `stories-v0.1.2`; the launcher is its own repo at `b8f8940`).
 Read this before changing anything. A reviewer will check work against it.
+
+## 2026-10-18 (Claude): cut `stories-v0.1.2`
+
+The release branch is a fast-forward of the dev tip, tagged `stories-v0.1.2`.
+What a player gets over `stories-v0.1.1` (`f4a8c39`):
+
+- memory-card saves load at last - the listing is in creation-like order, not
+  alphabetical, because the game finds its saves by position (`905abf2`);
+- the card no longer has to live in the game folder (`921e48b`), and
+  `GetEntSpace` reports real free space instead of a hardcoded 1024 (`402fc66`);
+- the mouse is captured automatically at launch in fullscreen and borderless,
+  and re-captured on leaving the settings menu (`1244c2d`..`ccef7b7`) - the fix
+  is that the raw cursor mode is re-asserted, not raylib's `DisableCursor()`,
+  which re-centres the pointer on every call and zeroed the look delta;
+- modern free aim on keyboard/mouse and the Modern/Custom gamepad layouts
+  (`49f137c`), an FPS overlay, display options in display terms with Auto scale
+  (`4305b9f`), no music-folder station during in-engine cutscenes (`35e63af`);
+- the GPU renderer's per-draw overhead and presentation work
+  (`1443223`..`5b7bdfe`), and the VU program set learned during play in player
+  builds (`97ae75b`, `a260eb5`) - the two together are what took the Windows
+  port from 20-30 fps to a steady 60;
+- the generated function registry is untracked again, so a fresh clone builds
+  (`656b6f9`), which is what the launcher hands a player.
+
+Not in it: the game's own invert-look default, which the owner parked
+deliberately - the two RAM dumps taken to find its settings byte were not
+paused, so the byte never surfaced - and frame interpolation, parked earlier.
 
 ## 2026-10-18 (Claude): memory card saves now load
 
