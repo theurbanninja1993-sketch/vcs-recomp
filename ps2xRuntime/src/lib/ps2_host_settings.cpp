@@ -1,3 +1,4 @@
+#include <cmath>
 #include "runtime/ps2_host_settings.h"
 
 #include "runtime/ps2_platform.h"
@@ -555,6 +556,45 @@ void ps2HostSettingsApplyWindow()
             SetWindowState(FLAG_VSYNC_HINT);
         else
             ClearWindowState(FLAG_VSYNC_HINT);
+    }
+    // Borderless at startup on Windows can come out misplaced: the first
+    // apply runs before the window has settled on its monitor and DPI scale,
+    // and the resize Windows makes right after leaves the borderless window
+    // offset (toggling it off and on fixed it). So for the first seconds,
+    // check that the borderless window covers its monitor and, if not,
+    // re-apply - at most twice, logged either way.
+    {
+        static int s_frames = 0, s_retries = 0;
+        static bool s_reported = false;
+        ++s_frames;
+        if (s.displayMode == PS2HostSettings::DisplayMode::Borderless && IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) &&
+            s_frames >= 20 && s_frames <= 600 && s_frames % 20 == 0 && !g_windowApplyPending)
+        {
+            const int monitor = GetCurrentMonitor();
+            const Vector2 monitorPos = GetMonitorPosition(monitor);
+            const Vector2 windowPos = GetWindowPosition();
+            const int mw = GetMonitorWidth(monitor), mh = GetMonitorHeight(monitor);
+            const int ww = GetScreenWidth(), wh = GetScreenHeight();
+            const bool covers = std::abs(windowPos.x - monitorPos.x) < 2.0f && std::abs(windowPos.y - monitorPos.y) < 2.0f &&
+                                std::abs(ww - mw) < 2 && std::abs(wh - mh) < 2;
+            if (!covers && s_retries < 2)
+            {
+                ++s_retries;
+                std::fprintf(stderr,
+                             "[window] borderless misplaced (window %dx%d at %.0f,%.0f, monitor %d %dx%d at %.0f,%.0f): "
+                             "re-applying (%d)\n",
+                             ww, wh, windowPos.x, windowPos.y, monitor, mw, mh, monitorPos.x, monitorPos.y, s_retries);
+                ToggleBorderlessWindowed();
+                ToggleBorderlessWindowed();
+            }
+            else if (!s_reported && (covers || s_retries >= 2))
+            {
+                s_reported = true;
+                std::fprintf(stderr, "[window] borderless %s (window %dx%d at %.0f,%.0f, monitor %d %dx%d at %.0f,%.0f)\n",
+                             covers ? "ok" : "still misplaced after re-applying", ww, wh, windowPos.x, windowPos.y, monitor,
+                             mw, mh, monitorPos.x, monitorPos.y);
+            }
+        }
     }
     if (!g_windowApplyPending)
     {
