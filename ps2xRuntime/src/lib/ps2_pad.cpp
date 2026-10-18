@@ -1,3 +1,4 @@
+#include <GLFW/glfw3.h>
 #include "runtime/ps2_pad.h"
 #include "runtime/ps2_platform.h"
 #include "runtime/ps2_mods.h"
@@ -1198,7 +1199,7 @@ void PSPadBackend::updateHostInput()
     // F7: a marker in the log (playtest notes: "it happened here").
     // F8: snapshot EE RAM to ram_f8_<frame>.bin (memory diffing while playing,
     // e.g. finding the radio station variable).
-    if (IsKeyPressed(KEY_F8))
+    if (IsKeyPressed(KEY_F8) || IsKeyPressed(KEY_F9))
         g_ps2DumpRamRequest.store(true, std::memory_order_relaxed);
     if (IsKeyPressed(KEY_F7))
     {
@@ -1280,11 +1281,11 @@ void PSPadBackend::updateHostInput()
     }    m_mouseCaptured.store(captured, std::memory_order_relaxed);
     if (!captured)
         return;
-    // raylib applies the hidden-cursor mode lazily (on the next cursor event),
-    // so a capture without a click - launch, or leaving the settings menu - can
-    // leave the OS cursor visible while the mouse is already steering. Re-assert
-    // the hide every frame while captured.
-    DisableCursor();
+    // raylib's DisableCursor() also re-centres the cursor on every call, which
+    // zeroes the mouse delta. Re-assert the raw (hidden, uncentred) mode
+    // directly instead, so the hide sticks without eating the movement.
+    if (GLFWwindow *window = glfwGetCurrentContext())
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
     // Direct mouse look (applied to the camera by a game hook, see
     // consumeMouseLook). Sensitivity / invert Y come from the settings (F2
     // menu, PS2X_MOUSE_SENS / PS2X_MOUSE_INVERT_Y); '-' / '=' adjust the
