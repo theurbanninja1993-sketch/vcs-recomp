@@ -2338,12 +2338,37 @@ disables the wall stop; `PS2X_CARLOOK_DEBUG=<file>` logs the whole path
       threads asking for it, and the exclusion line is a recent addition to the
       docs, so it is being actively decided rather than long settled. If it changes,
       the work above is a week.
-    - **a local achievement system instead**: the same rcheevos evaluator with our
-      own definitions and no server, which needs nobody's permission. The engine is
-      the easy half; authoring a set worth having is the real work.
+    - **a local set, which is the intended route (owner, 2026-10-18: "park that for
+      later incase the rules change. maybe we could make our own set that just the
+      port uses").** Parked, but this is what to build when it is picked up - see
+      below.
     - **note for whoever does it**: RA's hardcore mode forbids cheats, and this port
       ships a `mods/` folder with cheats in it - an RA client would have to switch
       those off, or restrict them to casual.
+
+    **The local set, in the shape it should take.** Everything above stays, minus
+    the HTTP client and the server:
+
+    - **Use rcheevos as the evaluator, and its condition format for the set.** It is
+      MIT, it is the format the RA tooling and editor already speak, and it keeps
+      the set *portable*: if RA ever accepts recompilations, the same definitions
+      can be submitted rather than re-authored. Writing our own evaluator and format
+      would be more work for less.
+    - **No network at all**, which removes the whole libcurl/TLS problem and the
+      need for an account. Definitions ship in the repo as our own content (like the
+      prompt packs and `mods/`), and unlocks are a small local file.
+    - **The addresses are ours to find, and the tools are already here**: the
+      port's F9 RAM dump, the ped dump and the camera trace exist for exactly this
+      kind of hunt, and conditions authored against this port's memory are authored
+      against retail's, because the layout matches.
+    - **Cost**: the integration is small - a few days for rcheevos, a memory
+      callback, a list and unlock toasts in the settings menu, and the local file.
+      The set itself is the real work, and it is authoring rather than programming:
+      a set worth having is weeks of playing with the debugger open, the way the 167
+      on RA's set were made.
+    - **UI placement** is the one open design question: the settings menu is the
+      obvious home, with unlocks as an in-game toast the way the game itself would
+      show one.
 
 ## Third-party assets (release-page credits)
 
