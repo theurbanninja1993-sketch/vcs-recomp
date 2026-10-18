@@ -2292,6 +2292,59 @@ disables the wall stop; `PS2X_CARLOOK_DEBUG=<file>` logs the whole path
     with the per-version data kept per game - otherwise every version has to be
     added twice.
 
+16. **RetroAchievements support (owner ask, 2026-10-18: "is retroachievements
+    support doable?").** Technically yes, and unusually cheaply - but the answer
+    today is **no, and not for a technical reason**. Recorded here so nobody spends
+    a week before finding that out.
+
+    **Why it would be cheap, which is worth knowing.** A *recompilation* keeps the
+    game's memory layout: the recompiled code runs at the ELF's own addresses and
+    the game's globals sit where the retail build put them - the overrides in this
+    repo are the proof, reading the cutscene flag at `0x6F4D14`, the pause flag at
+    `0x4CD2AC` and the settings bytes near `0x4E47xx`, and the runtime's HLE arena
+    (`0x00080000`-`0x00100000`) stays below the game's heap base. So RA's *existing*
+    PS2 sets, which are authored against PCSX2's view of retail memory, would
+    evaluate against the port's RDRAM **unchanged** - no re-authoring, which is the
+    part that makes this normally expensive. Vice City Stories already has a set
+    (167 achievements, plus a subset).
+
+    **What it would take:**
+
+    - **rcheevos** (MIT) with its `rc_client` - it parses and evaluates the
+      conditions, keeps the session, and reports unlocks. The client supplies only a
+      memory-read callback, which for this port is a `memcpy` out of RDRAM.
+    - **The game ID**: RA's PS2 hash is the `BOOT2=` path from `SYSTEM.CNF` followed
+      by the boot executable's contents, hashed. The port has both (`ps2x_iso`
+      already parses `SYSTEM.CNF` for the boot file).
+    - **An HTTP client with TLS**, which would be this port's first networked
+      feature: libcurl on Linux, and something cross-buildable for the Windows
+      target. This is the heaviest piece by far.
+    - **UI**: a login field, an achievements list and unlock toasts, in the existing
+      ImGui settings menu.
+
+    Roughly one to two weeks, most of it the HTTP/TLS plumbing and testing (which
+    needs an RA account). Not blocked by anything in the port.
+
+    **Why it is not allowed.** RA's standalone-support rules say it outright:
+    *"Decompilations, recompilations, and other unofficial ports are not eligible
+    for standalone sets."* And the port is not an emulator, so it cannot be an
+    approved emulator client either. Reporting as PCSX2 to get around it would be
+    against the rules and would put players' accounts at risk - not something to
+    build, and not something to suggest to players.
+
+    **So the options are:**
+
+    - **watch the policy.** Recompilation is a live subject there - there are forum
+      threads asking for it, and the exclusion line is a recent addition to the
+      docs, so it is being actively decided rather than long settled. If it changes,
+      the work above is a week.
+    - **a local achievement system instead**: the same rcheevos evaluator with our
+      own definitions and no server, which needs nobody's permission. The engine is
+      the easy half; authoring a set worth having is the real work.
+    - **note for whoever does it**: RA's hardcore mode forbids cheats, and this port
+      ships a `mods/` folder with cheats in it - an RA client would have to switch
+      those off, or restrict them to casual.
+
 ## Third-party assets (release-page credits)
 
 Both packs are by **AL2009man**, MIT-licensed, (c) 2024 Al. Lopez:
