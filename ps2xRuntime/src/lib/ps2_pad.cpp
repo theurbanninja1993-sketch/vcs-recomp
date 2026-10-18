@@ -1240,9 +1240,21 @@ void PSPadBackend::updateHostInput()
         GetMouseDelta();
         return;
     }
-    if (!captured && IsWindowFocused() && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    // Auto-capture in fullscreen/borderless: once at launch and again whenever
+    // the settings menu closes. A click still captures in any mode, so windowed
+    // play keeps the cursor until it is clicked.
+    static bool s_didLaunchCapture = false;
+    static bool s_settingsWasOpen = false;
+    const bool settingsOpenNow = g_ps2SettingsMenuOpen.load(std::memory_order_relaxed);
+    const bool settingsJustClosed = s_settingsWasOpen && !settingsOpenNow;
+    s_settingsWasOpen = settingsOpenNow;
+    const bool mouseLookMode =
+        ps2HostSettings().displayMode != PS2HostSettings::DisplayMode::Windowed;
+    if (!captured && IsWindowFocused() && mouseLookMode &&
+        (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || !s_didLaunchCapture || settingsJustClosed))
     {
         DisableCursor();
+        GetMouseDelta(); // swallow motion made while the cursor was free
         captured = true;
     }
     else if (captured && (releaseMousePressed() || !IsWindowFocused()))
@@ -1250,6 +1262,7 @@ void PSPadBackend::updateHostInput()
         EnableCursor();
         captured = false;
     }
+    s_didLaunchCapture = true;
     m_mouseCaptured.store(captured, std::memory_order_relaxed);
     if (!captured)
         return;
