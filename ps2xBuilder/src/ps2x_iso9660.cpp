@@ -42,10 +42,21 @@ namespace ps2x
         // A CHD says 'MComprHD' first, whatever version it is.
         bool looksLikeChd(const uint8_t *head) { return std::memcmp(head, "MComprHD", 8) == 0; }
 
+        std::string trim(const std::string &text)
+        {
+            const size_t first = text.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos)
+                return {};
+            const size_t last = text.find_last_not_of(" \t\r\n");
+            return text.substr(first, last - first + 1);
+        }
+
         // A .cue is text, and small: the largest real one is a few KB. Sniffing
         // the content rather than the extension means a cue sheet renamed to .iso
         // is understood instead of being called "not an ISO9660 image", which is
-        // true but no help to anyone.
+        // true but no help to anyone. What makes it a sheet is a line that names a
+        // file - FILE in the standard, DATAFILE in what the Windows tools write -
+        // so plain text that merely mentions one is not mistaken for it.
         bool looksLikeCue(const uint8_t *head, size_t size)
         {
             if (size == 0 || size > 1024u * 1024u)
@@ -54,16 +65,20 @@ namespace ps2x
                 if (head[i] != 0 && (head[i] < 0x09 || (head[i] > 0x0D && head[i] < 0x20)))
                     return false; // control bytes: this is a binary image, not a sheet
             const std::string text(reinterpret_cast<const char *>(head), size);
-            return text.find("FILE ") != std::string::npos || text.find("\"BINARY\"") != std::string::npos;
-        }
-
-        std::string trim(const std::string &text)
-        {
-            const size_t first = text.find_first_not_of(" \t\r\n");
-            if (first == std::string::npos)
-                return {};
-            const size_t last = text.find_last_not_of(" \t\r\n");
-            return text.substr(first, last - first + 1);
+            std::istringstream in(text);
+            std::string line;
+            while (std::getline(in, line))
+            {
+                line = trim(line);
+                for (const char *keyword : {"FILE", "DATAFILE"})
+                {
+                    const size_t n = std::strlen(keyword);
+                    if (line.size() > n && line.compare(0, n, keyword) == 0 &&
+                        (line[n] == ' ' || line[n] == '\t' || line[n] == '"'))
+                        return true;
+                }
+            }
+            return false;
         }
     }
 
