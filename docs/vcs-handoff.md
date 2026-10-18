@@ -2219,6 +2219,79 @@ disables the wall stop; `PS2X_CARLOOK_DEBUG=<file>` logs the whole path
       is too light to show the synthesis cost - a gameplay check on the owner's
       machine is still the one that counts.
 
+15. **Other versions of the game - PAL, and other regional builds (owner ask,
+    2026-10-18: "how much work would it be to support other versions of the game?
+    like pal.").** Parked deliberately: not started, and the owner said not to
+    worry about it for now. What follows is the survey, so whoever picks it up
+    starts from evidence rather than from the question again.
+
+    **Nothing is measurable here yet** - there is no PAL disc on this machine
+    (only the NTSC-U VCS and LCS), so the layout question below is open. Today a
+    PAL disc is refused at the boot-hash check, so it cannot even be tried.
+
+    **What is already version-agnostic**, which is most of it:
+
+    - the runtime itself - graphics, VU1, memory card, pads, audio - holds no game
+      addresses at all (the ones in `ps2_runtime.cpp` are the guest heap base and
+      COP0 constants, not game-specific);
+    - the override registry matches a game by **ELF filename + entry point (+
+      optional CRC32)**: `PS2_REGISTER_GAME_OVERRIDE("… (SLUS_215.90)",
+      "SLUS_215.90", 0x001DD6A0u, 0u, …)`. A second version is another descriptor,
+      which is what the mechanism is for;
+    - `games/<id>/game.toml` already carries `region`, `boot_file` and
+      `boot_hash_xxh3_128`, and `[runtime] override` names the registration;
+    - the VU1 program set is learned from the disc at build time, so it needs
+      nothing per version;
+    - the disc supplies every byte of game data, so a PAL build ships nothing new.
+
+    **What is version-specific, counted (all of it in
+    `ps2xRuntime/src/lib/game_overrides.cpp` unless said otherwise):**
+
+    | what | count | notes |
+    |---|---|---|
+    | hook code addresses | 16 | camera process, follow-ped cam, follow-car cam, after-cam-process, frame update, set view window, set far clip, line of sight, radio entity, radio update, movie finished, movie push-end-code, GIF add-GS-AD, GIF close-GIF-tag, `sceCdSearchFile`, `sceMpegIsEnd` |
+    | game data addresses | 13 | camera struct, view window, cutscene flag `0x6F4D14`, pause flag `0x4CD2AC`, radio/station tables, the settings bytes near `0x4E47xx` |
+    | struct offsets the hooks read | ~a dozen | camera and ped fields; usually identical if the build is the same engine revision |
+    | `config/vcs_clean.csv` | 10,224 functions | **regenerated**: a Ghidra auto-analysis of the PAL ELF, then `games/vcs/tools/rebuild_function_map.py` |
+    | `config/vcs_clean.toml` stub bindings | 351 `name@addr` | **regenerated** by ElfAnalyzer |
+    | prompt art / font table | 1 address | what `games/vcs/tools/make_prompt_packs.py` reads the game's font from |
+
+    **The cost turns on one question: is PAL's `.text` the same code at the same
+    addresses?** Regional builds of the same revision are often identical code with
+    different data, and the localisation lives in the data segment - in which case
+    most of those 29 addresses carry over and the work is verification rather than
+    discovery. If it is a genuinely different build, each of the 16 hooks has to be
+    re-found by matching it against the *named* NTSC-U function in the new map -
+    which is what `games/vcs/tools/` (`mips_dis.py`, `find_refs.py`,
+    `jal_callers.py`) exists for. **So: about a week if the code matches, two to
+    three weeks if it does not**, for one regional variant, plus the same again per
+    further revision (v2.0, a different pressing).
+
+    **An hour settles which case it is**, given the PAL ELF: compare the entry
+    point, the `.text` size, and whether those 16 addresses still point at
+    recognisable code. Do that before planning anything.
+
+    **Two things beyond the addresses.** PAL runs at **50 Hz** and the port presents
+    at 60, with the audio clock following the game clock (that work is done for
+    NTSC-U) - a PAL build's frame-rate-dependent logic needs the same treatment.
+    And PAL's internal resolution differs (512x512 against 512x448); the port
+    already overrides the game's view window and far clip through the
+    `set view window` / `set far clip` hooks, so those need PAL values.
+
+    **The cheap enabling step, worth doing first (~an hour).** Let the builder
+    **warn instead of refuse** when the disc's boot file does not match the
+    manifest - "this is not the disc this source was built for; building anyway".
+    Without it a PAL disc cannot be tried at all. The overrides would *not* apply
+    (they match by ELF name and entry point), so expect visible corruption rather
+    than a working game - but it is real information, and it is the step that makes
+    the measurement above possible for anyone holding the disc.
+
+    **The same shape applies to LCS**, and note that the LCS project *vendors* a
+    copy of this runtime (`Liberty City Stories Recomp/vendor/ps2recomp/`, with its
+    own `game_overrides.cpp`). So a multi-version mechanism belongs in the runtime,
+    with the per-version data kept per game - otherwise every version has to be
+    added twice.
+
 ## Third-party assets (release-page credits)
 
 Both packs are by **AL2009man**, MIT-licensed, (c) 2024 Al. Lopez:
