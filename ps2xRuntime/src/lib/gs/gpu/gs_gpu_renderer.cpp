@@ -4895,12 +4895,16 @@ void main()
         gl.glDeleteSync(slot.fence);
         slot.fence = nullptr;
         const size_t bytes = static_cast<size_t>(slot.width) * slot.height * 4u;
-        frame.pixels.resize(bytes);
         if (const void *mapped = gl.glMapNamedBufferRange(slot.buffer, 0, static_cast<GLsizeiptr>(bytes), GL_MAP_READ_BIT))
         {
-            std::memcpy(frame.pixels.data(), mapped, bytes);
+            // One pass (resize would zero the buffer first).
+            const uint8_t *src = static_cast<const uint8_t *>(mapped);
+            frame.pixels = gsTakeFrameBuffer(); // reuses its capacity
+            frame.pixels.assign(src, src + bytes);
             gl.glUnmapNamedBuffer(slot.buffer);
         }
+        else
+            frame.pixels.assign(bytes, 0u);
         frame.width = slot.width;
         frame.height = slot.height;
         frame.rowPixels = slot.width;

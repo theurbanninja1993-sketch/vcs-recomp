@@ -321,3 +321,245 @@ extern "C"
     __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
+
+#if defined(_WIN32)
+#include <atomic>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace
+{
+    struct ProfiledThread
+    {
+        DWORD id = 0;
+        HANDLE handle = nullptr;
+        std::string label;
+        uint64_t stackBase = 0; // top of the thread's stack (TEB NT_TIB.StackBase)
+    };
+
+    std::string profModuleOf(uint64_t address, uint64_t &base)
+    {
+        HMODULE owner = nullptr;
+        base = 0;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCWSTR>(address), &owner) ||
+            owner == nullptr)
+            return "?";
+        base = reinterpret_cast<uint64_t>(owner);
+        wchar_t name[MAX_PATH] = {};
+        if (GetModuleBaseNameW(GetCurrentProcess(), owner, name, MAX_PATH) == 0)
+            return "?";
+        std::wstring wide(name);
+        return std::string(wide.begin(), wide.end());
+    }
+
+    void profRefreshThreads(std::vector<ProfiledThread> &threads)
+    {
+        for (ProfiledThread &t : threads)
+            CloseHandle(t.handle);
+        threads.clear();
+        const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE)
+            return;
+        using GetThreadDescriptionFn = HRESULT(WINAPI *)(HANDLE, PWSTR *);
+        static const auto s_getDescription = []() -> GetThreadDescriptionFn
+        {
+            HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+            return kernel32 ? reinterpret_cast<GetThreadDescriptionFn>(GetProcAddress(kernel32, "GetThreadDescription"))
+                            : nullptr;
+        }();
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        if (Thread32First(snapshot, &entry))
+        {
+            do
+            {
+                if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self)
+                    continue;
+                HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
+                                           entry.th32ThreadID);
+                if (handle == nullptr)
+                    continue;
+                ProfiledThread t;
+                t.id = entry.th32ThreadID;
+                t.handle = handle;
+                if (s_getDescription)
+                {
+                    PWSTR description = nullptr;
+                    if (SUCCEEDED(s_getDescription(handle, &description)) && description != nullptr)
+                    {
+                        std::wstring wide(description);
+                        LocalFree(description);
+                        t.label.assign(wide.begin(), wide.end());
+                    }
+                }
+                // Only our own pipeline threads: suspending everything (the
+                // window/OS threads) is intrusive and the driver's code
+                // cannot be symbolized anyway.
+                static const char *kWanted[] = {"GameThread", "Vu1Worker", "GsGpu", "GsFrontend"};
+                bool wanted = false;
+                for (const char *name : kWanted)
+                    wanted = wanted || t.label == name;
+                // Under Wine a suspended GL thread can be mid X request, and
+                // the X connection then times out: leave it alone there.
+                static const bool s_wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+                if (s_wine && t.label == "GsGpu")
+                    wanted = false;
+                if (!wanted)
+                {
+                    CloseHandle(handle);
+                    continue;
+                }
+                {
+                    // TEB -> NT_TIB.StackBase, so the stack copy stays inside it.
+                    struct BasicInformation
+                    {
+                        LONG exitStatus;
+                        PVOID tebBase;
+                        ULONG_PTR rest[4];
+                    } info{};
+                    using NtQueryInformationThreadFn = LONG(WINAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+                    static const auto s_query = reinterpret_cast<NtQueryInformationThreadFn>(
+                        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+                    if (s_query && s_query(handle, 0 /* ThreadBasicInformation */, &info, sizeof(info), nullptr) >= 0 &&
+                        info.tebBase != nullptr)
+                        t.stackBase = *reinterpret_cast<const uint64_t *>(static_cast<const uint8_t *>(info.tebBase) + 8);
+                }
+                if (t.stackBase == 0)
+                {
+                    CloseHandle(handle);
+                    continue;
+                }
+                threads.push_back(std::move(t));
+            } while (Thread32Next(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+    }
+
+    void profLoop(std::string path)
+    {
+        constexpr int kDepth = 6;
+        // key: thread label + frames; value: count. Frames as raw addresses.
+        std::map<std::pair<std::string, std::vector<uint64_t>>, uint64_t> counts;
+        std::map<std::string, uint64_t> totals;
+        std::vector<ProfiledThread> threads;
+        auto lastRefresh = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+        auto lastWrite = std::chrono::steady_clock::now();
+        for (;;)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastRefresh > std::chrono::seconds(2))
+            {
+                profRefreshThreads(threads);
+                lastRefresh = now;
+            }
+            for (ProfiledThread &t : threads)
+            {
+                // While the thread is suspended: registers and a copy of the
+                // top of its stack, nothing else - no allocation, no unwind
+                // table lookups (the thread may hold the heap or loader lock,
+                // and waiting for it here would hang the process).
+                static uint8_t s_stack[16 << 10];
+                CONTEXT context{};
+                context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                size_t copied = 0;
+                static const bool s_dry = std::getenv("PS2X_HOST_PROFILE_DRY") != nullptr;
+                if (s_dry)
+                    continue;
+                if (SuspendThread(t.handle) == static_cast<DWORD>(-1))
+                    continue;
+                const bool haveContext = GetThreadContext(t.handle, &context) != 0;
+                if (haveContext && context.Rsp < t.stackBase)
+                {
+                    copied = static_cast<size_t>(std::min<uint64_t>(sizeof(s_stack), t.stackBase - context.Rsp));
+                    std::memcpy(s_stack, reinterpret_cast<const void *>(context.Rsp), copied);
+                }
+                ResumeThread(t.handle);
+                if (!haveContext)
+                    continue;
+                // Unwind against the copy: stack addresses are shifted into it.
+                const uint64_t realRsp = context.Rsp;
+                const int64_t shift = static_cast<int64_t>(reinterpret_cast<uint64_t>(s_stack)) - static_cast<int64_t>(realRsp);
+                auto inCopy = [&](uint64_t address)
+                { return address >= reinterpret_cast<uint64_t>(s_stack) && address < reinterpret_cast<uint64_t>(s_stack) + copied; };
+                auto toCopy = [&](uint64_t address) -> uint64_t
+                { return (address >= realRsp && address < realRsp + copied) ? address + shift : address; };
+                context.Rsp = toCopy(context.Rsp);
+                context.Rbp = toCopy(context.Rbp);
+                std::vector<uint64_t> frames;
+                frames.reserve(kDepth);
+                for (int depth = 0; depth < kDepth && context.Rip != 0; ++depth)
+                {
+                    frames.push_back(context.Rip);
+                    if (!inCopy(context.Rsp))
+                        break;
+                    DWORD64 imageBase = 0;
+                    PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+                    if (function == nullptr)
+                    {
+                        // Leaf without unwind data: the return address is at [rsp].
+                        if (!inCopy(context.Rsp + 7))
+                            break;
+                        context.Rip = *reinterpret_cast<const DWORD64 *>(context.Rsp);
+                        context.Rsp += 8;
+                        continue;
+                    }
+                    void *handlerData = nullptr;
+                    DWORD64 establisher = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData,
+                                     &establisher, nullptr);
+                    context.Rbp = toCopy(context.Rbp);
+                }
+                if (!frames.empty())
+                {
+                    ++counts[{t.label, frames}];
+                    ++totals[t.label];
+                }
+            }
+            if (std::chrono::steady_clock::now() - lastWrite > std::chrono::seconds(10))
+            {
+                lastWrite = std::chrono::steady_clock::now();
+                if (FILE *f = std::fopen(path.c_str(), "w"))
+                {
+                    std::map<uint64_t, std::pair<std::string, uint64_t>> modules; // address -> (module, base)
+                    for (auto &[name, total] : totals)
+                        std::fprintf(f, "# thread %s samples %llu\n", name.c_str(), (unsigned long long)total);
+                    for (auto &[key, count] : counts)
+                    {
+                        if (count < 2)
+                            continue;
+                        std::fprintf(f, "%llu\t%s", (unsigned long long)count, key.first.c_str());
+                        for (uint64_t address : key.second)
+                        {
+                            uint64_t base = 0;
+                            const std::string module = profModuleOf(address, base);
+                            std::fprintf(f, "\t%s+0x%llx", module.c_str(), (unsigned long long)(address - base));
+                        }
+                        std::fprintf(f, "\n");
+                    }
+                    std::fclose(f);
+                }
+            }
+            Sleep(0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+}
+
+void ps2StartHostProfiler()
+{
+    const char *path = std::getenv("PS2X_HOST_PROFILE");
+    if (path == nullptr || *path == 0)
+        return;
+    std::thread(profLoop, std::string(path)).detach();
+}
+#else
+void ps2StartHostProfiler()
+{
+}
+#endif
+

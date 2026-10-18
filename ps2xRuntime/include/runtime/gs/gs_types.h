@@ -298,6 +298,13 @@ struct GSPresentationRequest
     bool hasCamera = false;
 };
 
+// Presentation pixel buffers are megabytes at a high internal scale; a fresh
+// one per frame meant an mmap and ~a thousand page faults on the render
+// thread and an munmap on the game thread. Spent buffers come back here and
+// are reused (any thread).
+void gsRecycleFrameBuffer(std::vector<uint8_t> &&buffer);
+std::vector<uint8_t> gsTakeFrameBuffer();
+
 // Set by the runtime: reads the game's current camera (game thread).
 extern bool (*g_gsCameraSampler)(Ps2CameraState &out);
 
@@ -316,6 +323,9 @@ struct PresentationFrame
     uint32_t glTexture = 0;
     uint32_t glWidth = 0;
     uint32_t glHeight = 0;
+    // Nothing newer than the frame the caller already has (an asynchronous
+    // backend hands each finished frame over once): keep showing that one.
+    bool unchanged = false;
 
     explicit operator bool() const
     {

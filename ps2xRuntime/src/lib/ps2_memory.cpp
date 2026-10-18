@@ -1266,7 +1266,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
     if (m_asyncVif1 && !t_onAsyncVif1Worker)
     {
-        if ((address >= 0x10003C00u && address < 0x10004000u) || (address >= 0x10005000u && address < 0x10006000u) ||
+        // Setting up the next VIF1 DMA (D1 registers) need not wait for the
+        // previous one: a kick copies its data, queues behind the one in
+        // flight and completes in order (see pollAsyncVif1). The game kicks
+        // each frame's display list without waiting for the last; waiting for
+        // the whole VU1+GS pipeline here held the EE - and VBlank delivery,
+        // and with it the cutscene audio sync - for 2-3 ms a frame on a slow
+        // CPU (ported from the LCS runtime, where it was up to ~35 ms).
+        // PS2X_VIF1_KICK_WAIT=1 restores the full wait.
+        static const bool s_kickWait = std::getenv("PS2X_VIF1_KICK_WAIT") != nullptr;
+        if (address >= 0x10009000u && address < 0x10009100u && !s_kickWait)
+            waitForVif1KickSlot(address == 0x10009000u ? "d1Chcr" : address == 0x10009010u ? "d1Madr"
+                                : address == 0x10009020u ? "d1Qwc" : address == 0x10009030u ? "d1Tadr" : "d1Other");
+        else if ((address >= 0x10003C00u && address < 0x10004000u) || (address >= 0x10005000u && address < 0x10006000u) ||
             (address >= 0x10009000u && address < 0x10009100u) || (address >= 0x1000A000u && address < 0x1000A100u))
             waitForAsyncVif1(address == 0x10009000u ? "d1Chcr" : address == 0x10009010u ? "d1Madr" : address == 0x10009020u ? "d1Qwc" : address == 0x10009030u ? "d1Tadr" : (address >= 0x10009000u && address < 0x10009100u) ? "d1Other"
                              : (address >= 0x1000A000u && address < 0x1000A100u) ? "d2Write"
@@ -1888,6 +1900,8 @@ void PS2Memory::asyncVif1WorkerLoop()
             t_streamPos = s_popped++; // batches are popped in commit order
             m_vif1WorkerActive = true;
         }
+        // A kick waiting for a queue slot (waitForVif1KickSlot) has one now.
+        m_vif1IdleCv.notify_all();
         for (PendingTransfer &transfer : batch)
         {
             if (!transfer.chainData.empty())
@@ -2026,21 +2040,12 @@ namespace
     }
 }
 
-void PS2Memory::waitForAsyncVif1(const char *why)
+namespace
 {
-    if (!m_asyncVif1 || t_onAsyncVif1Worker)
-        return;
-    static const bool s_stats = std::getenv("PS2X_SYNC_STATS") != nullptr;
-    const auto start = s_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // PS2X_SYNC_STATS: EE waits on the VIF1 / GS pipeline, per site, reported
+    // every 1200 presented frames.
+    void recordSyncWait(const char *why, double seconds)
     {
-        std::unique_lock<std::mutex> lock(m_vif1QueueMutex);
-        m_vif1IdleCv.wait(lock, [this]()
-                          { return m_vif1Batches.empty() && !m_vif1WorkerActive && m_gsPendingBatches == 0u; });
-    }
-    pollAsyncVif1();
-    if (s_stats)
-    {
-        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         SyncStats &stats = syncStats();
         std::lock_guard<std::mutex> lock(stats.mutex);
         auto &site = stats.sites[why];
@@ -2059,6 +2064,40 @@ void PS2Memory::waitForAsyncVif1(const char *why)
     }
 }
 
+void PS2Memory::waitForAsyncVif1(const char *why)
+{
+    if (!m_asyncVif1 || t_onAsyncVif1Worker)
+        return;
+    static const bool s_stats = std::getenv("PS2X_SYNC_STATS") != nullptr;
+    const auto start = s_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    {
+        std::unique_lock<std::mutex> lock(m_vif1QueueMutex);
+        m_vif1IdleCv.wait(lock, [this]()
+                          { return m_vif1Batches.empty() && !m_vif1WorkerActive && m_gsPendingBatches == 0u; });
+    }
+    pollAsyncVif1();
+    if (s_stats)
+        recordSyncWait(why, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+}
+
+// At most one VIF1 batch queued behind the one the worker is on, so the EE
+// stays no more than a frame ahead of VU1.
+void PS2Memory::waitForVif1KickSlot(const char *why)
+{
+    if (!m_asyncVif1 || t_onAsyncVif1Worker)
+        return;
+    static const bool s_stats = std::getenv("PS2X_SYNC_STATS") != nullptr;
+    const auto start = s_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    {
+        std::unique_lock<std::mutex> lock(m_vif1QueueMutex);
+        if (!m_vif1Batches.empty())
+            m_vif1IdleCv.wait(lock, [this]() { return m_vif1Batches.empty(); });
+    }
+    pollAsyncVif1();
+    if (s_stats)
+        recordSyncWait(why, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+}
+
 bool PS2Memory::pollAsyncVif1()
 {
     if (!m_asyncVif1 || t_onAsyncVif1Worker)
@@ -2068,8 +2107,8 @@ bool PS2Memory::pollAsyncVif1()
         return false;
     while (m_vif1Applied != finished)
     {
-        completeVif1Dma();
         ++m_vif1Applied;
+        completeVif1Dma(m_vif1Applied == m_vif1Kicked);
     }
     if (m_vif1CompletionHook)
         m_vif1CompletionHook();
@@ -2092,11 +2131,14 @@ void PS2Memory::raiseDStatChannelBit(uint32_t channelBit)
     m_ioRegisters[D_STAT] = dstat;
 }
 
-void PS2Memory::completeVif1Dma()
+void PS2Memory::completeVif1Dma(bool latestKick)
 {
     static constexpr uint32_t VIF1_CHANNEL = 0x10009000;
     raiseDStatChannelBit(1u);
     queueCompletedDmacCause(1u);
+    // An older transfer finishing must not end the one kicked after it.
+    if (!latestKick)
+        return;
     m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
     m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
 }
@@ -2305,6 +2347,7 @@ void PS2Memory::processPendingTransfers()
         {
             std::lock_guard<std::mutex> lock(m_vif1QueueMutex);
             m_vif1Batches.push_back(std::move(batch));
+            ++m_vif1Kicked;
             g_vif1BatchesCommitted.fetch_add(1u, std::memory_order_release);
             if (!m_vif1Worker.joinable())
                 m_vif1Worker = std::thread([this]()

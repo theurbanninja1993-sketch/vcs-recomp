@@ -323,18 +323,17 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 // count too. Disabled (0) costs one predictable compare per store.
 extern uint32_t g_ps2WriteWatchAddr;
 extern std::unordered_set<uint32_t> g_ps2WriteWatchSet;
+extern bool g_ps2WriteWatchActive; // PS2X_WATCH_WRITE set at all
 void ps2ReportWatchedWrite(uint32_t addr, uint32_t size, uint64_t value, const R5900Context *ctx, const char *op);
+void ps2CheckWatchedWrite(uint32_t addr, uint32_t size, uint64_t value, const R5900Context *ctx, const char *op);
 
+// Every guest store goes through this, so the off case is one flag test that
+// inlines: the old body (two globals and a loop) was often left as a call,
+// ~4% of the game thread in a dense cutscene.
 static inline void Ps2WatchWrite(uint32_t addr, uint32_t size, uint64_t value, const R5900Context *ctx, const char *op)
 {
-    bool hit = g_ps2WriteWatchAddr != 0u && (g_ps2WriteWatchAddr - (addr & PS2_RAM_MASK)) < size;
-    if (!hit && !g_ps2WriteWatchSet.empty())
-        for (uint32_t i = 0; i < size && !hit; ++i)
-            hit = g_ps2WriteWatchSet.count((addr & PS2_RAM_MASK) + i) != 0u;
-    if (hit)
-    {
-        ps2ReportWatchedWrite(addr, size, value, ctx, op);
-    }
+    if (__builtin_expect(g_ps2WriteWatchActive, 0))
+        ps2CheckWatchedWrite(addr, size, value, ctx, op);
 }
 
 #define FAST_WRITE8(addr, val) (Ps2WatchWrite((uint32_t)(addr), 1u, (uint8_t)(val), ctx, "SB"), Ps2FastWrite8(rdram, (uint32_t)(addr), (uint8_t)(val)))

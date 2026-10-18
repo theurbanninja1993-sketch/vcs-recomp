@@ -43,6 +43,13 @@ std::vector<Ps2ThreadCpu> ps2ThreadCpuTicks();
 // failures (no privileges) are ignored.
 void ps2RaiseCurrentThreadPriority();
 
+// PS2X_HOST_PROFILE=<file> (Windows): a sampling profiler for the host. A
+// background thread suspends the game, VU1 and GS threads ~1000 times
+// a second, records a short stack (RtlVirtualUnwind) and writes the counts,
+// as module+offset per frame, to <file> every 10 s. Symbolize offline with
+// llvm-symbolizer against the same executable. No-op elsewhere.
+void ps2StartHostProfiler();
+
 // Resident memory of this process in MB (0 when unavailable). Reported in the
 // perf log: a footprint that keeps climbing over a session is a leak.
 size_t ps2ProcessResidentMb();

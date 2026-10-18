@@ -761,6 +761,34 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
+namespace
+{
+    std::mutex g_frameBufferPoolMutex;
+    std::vector<std::vector<uint8_t>> g_frameBufferPool;
+}
+
+void gsRecycleFrameBuffer(std::vector<uint8_t> &&buffer)
+{
+    if (buffer.capacity() < (64u << 10))
+        return; // small ones are cheap to allocate
+    std::lock_guard<std::mutex> lock(g_frameBufferPoolMutex);
+    if (g_frameBufferPool.size() < 4u)
+    {
+        buffer.clear();
+        g_frameBufferPool.push_back(std::move(buffer));
+    }
+}
+
+std::vector<uint8_t> gsTakeFrameBuffer()
+{
+    std::lock_guard<std::mutex> lock(g_frameBufferPoolMutex);
+    if (g_frameBufferPool.empty())
+        return {};
+    std::vector<uint8_t> buffer = std::move(g_frameBufferPool.back());
+    g_frameBufferPool.pop_back();
+    return buffer;
+}
+
 void GS::latchHostPresentationFrame()
 {
     GSPresentationRequest request{};
@@ -819,6 +847,12 @@ void GS::latchHostPresentationFrame()
             frame = m_backend->Present(request);
         }
     }
+    if (frame.unchanged)
+    {
+        // The backend has nothing newer than what was latched: keep it.
+        m_hostPresentationInputSeq = inputSeq;
+        return;
+    }
 
     const bool hasFrame = static_cast<bool>(frame);
     m_hostPresentationInputSeq = inputSeq;
@@ -832,6 +866,7 @@ void GS::latchHostPresentationFrame()
     const bool usedPreferred = frame.usedPreferred;
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+        gsRecycleFrameBuffer(std::move(m_hostPresentationFrame));
         m_hostPresentationFrame = std::move(frame.pixels);
         m_hostPresentationGlTexture = frame.glTexture;
         m_hostPresentationGlWidth = frame.glWidth;

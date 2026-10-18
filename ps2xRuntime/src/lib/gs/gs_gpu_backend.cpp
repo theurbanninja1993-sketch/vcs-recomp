@@ -334,9 +334,18 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
             ++m_lastFrameSeq;
         };
         enqueue(std::move(command), true);
+        // Each finished frame is handed over once, by move: copying it here
+        // (megabytes at a high internal scale) cost the game thread - which
+        // calls this every VBlank - milliseconds per frame on a slow CPU.
         std::lock_guard<std::mutex> lock(m_frameMutex);
+        if (m_lastHandedSeq == m_lastFrameSeq)
+        {
+            PresentationFrame none;
+            none.unchanged = true;
+            return none;
+        }
         m_lastHandedSeq = m_lastFrameSeq;
-        return m_lastFrame;
+        return std::move(m_lastFrame);
     }
     PresentationFrame frame;
     runSync([&]()
@@ -369,7 +378,7 @@ bool GSGpuBackend::PollPresentation(PresentationFrame &out)
     if (m_lastHandedSeq == m_lastFrameSeq || !m_lastFrame)
         return false;
     m_lastHandedSeq = m_lastFrameSeq;
-    out = m_lastFrame;
+    out = std::move(m_lastFrame);
     return true;
 }
 

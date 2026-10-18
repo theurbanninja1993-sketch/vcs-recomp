@@ -1967,6 +1967,18 @@ static void ps2Vu1TraceMscal(const uint8_t *vu1Data, uint32_t startPC, uint32_t 
 
 
 
+bool g_ps2WriteWatchActive = std::getenv("PS2X_WATCH_WRITE") != nullptr;
+
+void ps2CheckWatchedWrite(uint32_t addr, uint32_t size, uint64_t value, const R5900Context *ctx, const char *op)
+{
+    bool hit = g_ps2WriteWatchAddr != 0u && (g_ps2WriteWatchAddr - (addr & PS2_RAM_MASK)) < size;
+    if (!hit && !g_ps2WriteWatchSet.empty())
+        for (uint32_t i = 0; i < size && !hit; ++i)
+            hit = g_ps2WriteWatchSet.count((addr & PS2_RAM_MASK) + i) != 0u;
+    if (hit)
+        ps2ReportWatchedWrite(addr, size, value, ctx, op);
+}
+
 uint32_t g_ps2WriteWatchAddr = []() -> uint32_t
 {
     const char *env = std::getenv("PS2X_WATCH_WRITE");
@@ -3390,6 +3402,7 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 
 void PS2Runtime::run()
 {
+    ps2StartHostProfiler(); // PS2X_HOST_PROFILE (Windows)
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     resetIop();
