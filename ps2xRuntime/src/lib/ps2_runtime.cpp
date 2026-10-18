@@ -523,6 +523,71 @@ namespace
     }
 }
 
+// Learning VU programs during play. VU microprograms come from the game disc,
+// so their compiled versions are generated on the player's machine
+// (tools/vu1_recomp via build.sh) from recordings of the programs running; a
+// program the build never saw runs interpreted, about ten times slower. So the
+// runtime records, by default, every program with no compiled version (up to 4
+// runs each - enough for vu1_recomp to trace its jump targets) to
+// <config>/vu_learn/vu<unit>_learn_<time>.bin, and drops a PENDING marker there;
+// `build.sh --optimize` (the launcher's Optimize) compiles them into the
+// vu1_programs plugin next to the game, which it loads at startup.
+// A file is only created once something is recorded, so a complete build
+// writes nothing. PS2X_VU_LEARN=0 turns it off; PS2X_VU1_LEARN=<dir> and
+// PS2X_VU0_CAPTURE=<file> name the destination explicitly (build passes).
+static FILE *ps2VuLearnFile(int unit)
+{
+    static std::mutex s_mutex;
+    static FILE *s_files[2] = {};
+    static bool s_failed[2] = {};
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (s_files[unit] || s_failed[unit])
+        return s_files[unit];
+    static const bool s_off = []()
+    {
+        const char *env = std::getenv("PS2X_VU_LEARN");
+        return env != nullptr && std::strcmp(env, "0") == 0;
+    }();
+    const char *vu1Dir = std::getenv("PS2X_VU1_LEARN");
+    const char *vu0File = std::getenv("PS2X_VU0_CAPTURE");
+    std::error_code ec;
+    std::filesystem::path path;
+    std::filesystem::path marker;
+    if (unit == 1 && vu1Dir && *vu1Dir)
+    {
+        std::filesystem::create_directories(vu1Dir, ec);
+        path = std::filesystem::path(vu1Dir) / ("vu1_learn_" + std::to_string(static_cast<long long>(std::time(nullptr))) + ".bin");
+    }
+    else if (unit == 0 && vu0File && *vu0File)
+    {
+        path = vu0File;
+    }
+    else if (!s_off)
+    {
+        const std::filesystem::path dir = ps2ConfigDirectory() / "vu_learn";
+        std::filesystem::create_directories(dir, ec);
+        path = dir / ("vu" + std::to_string(unit) + "_learn_" + std::to_string(static_cast<long long>(std::time(nullptr))) + ".bin");
+        marker = dir / "PENDING";
+    }
+    if (path.empty())
+    {
+        s_failed[unit] = true;
+        return nullptr;
+    }
+    s_files[unit] = std::fopen(path.string().c_str(), "wb");
+    if (!s_files[unit])
+    {
+        s_failed[unit] = true;
+        return nullptr;
+    }
+    std::cerr << "[vu" << unit << ":learn] recording a program with no compiled version to " << path.string()
+              << (marker.empty() ? "" : " (run Optimize to compile it)") << std::endl;
+    if (!marker.empty())
+        if (FILE *m = std::fopen(marker.string().c_str(), "w"))
+            std::fclose(m);
+    return s_files[unit];
+}
+
 // `outDraw` is the texture the caller should draw: `tex` (the host's own, for
 // the CPU frames) or the renderer's shared display texture when it composes on
 // the GPU in the window's context - then there is nothing to upload at all.
@@ -1127,36 +1192,19 @@ bool PS2Runtime::syncCoreSubsystems()
                                      (void)s_captureInit;
                                      bool capture = s_capture && s_captureLeft > 0u &&
                                                     g_ps2PresentedFrameCounter.load(std::memory_order_relaxed) >= s_captureStart;
-                                     // PS2X_VU1_LEARN=<dir>: record MSCALs of programs that have
-                                     // no compiled version (up to 4 runs per program, enough for
-                                     // vu1_recomp to trace their jump targets) to
-                                     // <dir>/vu1_learn_<time>.bin, in the PS2X_VU1_CAPTURE format.
-                                     static FILE *s_learn = nullptr;
+                                     // Programs with no compiled version are recorded for the
+                                     // next Optimize (see ps2VuLearnFile), in the
+                                     // PS2X_VU1_CAPTURE format.
                                      static std::unordered_map<uint64_t, uint32_t> s_learned;
-                                     static const bool s_learnInit = [&]()
-                                     {
-                                         if (const char *dir = std::getenv("PS2X_VU1_LEARN"); dir && *dir)
-                                         {
-                                             std::error_code ec;
-                                             std::filesystem::create_directories(dir, ec);
-                                             const auto path = std::filesystem::path(dir) /
-                                                               ("vu1_learn_" + std::to_string(static_cast<long long>(std::time(nullptr))) + ".bin");
-                                             s_learn = std::fopen(path.string().c_str(), "wb");
-                                             if (s_learn)
-                                                 std::cerr << "[vu1:learn] recording uncompiled programs to " << path.string() << std::endl;
-                                         }
-                                         return true;
-                                     }();
-                                     (void)s_learnInit;
                                      FILE *recordTo = capture ? s_capture : nullptr;
-                                     if (!recordTo && s_learn &&
+                                     if (!recordTo &&
                                          !m_vu1.lookupCompiled(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE, &m_memory, startPC))
                                      {
                                          uint32_t &runs = s_learned[ps2Vu1ProgramKey(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE, startPC & 0x3FF8u)];
                                          if (runs < 4u)
                                          {
                                              ++runs;
-                                             recordTo = s_learn;
+                                             recordTo = ps2VuLearnFile(1);
                                          }
                                      }
                                      if (recordTo)
@@ -1177,13 +1225,10 @@ bool PS2Runtime::syncCoreSubsystems()
                                      {
                                          std::fwrite(&m_vu1.state(), sizeof(VU1State), 1, recordTo);
                                          std::fwrite(m_memory.getVU1Data(), 1, PS2_VU1_DATA_SIZE, recordTo);
-                                         if (recordTo == s_learn)
-                                             std::fflush(s_learn);
-                                             // The capture is written with fwrite and only closed when it fills, so a run
-                                             // that ends first - which is what PS2X_EXIT_AFTER_FRAME does - went through
-                                             // _Exit with the buffer still in libc, and the file came out empty.
-                                             if (recordTo == s_capture)
-                                                 std::fflush(s_capture);
+                                         // Flushed per record: a run can end through _Exit
+                                         // (PS2X_EXIT_AFTER_FRAME) with the buffer still in libc,
+                                         // and the file would come out empty.
+                                         std::fflush(recordTo);
                                      }
                                      if (capture)
                                      {
@@ -2324,33 +2369,19 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
     m_vu0.reset(); // zeroes the cycle counter, so measure from here
     VuStatsScope statsScope(0, m_vu0.state().cycles);
     copyVu0ContextToState(ctx, m_vu0.state());
-    // PS2X_VU0_CAPTURE=<file>: record VU0 microprogram runs (up to 4 per program
-    // that has no compiled version, enough for vu1_recomp to trace its jump
-    // targets) in the VU1 capture format, tagged 'CVU0' so the tooling can tell
-    // VU0's 4 KB code/data from VU1's 16 KB. This is how the VU0 programs get
-    // generated: VU0 microcode is loaded by the game in gameplay, not at boot.
-    static FILE *s_vu0Capture = nullptr;
+    // VU0 programs with no compiled version are recorded for the next Optimize
+    // (see ps2VuLearnFile) in the VU1 capture format, tagged 'CVU0' so the
+    // tooling can tell VU0's 4 KB code/data from VU1's 16 KB. VU0 microcode is
+    // loaded by the game in gameplay, not at boot.
     static std::unordered_map<uint64_t, uint32_t> s_vu0Captured;
-    static const bool s_vu0CaptureInit = [&]()
-    {
-        if (const char *env = std::getenv("PS2X_VU0_CAPTURE"); env && *env)
-        {
-            s_vu0Capture = std::fopen(env, "wb");
-            if (s_vu0Capture)
-                std::cerr << "[vu0:capture] recording uncompiled programs to " << env << std::endl;
-        }
-        return true;
-    }();
-    (void)s_vu0CaptureInit;
     FILE *recordTo = nullptr;
-    if (s_vu0Capture != nullptr &&
-        m_vu0.lookupCompiled(vu0Code, PS2_VU0_CODE_SIZE, &m_memory, startPC) == nullptr)
+    if (m_vu0.lookupCompiled(vu0Code, PS2_VU0_CODE_SIZE, &m_memory, startPC) == nullptr)
     {
         uint32_t &runs = s_vu0Captured[ps2Vu1ProgramKey(vu0Code, PS2_VU0_CODE_SIZE, startPC & 0xFF8u)];
         if (runs < 4u)
         {
             ++runs;
-            recordTo = s_vu0Capture;
+            recordTo = ps2VuLearnFile(0);
         }
     }
     if (recordTo)

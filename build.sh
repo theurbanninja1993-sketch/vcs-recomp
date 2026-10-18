@@ -15,6 +15,11 @@
 #                    Linux-hosted toolchain, which is fetched once if missing)
 #     --toolchain D  use this llvm-mingw instead of fetching one
 #     --dry-run      print what each stage would do, and change nothing
+#     --optimize     compile the VU programs the game recorded while being played
+#                    (<game folder>/<platform>/config/vu_learn, or the user config
+#                    folder) into the vu1_programs plugin next to the game; needs
+#                    a finished build (same --out/--work), not the disc
+#     --learned DIR  another folder of recordings for --optimize
 #
 # Stages:
 #   0 check      is this the right disc? (manifest hash vs the disc's boot file)
@@ -39,6 +44,8 @@ TO=99
 DRY_RUN=0
 WINDOWS=0
 TOOLCHAIN=""
+OPTIMIZE=0
+LEARNED=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -51,7 +58,9 @@ while [ $# -gt 0 ]; do
         --windows) WINDOWS=1 ;;
         --toolchain) TOOLCHAIN="$2"; shift ;;
         --dry-run) DRY_RUN=1 ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        --optimize) OPTIMIZE=1 ;;
+        --learned) LEARNED="$2"; shift ;;
+        -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
     shift
@@ -156,6 +165,73 @@ need_tool() {
 stage_start=0
 stage_begin() { stage_start=$(date +%s); say "$*"; }
 stage_end()   { [ "$DRY_RUN" -eq 1 ] || note "took $(( $(date +%s) - stage_start ))s"; }
+
+# ---------------------------------------------------------------- optimize
+# --optimize: compile the VU programs the game recorded while it was played.
+# A program the build never saw runs interpreted (about ten times slower), so the
+# runtime records each one it meets (<config>/vu_learn/vu<unit>_learn_*.bin plus
+# a PENDING marker; see ps2VuLearnFile in ps2_runtime.cpp). This turns every
+# recording made while playing (all sessions so far) into the vu1_programs.so /
+# .dll plugin next to the game, which it loads at startup: no relink, a minute
+# or so. The played recordings are kept in $WORK/vu_played, so
+# a later full rebuild (stage 5) includes them too.
+if [ "$OPTIMIZE" -eq 1 ]; then
+    say "optimizing: compiling the VU programs recorded while playing"
+    played="$WORK/vu_played"
+    sources=()
+    [ -n "$LEARNED" ] && sources+=("$LEARNED")
+    sources+=("$OUT/linux/config/vu_learn" "$OUT/windows/config/vu_learn" "$OUT/config/vu_learn"
+              "${XDG_CONFIG_HOME:-$HOME/.config}/ps2recomp/vu_learn")
+    new=0
+    for dir in "${sources[@]}"; do
+        [ -d "$dir" ] || continue
+        while IFS= read -r file; do
+            note "recorded: $file"
+            if [ "$DRY_RUN" -eq 0 ]; then
+                mkdir -p "$played"
+                # The file names carry a timestamp, so recordings from different
+                # sessions or folders do not collide.
+                mv "$file" "$played/$(basename "$file")"
+            fi
+            new=$((new + 1))
+        done < <(find "$dir" -maxdepth 1 -name 'vu[01]_learn_*.bin' -size +0 | sort)
+        [ "$DRY_RUN" -eq 1 ] || find "$dir" -maxdepth 1 \( -name PENDING -o -name 'vu[01]_learn_*.bin' \) -delete
+    done
+    if [ "$new" -eq 0 ]; then
+        note "nothing new was recorded: every program the game has run is compiled"
+        exit 0
+    fi
+    if [ ! -x "$vu1_recomp" ]; then
+        run cmake -S "$PS2RECOMP" -B "$PS2RECOMP/build" -DCMAKE_BUILD_TYPE=Release
+        run cmake --build "$PS2RECOMP/build" --target vu1_recomp -j "$(nproc)"
+    fi
+    plugin_dir="$WORK/vu1_plugin"
+    # Only what was recorded while playing: those are exactly the programs the
+    # linked build lacks, so the plugin never shadows a linked program (the
+    # plugin's calls go through an API table and are slower than linked ones).
+    mapfile -t recordings < <(find "$played" -name 'vu[01]_learn_*.bin' -size +0 2>/dev/null | sort)
+    note "${#recordings[@]} recording(s), $new of them new"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        rm -rf "$plugin_dir"; mkdir -p "$plugin_dir"
+        "$vu1_recomp" "$plugin_dir" "${recordings[@]}" || die "vu1_recomp failed"
+        [ -f "$plugin_dir/vu1_programs.cpp" ] || die "vu1_recomp wrote no registry"
+        note "$(ls "$plugin_dir"/vu1p_*.cpp 2>/dev/null | wc -l) program file(s)"
+    fi
+    run cmake -S "$PS2RECOMP" -B "$PS2RECOMP/build" -DPS2X_VU1_PLUGIN_PROGRAMS="$plugin_dir"
+    run cmake --build "$PS2RECOMP/build" --target ps2_vu1_plugin -j "$(nproc)"
+    if [ -d "$OUT/linux" ]; then
+        run cp "$PS2RECOMP/build/ps2xRuntime/vu1_programs.so" "$OUT/linux/"
+        note "installed $OUT/linux/vu1_programs.so"
+    fi
+    if [ -f "$PS2RECOMP/build-win/CMakeCache.txt" ] && [ -d "$OUT/windows" ]; then
+        run cmake -S "$PS2RECOMP" -B "$PS2RECOMP/build-win" -DPS2X_VU1_PLUGIN_PROGRAMS="$plugin_dir"
+        run cmake --build "$PS2RECOMP/build-win" --target ps2_vu1_plugin -j "$(nproc)"
+        run cp "$PS2RECOMP/build-win/ps2xRuntime/vu1_programs.dll" "$OUT/windows/"
+        note "installed $OUT/windows/vu1_programs.dll"
+    fi
+    printf '\n\033[32mOptimize complete: restart the game to use the new programs.\033[0m\n'
+    exit 0
+fi
 
 say "GTA PS2 build pipeline"
 note "game  : $game_name (${game_boot_file})"
@@ -416,7 +492,8 @@ if [ "$FROM" -le 5 ] && [ "$TO" -ge 5 ]; then
             # program plus the registry vu1_programs.cpp.
             # Every recording so far (a later pass only adds what is still
             # missing); empty files are passes that found nothing new.
-            mapfile -t recordings < <(find "$learn" -name 'vu[01]_learn_*.bin' -size +0 | sort)
+            # Plus anything recorded while playing and compiled by --optimize.
+            mapfile -t recordings < <(find "$learn" "$WORK/vu_played" -name 'vu[01]_learn_*.bin' -size +0 2>/dev/null | sort)
             "$vu1_recomp" "$vu1_dir" "${recordings[@]}" || die "vu1_recomp failed"
             [ -f "$vu1_dir/vu1_programs.cpp" ] || die "vu1_recomp wrote no registry"
             note "  $(ls "$vu1_dir"/vu1p_*.cpp 2>/dev/null | wc -l) program file(s)"

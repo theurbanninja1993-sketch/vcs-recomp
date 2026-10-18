@@ -30,9 +30,23 @@ an A/B of each of those changed nothing.
   (`PS2X_VU0_CAPTURE`), and `games/vcs/game.toml` rides Sgt. Martinez's bike after
   the intro (7000 frames). Measured with this route: 22 programs (8 VU0) instead
   of 15. That is still short of 30, because a scripted route cannot reach
-  everything. Next step: keep learning during normal play (record uncompiled
-  programs into the config dir) plus a launcher "optimize" action that compiles
-  them and relinks.
+  everything. So the runtime keeps learning during normal play (below).
+- **Learning during play (done, needs a launcher button).** By default the
+  runtime records every VU1/VU0 program it meets that has no compiled version
+  (4 runs each, the same capture format) into `<config>/vu_learn/`, where
+  `<config>` is `<game>/<platform>/config` for portable installs, and writes a
+  `PENDING` marker there. A complete build writes nothing. `PS2X_VU_LEARN=0`
+  turns it off. **Launcher contract:** if `<config>/vu_learn/PENDING` exists,
+  offer "Optimize", which runs `build.sh --optimize --out <game folder> --work
+  <the build's work folder>`. That compiles every played recording so far into
+  `vu1_programs.so` / `.dll` next to the game (the plugin the runtime already
+  loads at startup; no relink, about a minute), keeps the recordings in
+  `<work>/vu_played` (a later full rebuild links them in), and clears the
+  marker. The plugin only holds programs the linked build lacks: plugin calls go
+  through the API table and measured ~8-10 us/call against ~6 linked (with
+  another game running alongside), against ~57 interpreted. Tested end to end
+  in a sandbox: recordings moved, 22 programs built, plugin loaded ("[vu1] 22
+  compiled programs from .../vu1_programs.so"), nothing interpreted.
 
 ## If you are reviewing this
 
