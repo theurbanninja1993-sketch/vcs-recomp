@@ -3,8 +3,9 @@
 #
 #   ./build.sh --image <disc|image|folder> [--game <dir>] [options]
 #
-#     --image PATH   the source: an optical drive (/dev/sr0, E:), an .iso/.bin,
-#                    or an already-extracted folder (skips the extraction).
+#     --image PATH   the source: an optical drive (/dev/sr0, E:), an .iso, a raw
+#                    .bin, a .cue sheet naming one of those, a .chd, or an
+#                    already-extracted folder (skips the extraction).
 #     --game DIR     the game's manifest folder (default: the only games/*/ that
 #                    has a game.toml, so a single-game checkout needs no flag).
 #     --out DIR      where the finished game folder goes (default: $PWD/dist)

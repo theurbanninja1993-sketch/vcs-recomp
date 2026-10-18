@@ -12,6 +12,11 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <sstream>
+
+#if defined(PS2X_ISO_CHD)
+#include <libchdr/chd.h>
+#endif
 
 namespace ps2x
 {
@@ -33,6 +38,33 @@ namespace ps2x
             std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
             return s;
         }
+
+        // A CHD says 'MComprHD' first, whatever version it is.
+        bool looksLikeChd(const uint8_t *head) { return std::memcmp(head, "MComprHD", 8) == 0; }
+
+        // A .cue is text, and small: the largest real one is a few KB. Sniffing
+        // the content rather than the extension means a cue sheet renamed to .iso
+        // is understood instead of being called "not an ISO9660 image", which is
+        // true but no help to anyone.
+        bool looksLikeCue(const uint8_t *head, size_t size)
+        {
+            if (size == 0 || size > 1024u * 1024u)
+                return false;
+            for (size_t i = 0; i < size; ++i)
+                if (head[i] != 0 && (head[i] < 0x09 || (head[i] > 0x0D && head[i] < 0x20)))
+                    return false; // control bytes: this is a binary image, not a sheet
+            const std::string text(reinterpret_cast<const char *>(head), size);
+            return text.find("FILE ") != std::string::npos || text.find("\"BINARY\"") != std::string::npos;
+        }
+
+        std::string trim(const std::string &text)
+        {
+            const size_t first = text.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos)
+                return {};
+            const size_t last = text.find_last_not_of(" \t\r\n");
+            return text.substr(first, last - first + 1);
+        }
     }
 
     IsoImage::~IsoImage()
@@ -50,8 +82,59 @@ namespace ps2x
             CloseHandle(static_cast<HANDLE>(m_device));
 #endif
         m_device = nullptr;
+#if defined(PS2X_ISO_CHD)
+        if (m_chd)
+            chd_close(static_cast<chd_file *>(m_chd));
+#endif
+        m_chd = nullptr;
+        m_chdHunk.clear();
+        m_chdHunkIndex = 0xFFFFFFFFu;
+        m_chdFrameBytes = 0;
         m_entries.clear();
+        m_volumeId.clear();
         m_readError.clear();
+    }
+
+    // A CHD holds the disc as fixed-size units packed into hunks - 2448 bytes each
+    // for a CD (2352 of sector plus 96 of subcode), or a flat 2048 for a DVD.
+    // Reading one is therefore the same shape as reading a raw image: the unit for
+    // sector N, with the user data at whichever offset the layout probe settled on.
+    // Only the stride and the decompression differ, so everything after this point
+    // (the directory walk, extraction) is unchanged.
+    //
+    // The hunk is cached because a hunk holds several units and libchdr decodes a
+    // hunk to hand out any of them: without this a sector-by-sector walk would ask
+    // for the same hunk eight times over.
+    bool IsoImage::readChdSectors(uint32_t lba, uint32_t count, uint8_t *out)
+    {
+#if defined(PS2X_ISO_CHD)
+        chd_file *chd = static_cast<chd_file *>(m_chd);
+        const chd_header *head = chd_get_header(chd);
+        const uint32_t framesPerHunk = head->hunkbytes / m_chdFrameBytes;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const uint32_t frame = lba + i;
+            const uint32_t hunk = frame / framesPerHunk;
+            if (hunk != m_chdHunkIndex)
+            {
+                if (m_chdHunk.size() != head->hunkbytes)
+                    m_chdHunk.resize(head->hunkbytes);
+                const chd_error err = chd_read(chd, hunk, m_chdHunk.data());
+                if (err != CHDERR_NONE)
+                {
+                    m_readError = std::string("can't decompress the CHD: ") + chd_error_string(err);
+                    return false;
+                }
+                m_chdHunkIndex = hunk;
+            }
+            std::memcpy(out + size_t(i) * 2048u, m_chdHunk.data() + size_t(frame % framesPerHunk) * m_chdFrameBytes + m_dataOffset, 2048u);
+        }
+        return true;
+#else
+        (void)lba; (void)count; (void)out;
+        m_readError = "this build of ps2x_iso has no CHD support";
+        return false;
+#endif
     }
 
     bool IsoImage::readSectors(uint32_t lba, uint32_t count, uint8_t *out)
@@ -80,6 +163,9 @@ namespace ps2x
             return true;
         }
 #endif
+        if (m_chd)
+            return readChdSectors(lba, count, out);
+
         bool ok = false;
         if (m_sectorSize == 2048u)
         {
@@ -95,6 +181,244 @@ namespace ps2x
         if (!ok)
             m_readError = "can't read the image at sector " + std::to_string(lba);
         return ok;
+    }
+
+    // The primary volume descriptor, then the directories.
+    //
+    // A plain image is tried as 2048-byte sectors and as raw 2352-byte ones, with
+    // the user data after the sync/header. A CHD is different in one way that
+    // matters: its unit is a CD frame of 2448 bytes (2352 + 96 subcode) for a CD,
+    // or a flat 2048 for a DVD, but what is at the *front* of the unit depends on
+    // what the CHD was made from - chdman passes through 2048-byte sectors as they
+    // are, so their data sits at 0 - so the three offsets are all worth trying.
+    bool IsoImage::mount(bool isChd, std::string &error)
+    {
+        struct Layout
+        {
+            uint32_t stride, dataOffset;
+        };
+        std::vector<Layout> layouts;
+        if (isChd)
+        {
+            const uint32_t unit = m_chdFrameBytes;
+            for (const uint32_t offset : {0u, 16u, 24u})
+                if (unit >= offset + 2048u)
+                    layouts.push_back({unit, offset});
+        }
+        else
+        {
+            layouts = {{2048u, 0u}, {2352u, 0u}, {2352u, 16u}, {2352u, 24u}};
+        }
+
+        uint8_t pvd[2048];
+        bool found = false;
+        for (const Layout &layout : layouts)
+        {
+            m_sectorSize = layout.stride;
+            m_dataOffset = layout.dataOffset;
+            if (readSectors(16u, 1u, pvd) && pvd[0] == 1u && std::memcmp(pvd + 1, "CD001", 5) == 0)
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+        {
+            // Read the reason out before close(), which clears it - otherwise every
+            // failure reports "not an ISO9660 disc image", including the ones with
+            // a much more useful answer.
+            const std::string reason = m_readError;
+            close();
+            error = reason.empty() ? "not an ISO9660 disc image" : ("can't read the disc: " + reason);
+            return false;
+        }
+        m_volumeId.assign(reinterpret_cast<const char *>(pvd + 40), 32);
+        m_volumeId.erase(m_volumeId.find_last_not_of(' ') + 1);
+        const uint8_t *root = pvd + 156;
+        if (!readDirectory("", le32(root + 2), le32(root + 10), 0))
+        {
+            close();
+            error = "can't read the disc's directories";
+            return false;
+        }
+        return true;
+    }
+
+    // A .cue names the image file beside it. The data track is the one that
+    // matters - a disc can carry audio tracks too - so this takes the first FILE
+    // that is followed by a non-audio TRACK, and the first FILE of all when the
+    // sheet does not say.
+    bool IsoImage::readCueTarget(const std::string &imagePath, std::string &target, std::string &error)
+    {
+        std::FILE *f = std::fopen(imagePath.c_str(), "rb");
+        if (!f)
+        {
+            error = "can't open " + imagePath + " (" + std::strerror(errno) + ")";
+            return false;
+        }
+        std::string text;
+        char buffer[4096];
+        size_t n = 0;
+        while ((n = std::fread(buffer, 1, sizeof buffer, f)) > 0)
+            text.append(buffer, n);
+        std::fclose(f);
+
+        std::string first, data;
+        std::string pending;
+        bool havePending = false;
+        std::istringstream in(text);
+        std::string line;
+        while (std::getline(in, line))
+        {
+            line = trim(line);
+            if (line.rfind("REM", 0) == 0 || line.rfind("//", 0) == 0)
+                continue;
+            // FILE is the standard cue keyword. DATAFILE is what the Windows tools
+            // that produce a "cue" from an already-extracted bin write instead, and
+            // it means the same thing - the owner of this project hit exactly that.
+            const size_t keyword = line.rfind("DATAFILE", 0) == 0 ? 8 : line.rfind("FILE", 0) == 0 ? 4 : 0;
+            if (keyword != 0)
+            {
+                std::string rest = trim(line.substr(keyword));
+                std::string name;
+                if (!rest.empty() && rest.front() == '"')
+                {
+                    const size_t close = rest.find('"', 1);
+                    name = rest.substr(1, close == std::string::npos ? std::string::npos : close - 1);
+                }
+                else
+                {
+                    const size_t space = rest.find_first_of(" \t");
+                    name = rest.substr(0, space);
+                }
+                if (name.empty())
+                    continue;
+                pending = name;
+                havePending = true;
+                if (first.empty())
+                    first = name;
+                continue;
+            }
+            if (havePending && line.rfind("TRACK", 0) == 0)
+            {
+                if (line.find("AUDIO") == std::string::npos && data.empty())
+                    data = pending;
+                havePending = false;
+            }
+        }
+        const std::string chosen = data.empty() ? first : data;
+        if (chosen.empty())
+        {
+            error = imagePath + " is a .cue sheet, but it does not name an image file";
+            return false;
+        }
+
+        // The name in a cue is relative to the sheet, and may use Windows
+        // separators whatever is reading it.
+        std::string name = chosen;
+        std::replace(name.begin(), name.end(), '\\', '/');
+        std::filesystem::path path(name);
+        target = path.is_absolute() ? name : (std::filesystem::path(imagePath).parent_path() / path).string();
+        if (!std::filesystem::exists(target))
+        {
+            error = imagePath + " is a .cue sheet for \"" + chosen + "\", which is not next to it - " +
+                    "keep the two files together, or pick the image file itself";
+            return false;
+        }
+        return true;
+    }
+
+    bool IsoImage::openImage(const std::string &imagePath, std::string &error)
+    {
+        m_file = std::fopen(imagePath.c_str(), "rb");
+        if (!m_file)
+        {
+            // errno is the difference between "no such file" and "not allowed".
+            error = "can't open " + imagePath + " (" + std::strerror(errno) + ")";
+            return false;
+        }
+        // The descriptor sits at sector 16, so anything under 17 sectors is not
+        // worth three read attempts to find that out - and "not an ISO9660 disc
+        // image" is a better answer than a read error at sector 16 for a file the
+        // player picked by mistake.
+        if (seek64(m_file, 0) && fseek(m_file, 0, SEEK_END) == 0)
+        {
+            const long size = ftell(m_file);
+            if (size >= 0 && static_cast<uint64_t>(size) < 17u * 2048u)
+            {
+                close();
+                error = "not an ISO9660 disc image: " + imagePath + " is only " + std::to_string(size) + " bytes";
+                return false;
+            }
+            seek64(m_file, 0);
+        }
+        return mount(false, error);
+    }
+
+    bool IsoImage::openChd(void *handle, std::string &error)
+    {
+#if defined(PS2X_ISO_CHD)
+        m_chd = handle;
+        const chd_header *head = chd_get_header(static_cast<chd_file *>(handle));
+        // A CD or DVD CHD holds 2448-byte CD frames or flat 2048-byte sectors. A
+        // hard-disc one holds 512, and is not something a PlayStation 2 game came
+        // on, so saying so is better than reading it as nonsense.
+        if (head->unitbytes < 2048u)
+        {
+            error = "this CHD holds a hard-disc image, not a CD or DVD";
+            close();
+            return false;
+        }
+        m_chdFrameBytes = head->unitbytes;
+        return mount(true, error);
+#else
+        (void)handle;
+        error = "this is a CHD, a compressed disc image, and this build of ps2x_iso was made without "
+                "CHD support - rebuild it with -DPS2X_ISO_CHD=ON, or unpack the CHD to .bin/.cue with chdman first";
+        return false;
+#endif
+    }
+
+    bool IsoImage::openOne(const std::string &imagePath, std::string &error, int depth)
+    {
+        if (depth > 4)
+        {
+            error = "too many .cue sheets pointing at each other";
+            return false;
+        }
+        std::FILE *probe = std::fopen(imagePath.c_str(), "rb");
+        if (!probe)
+        {
+            error = "can't open " + imagePath + " (" + std::strerror(errno) + ")";
+            return false;
+        }
+        uint8_t head[1024];
+        const size_t size = std::fread(head, 1, sizeof head, probe);
+        std::fclose(probe);
+
+        if (size >= 8 && looksLikeChd(head))
+        {
+#if defined(PS2X_ISO_CHD)
+            chd_file *chd = nullptr;
+            const chd_error err = chd_open(imagePath.c_str(), CHD_OPEN_READ, nullptr, &chd);
+            if (err != CHDERR_NONE)
+            {
+                error = "can't open " + imagePath + " as a CHD: " + std::string(chd_error_string(err));
+                return false;
+            }
+            return openChd(chd, error);
+#else
+            return openChd(nullptr, error);
+#endif
+        }
+        if (looksLikeCue(head, size))
+        {
+            std::string target;
+            if (!readCueTarget(imagePath, target, error))
+                return false;
+            return openOne(target, error, depth + 1);
+        }
+        return openImage(imagePath, error);
     }
 
     bool IsoImage::open(const std::string &imagePath, std::string &error)
@@ -125,50 +449,10 @@ namespace ps2x
                 return false;
             }
             m_device = handle;
+            return mount(false, error);
         }
-        else
 #endif
-            m_file = std::fopen(imagePath.c_str(), "rb");
-        if (!m_file && !m_device)
-        {
-            // errno is the difference between "no such file" and "not allowed".
-            error = "can't open " + imagePath + " (" + std::strerror(errno) + ")";
-            return false;
-        }
-        // Find the primary volume descriptor (sector 16) for each layout.
-        struct Layout
-        {
-            uint32_t sectorSize, dataOffset;
-        };
-        const Layout layouts[] = {{2048u, 0u}, {2352u, 16u}, {2352u, 24u}};
-        uint8_t pvd[2048];
-        bool found = false;
-        for (const Layout &layout : layouts)
-        {
-            m_sectorSize = layout.sectorSize;
-            m_dataOffset = layout.dataOffset;
-            if (readSectors(16u, 1u, pvd) && pvd[0] == 1u && std::memcmp(pvd + 1, "CD001", 5) == 0)
-            {
-                found = true;
-                break;
-            }
-        }
-        if (!found)
-        {
-            close();
-            error = m_readError.empty() ? "not an ISO9660 disc image" : ("can't read the disc: " + m_readError);
-            return false;
-        }
-        m_volumeId.assign(reinterpret_cast<const char *>(pvd + 40), 32);
-        m_volumeId.erase(m_volumeId.find_last_not_of(' ') + 1);
-        const uint8_t *root = pvd + 156;
-        if (!readDirectory("", le32(root + 2), le32(root + 10), 0))
-        {
-            close();
-            error = "can't read the disc's directories";
-            return false;
-        }
-        return true;
+        return openOne(imagePath, error, 0);
     }
 
     bool IsoImage::readDirectory(const std::string &prefix, uint32_t lba, uint32_t size, int depth)

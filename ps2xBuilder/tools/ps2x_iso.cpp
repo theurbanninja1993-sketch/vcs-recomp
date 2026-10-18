@@ -1,4 +1,6 @@
 // ps2x_iso: inspect / extract a PS2 disc image (test tool for the builder).
+//   <image> is an .iso, a raw .bin, a .cue sheet naming one of those, or a .chd -
+//   sniffed by content, so a sheet renamed to .iso still reads.
 //   ps2x_iso drives                    optical drives (/dev/sr0, D:) usable as <image>
 //   ps2x_iso info <image>              volume, boot file, file count, size
 //   ps2x_iso list <image>              every entry

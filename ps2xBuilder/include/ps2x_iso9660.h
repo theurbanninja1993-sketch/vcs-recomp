@@ -1,8 +1,10 @@
 #pragma once
 
 // Minimal read-only ISO9660 reader for PS2 disc images: plain 2048-byte
-// sector images (.iso) and raw 2352-byte CD images (.bin, mode 1 / mode 2).
-// Used by the builder to verify and extract the player's own disc.
+// sector images (.iso), raw 2352-byte CD images (.bin, mode 1 / mode 2), a .cue
+// sheet naming one of those, and CHD (which is what a lot of people keep their
+// library in, and the reason ps2x_iso links libchdr). Used by the builder to
+// verify and extract the player's own disc.
 
 #include <cstdint>
 #include <cstdio>
@@ -46,9 +48,25 @@ namespace ps2x
     private:
         bool readSectors(uint32_t lba, uint32_t count, uint8_t *out);
         bool readDirectory(const std::string &prefix, uint32_t lba, uint32_t size, int depth);
+        // The three ways a disc arrives. Each either identifies itself here or
+        // leaves a reason in `error`, and a .cue lands back in openOne() to read
+        // whatever it names.
+        bool openOne(const std::string &imagePath, std::string &error, int depth);
+        bool openChd(void *handle, std::string &error);
+        bool openImage(const std::string &imagePath, std::string &error);
+        bool readCueTarget(const std::string &imagePath, std::string &target, std::string &error);
+        bool readChdSectors(uint32_t lba, uint32_t count, uint8_t *out);
+        // Find the primary volume descriptor, then walk the directories. Shared by
+        // all three, and the only difference between them is which sector layouts
+        // are worth trying.
+        bool mount(bool isChd, std::string &error);
 
         std::FILE *m_file = nullptr;
         void *m_device = nullptr;       // Windows: HANDLE of an optical drive (sector-aligned reads)
+        void *m_chd = nullptr;          // a chd_file*, when the disc is a CHD
+        std::vector<uint8_t> m_chdHunk; // the decoded hunk the reads are walking through
+        uint32_t m_chdHunkIndex = 0xFFFFFFFFu;
+        uint32_t m_chdFrameBytes = 0;   // one CD frame inside a hunk: 2448 (2352 + subcode)
         uint32_t m_sectorSize = 2048;   // bytes per sector in the image file
         uint32_t m_dataOffset = 0;      // user data offset inside a raw sector
         std::vector<IsoEntry> m_entries;
