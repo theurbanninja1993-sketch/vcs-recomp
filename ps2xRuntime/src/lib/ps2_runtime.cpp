@@ -4,6 +4,7 @@
 #include "runtime/ps2_platform.h"
 #include "runtime/ps2_music_station.h"
 #include "runtime/ps2_mods.h"
+#include "runtime/ps2_achievements.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -3553,6 +3554,13 @@ void PS2Runtime::run()
         {
             s_lastCameraTick = cameraTick;
             ps2_game_overrides::publishCameraFrame(m_memory.getRDRAM());
+            // Achievements are evaluated against the game's own frames, the way an
+            // emulator's client evaluates them: a host frame that shows the same
+            // game frame twice must not count twice, or a "hold this for a second"
+            // condition would be met at half speed. Init is idempotent and does the
+            // set's file read on the first call.
+            ps2AchievementsInit(m_memory.getRDRAM());
+            ps2AchievementsFrame(m_memory.getRDRAM());
             // g_ps2PresentedFrameCounter counts *pictures*, not host frames. It
             // used to advance with the host loop, which coincided at 60 Hz and
             // broke everything that gates on it once the host ran faster - most
@@ -3884,6 +3892,10 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
             DrawText(TextFormat("game %d fps", s_gameFps), 10, 10, 20, LIME);
             DrawText(TextFormat("host %d fps  %.1f ms", GetFPS(), GetFrameTime() * 1000.0f), 10, 34, 20, RAYWHITE);
         }
+        // The unlock banner, over the game and under nothing: it is drawn whether
+        // or not the fps overlay is on, because it is the game talking to the
+        // player rather than a debug readout.
+        ps2AchievementsDrawOverlay();
         // The host rate in the perf log too, independent of the overlay: the game
         // rate is already there and the two together are how a pacing change is
         // checked without a visible window.

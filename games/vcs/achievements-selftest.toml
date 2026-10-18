@@ -1,0 +1,53 @@
+# Self test for the achievement engine - not shipped, and not the real set.
+#
+# Every condition here reads an address this port already reads for its own
+# overrides (game_overrides.cpp), so nothing in it depends on an address that is
+# still being hunted. It exists to prove the pipeline end to end: a condition
+# parses, the memory callback answers, an unlock fires, the banner draws, and the
+# capstone is granted once everything else is.
+#
+#   PS2X_ACHIEVEMENTS=games/vcs/achievements-selftest.toml <the runner> <elf>
+
+[set]
+name = "Achievement engine self test"
+version = 1
+
+# 0x4CD2AC is the flag the game's own pause handlers set (the port reads it to
+# close its settings menu when the game's pause menu opens). Note the shape: a
+# trigger that is *already* true when it is activated never fires - rcheevos
+# waits for a condition to be false once first, so "the game is running" has to be
+# written as a transition (paused, then not) rather than as a state.
+[achievement]
+id = 1
+title = Back in the game
+description = The pause menu was opened, and then closed again.
+category = Test
+points = 5
+trigger = 0xH4CD2AC=0
+
+# 0x6F4D14 is the cutscene flag the port reads for its cutscene audio and its
+# custom-soundtrack station.
+[achievement]
+id = 2
+title = In a cutscene
+description = The cutscene flag is up.
+category = Test
+points = 5
+trigger = 0xX6F4D14!=0
+
+[achievement]
+id = 3
+title = Paused
+description = The game's own pause menu is open.
+category = Test
+points = 5
+trigger = 0xH4CD2AC!=0
+
+# Granted by the port once the three above are unlocked, which is how the real
+# set's "unlock everything" capstone works.
+[achievement]
+id = 4
+title = Self test complete
+description = Every other self test is unlocked.
+category = Capstone
+points = 5

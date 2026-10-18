@@ -4,6 +4,85 @@ State as of 2026-10-18 (`vcs-bringup` is the tip the `release` branch players bu
 from was cut at, tagged `stories-v0.1.3`; the launcher is its own repo at `d964ca8` =
 `v0.1.2`). Read this before changing anything. A reviewer will check work against it.
 
+## 2026-10-18 (Claude): the local achievement set is built
+
+Owner: *"do you think you can build it?"* - it is built, and verified end to end.
+Item 16 below has the design and the reasoning; this is what exists now.
+
+**The engine** (`ps2xRuntime/src/lib/ps2_achievements.cpp`, ~450 lines, plus a
+tab in the settings panel):
+
+- **rcheevos** (MIT) is the evaluator, fetched by the runtime's CMake and pinned
+  to a revision. Only its runtime half is built - the api and client halves are
+  for talking to RetroAchievements, which a set that lives beside the port does
+  not do. Nothing here opens a socket.
+- The set is read from `$PS2X_ACHIEVEMENTS`, else `achievements.toml` beside the
+  runner, else beside the settings. Conditions are RetroAchievements condition
+  strings, so the set is portable if that rule ever changes.
+- Evaluation happens **once per game frame**, in the present path's new-picture
+  block, not per host frame - a host frame that shows the same game frame twice
+  must not count twice, or a "hold this for a second" condition is met at half
+  speed.
+- Unlocks persist in two files beside the settings: the ids (ours, so the list is
+  right even if the evaluator's state is lost) and rcheevos' progress blob (theirs,
+  where hit counts live).
+- A capstone over the others cannot be a condition on memory, so the port grants
+  it: a trigger-less achievement in the `Capstone` category unlocks once every
+  achievement that does have a condition is unlocked.
+- `PS2X_ACHIEVEMENTS_DEBUG=1` prints every state change, the read and event
+  counts, and the two self-test flags - which is how a condition that is not
+  behaving is told apart from one whose address is wrong.
+
+**Three things cost real time and are worth knowing before touching this:**
+
+1. **The RAM mask.** rcheevos' read callback has to mask the guest address the way
+   the hardware does, and the mask is `PS2_RAM_MASK` (32 MB - 1). Using 2 MB - 1
+   by mistake aliases every address above 2 MB - which is every address this game
+   keeps anything interesting at - and looks exactly like a set whose addresses are
+   all wrong.
+2. **Validation.** rcheevos will not evaluate a trigger whose addresses the client
+   has not declared readable (`rc_runtime_validate_addresses`). Without it, every
+   trigger sits there being read and never tested. Validation must come **after**
+   restoring the progress blob, because a restored memref state can otherwise leave
+   them unevaluable - and a stale blob then wedges the engine for good. The blob is
+   therefore stamped (`PS2XACH1`) and ignored if the stamp does not match.
+3. **A trigger that is already true when it is activated never fires.** rcheevos
+   waits for a condition to be false once first, so "the game is running" has to be
+   written as a transition (paused, then not) rather than as a state. Every
+   condition in the real set is a counter going up, which is the shape that works.
+
+**The set** (`games/vcs/achievements.toml`, 35 achievements): the shape and the
+counts are in item 16, and the story milestones are now decided - the first and
+last mission of each chapter, the way the official sets name theirs after the
+mission:
+
+| chapter | first | last |
+|---|---|---|
+| 1 | **Soldier** | **To Victor, the Spoils** |
+| 2 | **Jive Drive** | **From Zero to Hero** |
+| 3 | **Brawn of the Dead** | **Last Stand** |
+
+Every trigger is still to be authored, and that is the playthrough's work: F9 for
+a RAM dump, do the thing, diff, then confirm the address live in
+**Settings > Achievements > Address watcher** - which is why that watcher exists.
+The file's own comments say how, and one hint is worth repeating here: the six
+story milestones are probably **one** progression counter, so they may become six
+`>= n` conditions on a single address rather than six flags.
+
+**What was verified, and what was not.** The engine: a self-test set
+(`games/vcs/achievements-selftest.toml`) on addresses this port already reads for
+its own overrides - the pause flag at `0x4CD2AC` and the cutscene flag at
+`0x6F4D14`. Both a `!=0` transition (pause) and a `=0` transition (unpause)
+unlocked, drew the banner, and persisted across a restart. The panel was captured
+and checked: the list, the counts, the reset button and the address watcher all
+render. **Not verified:** the banner's on-screen appearance - the guest-frame
+screenshot mode deliberately excludes host UI, and the host capture needs a key
+press - and the real set's conditions, which do not exist yet.
+
+**One thing left for the set to be complete:** the four hidden mission challenges
+(ids 7-10) are held back on purpose, to be chosen against the missions once the
+playthrough has been done.
+
 ## 2026-10-18 (Claude): a converted image that would not read, and what a hash mismatch means
 
 The owner converted his CHD back to an image and the build rejected it. Working
@@ -2413,7 +2492,7 @@ disables the wall stop; `PS2X_CARLOOK_DEBUG=<file>` logs the whole path
 
     | category | count | proposed |
     |---|---|---|
-    | story milestones | 6 | the opening (**Soldier**), **Conduct Unbecoming**, **Boomshine Blowout**, **From Zero to Hero**, **Turn on, Tune in, Bug out**, and the finale (**Last Stand**) - VCS has 59 missions, so milestones only |
+    | story milestones | 6 | **decided** (owner, 2026-10-18): the first and last mission of each chapter - **Soldier** / **To Victor, the Spoils**, **Jive Drive** / **From Zero to Hero**, **Brawn of the Dead** / **Last Stand** |
     | mission challenges | 4 | hidden, authored per mission: a no-damage delivery, keeping Lance alive, a kill with a named weapon, a stealth route - the same shape as *"Kill the property developer with a Golf Club during 'Four Iron'."* |
     | side activities | 9 | **Vice Sights** (5 levels), **Beach Patrol** (15), **Air Rescue** (15), **Fire Copter** (15), Paramedic 15, Firefighter 15, Vigilante 15, taxi fares, the **Shooting Range** (5 rounds) - plus **Empire Builder: acquire all 30 Empire Building Sites**, which is VCS's own system and deserves its slot |
     | collectibles / sets | 3 | all **99 Red Balloons**, all **36 unique stunt jumps**, every **Rampage** |

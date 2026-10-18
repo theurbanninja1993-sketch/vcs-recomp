@@ -8,6 +8,7 @@
 #include "runtime/ps2_music_station.h"
 #include "runtime/ps2_platform.h"
 #include "runtime/ps2_mods.h"
+#include "runtime/ps2_achievements.h"
 
 #include <unordered_set>
 #include <utility>
@@ -2520,6 +2521,142 @@ void PS2DebugPanel::drawSettingsHint()
 #endif
 }
 
+// --------------------------------------------------------------- achievements
+// The list, and the tool used to author the next one. A set is worth nothing
+// until its addresses are right, and watching a candidate address while playing
+// is how a condition gets confirmed - so the watcher lives here rather than in a
+// separate build. See docs/vcs-handoff.md for the set's design and the addresses
+// still to be hunted.
+static void drawAchievementsTab(PS2Runtime &runtime)
+{
+    const std::vector<Ps2AchievementView> view = ps2AchievementsView();
+    const int unlocked = ps2AchievementsUnlocked();
+
+    ImGui::TextWrapped("The port's own achievement set: a file beside the port, no account, and nothing that "
+                       "goes online.");
+    if (ps2AchievementsLoaded())
+    {
+        ImGui::TextDisabled("%s", ps2AchievementsSetPath().c_str());
+        ImGui::Text("%d of %d unlocked", unlocked, static_cast<int>(view.size()));
+        if (unlocked > 0)
+        {
+            ImGui::SameLine();
+            if (ImGui::Button("Forget them"))
+                ImGui::OpenPopup("forget-achievements");
+        }
+    }
+    else
+    {
+        ImGui::TextDisabled("no set found: put achievements.toml beside the port, or point PS2X_ACHIEVEMENTS at one");
+    }
+    if (ImGui::BeginPopupModal("forget-achievements", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::TextUnformatted("Every unlock is forgotten, and the hit counts with them.");
+        if (ImGui::Button("Forget"))
+        {
+            ps2AchievementsReset();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Keep"))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    ImGui::Separator();
+    for (const Ps2AchievementView &row : view)
+    {
+        const std::string heading = std::string(row.unlocked ? "[x] " : "[ ] ") + row.title;
+        if (row.unlocked)
+            ImGui::TextColored(ImVec4(0.94f, 0.78f, 0.35f, 1.0f), "%s", heading.c_str());
+        else
+            ImGui::TextUnformatted(heading.c_str());
+
+        std::string meta = row.category;
+        if (row.points > 0)
+            meta += (meta.empty() ? "" : "  -  ") + std::to_string(row.points) + " points";
+        if (row.hasProgress)
+            meta += (meta.empty() ? "" : "  -  ") + row.progress;
+        if (!meta.empty())
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", meta.c_str());
+        }
+        if (!row.description.empty())
+            ImGui::TextDisabled("        %s", row.description.c_str());
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Address watcher");
+    ImGui::TextWrapped("Guest addresses in hex, separated by anything. Watch them while you play: this is how a "
+                       "condition's address is found and confirmed.");
+    static char addresses[256] = "";
+    static std::vector<uint32_t> watched;
+    if (ImGui::InputText("##watched-addresses", addresses, sizeof addresses))
+    {
+        watched.clear();
+        uint32_t value = 0;
+        bool inNumber = false;
+        for (const char *p = addresses;; ++p)
+        {
+            const char c = *p;
+            const int digit = (c >= '0' && c <= '9')   ? c - '0'
+                              : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                              : (c >= 'A' && c <= 'F') ? c - 'A' + 10
+                                                       : -1;
+            if (digit >= 0)
+            {
+                value = (value << 4) | static_cast<uint32_t>(digit);
+                inNumber = true;
+            }
+            else
+            {
+                if (inNumber)
+                    watched.push_back(value);
+                value = 0;
+                inNumber = false;
+                if (c == '\0')
+                    break;
+            }
+        }
+    }
+    const uint8_t *rdram = runtime.memory().getRDRAM();
+    if (!watched.empty() && rdram != nullptr &&
+        ImGui::BeginTable("watched", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit))
+    {
+        ImGui::TableSetupColumn("address");
+        ImGui::TableSetupColumn("u8");
+        ImGui::TableSetupColumn("u16");
+        ImGui::TableSetupColumn("u32");
+        ImGui::TableSetupColumn("f32");
+        ImGui::TableHeadersRow();
+        for (const uint32_t address : watched)
+        {
+            const size_t at = address & PS2_RAM_MASK;
+            uint8_t asByte = 0;
+            uint16_t asHalf = 0;
+            uint32_t asWord = 0;
+            float asFloat = 0.0f;
+            std::memcpy(&asByte, rdram + at, 1);
+            std::memcpy(&asHalf, rdram + (at & ~size_t(1)), 2);
+            std::memcpy(&asWord, rdram + (at & ~size_t(3)), 4);
+            std::memcpy(&asFloat, rdram + (at & ~size_t(3)), 4);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("0x%08X", address);
+            ImGui::TableNextColumn();
+            ImGui::Text("%u", asByte);
+            ImGui::TableNextColumn();
+            ImGui::Text("%u", asHalf);
+            ImGui::TableNextColumn();
+            ImGui::Text("%u", asWord);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.3f", asFloat);
+        }
+        ImGui::EndTable();
+    }
+}
+
 void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
@@ -2556,7 +2693,7 @@ void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
         const float footerH = ImGui::GetFrameHeightWithSpacing() * 2.0f + style.ItemSpacing.y * 2.0f + 4.0f;
         ImGui::PushItemWidth(columnW * 0.5f);
         // L1 / R1 switch tabs.
-        constexpr int kSettingsTabs = 3;
+        constexpr int kSettingsTabs = 4;
         if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false))
             m_settingsTabRequest = (m_settingsTab + kSettingsTabs - 1) % kSettingsTabs;
         else if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false))
@@ -3066,6 +3203,14 @@ void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
                     if (ImGui::Button("Rescan"))
                         ps2MusicStationRescan();
                 }
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Achievements", nullptr, tabFlags(3)))
+            {
+                m_settingsTab = 3;
+                ImGui::BeginChild("achievements-scroll", ImVec2(0.0f, -footerH));
+                drawAchievementsTab(runtime);
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }

@@ -1,0 +1,299 @@
+# Grand Theft Auto: Vice City Stories - the port's own achievement set.
+#
+# Why this is ours and not RetroAchievements: docs/vcs-handoff.md, open work item
+# 16. RA excludes recompilations from standalone sets, so this is a local set in
+# *their* condition format, which keeps it portable if that rule ever changes.
+#
+# Nothing here is Rockstar's: the titles and descriptions are ours, the addresses
+# are facts about the game, and the file ships with the port.
+#
+# The shape follows the official trilogy sets - The Definitive Edition's, 29 to 35
+# achievements each - which is what makes a set feel like the game's own: broad
+# rather than deep, one to three per system, the whole of a collectible set in a
+# single achievement, the name a joke or a quote and the description the
+# instruction. The full survey and the reasoning are in the handoff notes.
+#
+# ---------------------------------------------------------------------------
+# Format
+#
+#   [set]            name = "..."   version = 1
+#   [achievement]    id, title, description, category, points, trigger
+#
+# `trigger` is a RetroAchievements condition string, evaluated by rcheevos against
+# the guest's memory once per game frame:
+#
+#   0xH1234        one byte at 0x1234          0x1234     16 bits
+#   0xX1234        32 bits                     0xW1234    24 bits
+#   0xf1234        a float                     0xM1234    bit 0 (..0xT = bit 7)
+#   ==  !=  <  <=  >  >=                       and, or, not
+#   0xH1234=5.10.  five hits of this condition (client-side counting)
+#
+# An achievement with no `trigger` is listed but never unlocks - that is how the
+# set keeps its shape while an address is still being hunted.
+#
+# ---------------------------------------------------------------------------
+# Authoring the addresses
+#
+# Every trigger below needs an address, and the addresses are found by playing:
+#
+#   1. F9 writes a RAM dump next to the port (ram_<frame>.bin, 32 MB).
+#   2. Do the thing the achievement is for, and take another dump.
+#   3. Diff the two and look for the counter that moved by the right amount.
+#   4. Confirm it live in Settings > Achievements > Address watcher: type the
+#      address in, do the thing again, watch the number.
+#
+# Prefer the game's own counters over rcheevos' hit counting: a counter survives
+# a reload and cannot be farmed by pausing, and "balloons burst = 99" is one read
+# rather than ninety-nine frames of bookkeeping. Use hit counting only for things
+# the game does not count itself.
+#
+# The story milestones are probably one progression counter rather than six flags
+# - if the game keeps "missions passed" as a number, the six conditions become
+# `>= n` on that one address. Worth checking first: it would be six conditions for
+# the price of one.
+
+[set]
+name = "Grand Theft Auto: Vice City Stories"
+version = 1
+
+# ---------------------------------------------------------------- story (6)
+# One per act, first and last mission of each chapter, the way the official sets
+# name theirs after the mission.
+
+[achievement]
+id = 1
+title = Soldier
+description = Complete "Soldier".
+category = Story
+points = 10
+# TODO: the mission-passed flag or counter
+
+[achievement]
+id = 2
+title = To Victor, the Spoils
+description = Complete "To Victor, the Spoils".
+category = Story
+points = 10
+
+[achievement]
+id = 3
+title = Jive Drive
+description = Complete "Jive Drive".
+category = Story
+points = 10
+
+[achievement]
+id = 4
+title = From Zero to Hero
+description = Complete "From Zero to Hero".
+category = Story
+points = 10
+
+[achievement]
+id = 5
+title = Brawn of the Dead
+description = Complete "Brawn of the Dead".
+category = Story
+points = 10
+
+[achievement]
+id = 6
+title = Last Stand
+description = Complete "Last Stand".
+category = Story
+points = 25
+
+# ------------------------------------------------- hidden mission challenges (4)
+# The four slots the official sets fill with a special way through one mission,
+# always hidden. Held back deliberately: they are chosen against the missions, and
+# the owner is playing the game through first. Add them here as ids 7-10 once the
+# missions are picked - the shape to copy is Vice City DE's "Iron-y": kill the
+# property developer with a Golf Club during "Four Iron".
+
+# ------------------------------------------------------------ side activities (10)
+
+[achievement]
+id = 11
+title = Vice Sights
+description = Complete all 5 levels of Vice Sights.
+category = Side
+points = 15
+
+[achievement]
+id = 12
+title = Beach Patrol
+description = Complete all 15 levels of Beach Patrol.
+category = Side
+points = 15
+
+[achievement]
+id = 13
+title = Air Rescue
+description = Complete all 15 levels of Air Rescue.
+category = Side
+points = 15
+
+[achievement]
+id = 14
+title = Fire Copter
+description = Complete all 15 levels of Fire Copter.
+category = Side
+points = 15
+
+[achievement]
+id = 15
+title = Playing Doctor
+description = Complete Paramedic level 15.
+category = Side
+points = 15
+
+[achievement]
+id = 16
+title = Splish Splash
+description = Complete Firefighter level 15.
+category = Side
+points = 15
+
+[achievement]
+id = 17
+title = Going Rogue
+description = Complete Vigilante level 15.
+category = Side
+points = 15
+
+[achievement]
+id = 18
+title = Where To?
+description = Complete 15 taxi fares.
+category = Side
+points = 15
+
+[achievement]
+id = 19
+title = Vice City Mogul
+description = Acquire all 30 Empire Building sites.
+category = Side
+points = 20
+
+[achievement]
+id = 20
+title = Full Artillery
+description = Complete all 5 rounds at the Shooting Range.
+category = Side
+points = 15
+
+# ------------------------------------------------------------ collectibles (3)
+
+[achievement]
+id = 21
+title = 99 Red Balloons
+description = Burst all 99 red balloons.
+category = Collect
+points = 20
+
+[achievement]
+id = 22
+title = Wheels Up
+description = Complete all 36 unique stunt jumps.
+category = Collect
+points = 20
+
+[achievement]
+id = 23
+title = Rampage
+description = Complete every rampage.
+category = Collect
+points = 20
+
+# ------------------------------------------------------- stat and rating (6)
+
+[achievement]
+id = 24
+title = Dirty Money
+description = Amass a fortune of $1,000,000.
+category = Stat
+points = 15
+
+[achievement]
+id = 25
+title = Take the Cannoli
+description = Reach the top criminal rating.
+category = Stat
+points = 20
+
+[achievement]
+id = 26
+title = Catch Me if You Can
+description = Achieve a six-star wanted level.
+category = Stat
+points = 10
+
+[achievement]
+id = 27
+title = Reputation
+description = Reach maximum empire reputation.
+category = Stat
+points = 15
+
+[achievement]
+id = 28
+title = Street Sweeper
+description = Waste 100 gang members.
+category = Stat
+points = 15
+
+[achievement]
+id = 29
+title = Bull in a China Shop
+description = Cause $1,000,000 in property damage.
+category = Stat
+points = 15
+
+# ----------------------------------------------------------------- quirky (4)
+
+[achievement]
+id = 30
+title = Born in the 80s
+description = Listen to every radio station at least once.
+category = Quirky
+points = 10
+
+[achievement]
+id = 31
+title = One is Better Than Two
+description = Perform a 30 second wheelie.
+category = Quirky
+points = 10
+
+[achievement]
+id = 32
+title = Fore!
+description = Finish a round of Golf.
+category = Quirky
+points = 10
+
+[achievement]
+id = 33
+title = Crash!
+description = Complete Crash!.
+category = Quirky
+points = 10
+
+# -------------------------------------------------------------- capstones (2)
+
+[achievement]
+id = 34
+title = Is That All You've Got?
+description = Achieve 100% completion.
+category = Capstone
+points = 25
+
+[achievement]
+id = 35
+title = King of Vice City
+description = Unlock every achievement.
+category = Capstone
+points = 25
+# A capstone over the other 34: the condition is the other thirty-four, which
+# rcheevos cannot express against memory. It is granted by the port instead - see
+# the note in the handoff - so it carries no trigger here.

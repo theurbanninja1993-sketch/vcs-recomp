@@ -23,7 +23,7 @@ copy of the disc.
 
 In game
 -------
-F2                settings (display, controls, mods, music)
+F2                settings (display, controls, mods, music, achievements)
 F11               the settings, opened at launch
 Select + Start    the same settings, from a controller
 Esc               the game's own pause menu
@@ -40,6 +40,7 @@ game/                  the disc's files (SLUS_215.90 and the rest)
 prompts/               button-prompt glyph packs
 music/                 tracks for the extra radio station
 mods/                  texture packs and .pnach cheats
+achievements.toml      the port\'s own achievement set
 config/                created on the first run - see "Portable mode"
 portable.txt           marks this folder as portable
 run.sh / play.cmd      launcher
@@ -54,8 +55,19 @@ config/ in this folder instead of your home directory:
     config/prompts_rt/         button-prompt art generated at runtime
     config/gamecontrollerdb.txt  extra controller mappings, if you add any
     config/padlog.txt          controller diagnostics, only with PS2X_PAD_DEBUG=1
+      config/achievements.unlocked  which achievements you have earned
+      config/achievements.state     the evaluator\'s own progress (hit counts)
 
 Delete config/ to start over with defaults.
+
+Achievements
+------------
+F2 -> Achievements lists the port's own set: 35 of them, following the shape of
+the official trilogy's - story milestones, side jobs, collectibles, stat tiers,
+the odd silly one, and 100% completion. They are evaluated locally against the
+game's own memory. Nothing about them goes online and no account is involved:
+the set is a file beside this one, and what you have earned is a file in config/.
+The same tab has an address watcher, which is the tool used to author them.
 
 Performance
 -----------

@@ -397,6 +397,60 @@ function(ps2x_stage_ffmpeg_runtime_dlls target_name)
     )
 endfunction()
 
+# ---------------------------------------------------------------- achievements
+# A local achievement set, evaluated against the guest's own memory. rcheevos is
+# the evaluator and only its runtime half is wanted - the api and client halves
+# are for talking to RetroAchievements, which a set that lives beside the port
+# does not do. See docs/vcs-handoff.md, open work item 16, for why it is local.
+option(PS2X_ACHIEVEMENTS "Evaluate a local achievement set" ON)
+
+if(PS2X_ACHIEVEMENTS)
+    include(FetchContent)
+
+    set(PS2X_RCHEEVOS_REV "dfdc64ea035c34aa168cf13bbda72b71ca4eba1e" CACHE STRING
+        "rcheevos revision the achievement engine is built from")
+    FetchContent_Declare(
+        rcheevos
+        GIT_REPOSITORY https://github.com/RetroAchievements/rcheevos.git
+        GIT_TAG ${PS2X_RCHEEVOS_REV}
+    )
+    FetchContent_GetProperties(rcheevos)
+    if(NOT rcheevos_POPULATED)
+        FetchContent_Populate(rcheevos)
+    endif()
+
+    set(PS2X_RCHEEVOS_SOURCE_DIR "${rcheevos_SOURCE_DIR}")
+
+    # The runtime half, plus the helpers it needs: the same sources the library's
+    # own Makefile.common lists as RC_RUNTIME_OBJS and RC_UTIL_OBJS.
+    add_library(ps2x_rcheevos STATIC
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_alloc.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_condition.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_condset.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_consoleinfo.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_format.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_lboard.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_memref.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_operand.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_richpresence.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_runtime.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_runtime_progress.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_trigger.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_typed_value.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime/rc_value.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/util/md5.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/util/rc_compat.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/util/rc_util.c"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/util/rc_version.c"
+    )
+    target_include_directories(ps2x_rcheevos PUBLIC "${PS2X_RCHEEVOS_SOURCE_DIR}/include")
+    target_include_directories(ps2x_rcheevos PRIVATE
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/runtime"
+        "${PS2X_RCHEEVOS_SOURCE_DIR}/src/util"
+    )
+    set_target_properties(ps2x_rcheevos PROPERTIES C_STANDARD 99)
+endif()
+
 add_library(ps2_runtime STATIC
     src/lib/ps2_platform.cpp
     src/lib/ps2_music_station.cpp
@@ -430,6 +484,7 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/vu/ps2_vu1_programs.cpp
     src/lib/games_database.cpp
+    src/lib/ps2_achievements.cpp
 )
 
 # Host-CPU code generation for the runtime/IOP libraries (VU1 interpreter, GS
@@ -635,6 +690,10 @@ endif()
 target_include_directories(ps2_runtime PRIVATE "${xxhash_SOURCE_DIR}")
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(PS2X_ACHIEVEMENTS)
+    target_link_libraries(ps2_runtime PUBLIC ps2x_rcheevos)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_ACHIEVEMENTS=1)
+endif()
 # GPU GS renderer: GL 4.5+ via EGL surfaceless (tools) or a GLX context sharing
 # the host window's (the game, so the composed display texture can be drawn
 # directly) on Linux / a hidden window's WGL context on Windows.

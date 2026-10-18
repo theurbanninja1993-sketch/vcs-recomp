@@ -80,6 +80,15 @@ copy_assets() {
     local dest="$1" src="$2"
     # -L: follow symlinks. The build tree may hold mods as links to a folder
     # elsewhere, and a stick (exFAT, NTFS) cannot store a symlink at all.
+    # The achievement set, read from beside the runner. It is the game's own
+    # content, like the prompt art: no game code and nothing of Rockstar's.
+    if [ -e "$GAME/achievements.toml" ]; then
+        cp "$GAME/achievements.toml" "$dest/achievements.toml"
+    elif [ -e "$GAME/games" ]; then
+        set_file=$(find "$GAME/games" -maxdepth 2 -name achievements.toml | head -1)
+        [ -n "$set_file" ] && cp "$set_file" "$dest/achievements.toml"
+    fi
+
     for item in prompts music mods custom_logo.png vu1_programs.so vu1_programs.dll; do
         [ -e "$src/$item" ] && cp -rL "$src/$item" "$dest/" || true
     done
