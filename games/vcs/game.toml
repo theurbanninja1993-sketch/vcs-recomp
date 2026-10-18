@@ -18,7 +18,13 @@ function_map = "config/vcs_clean.csv"
 override = "GTA Vice City Stories (SLUS_215.90)"
 
 [vu1]
-# Automated PS2X_VU1_LEARN passes after the first build (intro + fast-boot script).
+# Automated PS2X_VU1_LEARN / PS2X_VU0_CAPTURE passes after the first build: the
+# fast-boot script, the opening cutscene, then taking Sgt. Martinez's bike and
+# riding it. Every VU program the run reaches is compiled; ones it never reaches
+# stay interpreted (~10x slower), so the route matters. The intro alone (3200
+# frames) found 15 programs and no VU0 ones, and that build ran the opening
+# cutscene ~25% late with the audio desynced; this route finds 22 (8 of them
+# VU0). Longer play sessions have shown 30.
 learn_passes = 2
-learn_pad_script = "1000:cross:10;1200:cross:10;1400:cross:10;1600:cross:10;1800:cross:10;2000:cross:10;2200:cross:10"
-learn_frames = 3200
+learn_pad_script = "1000:cross:10;1200:cross:10;1400:cross:10;1600:cross:10;1800:cross:10;2000:cross:10;2200:cross:10;2700:triangle:20;3000:sup:60;3100:cross:2500;3300:sleft:40;3600:sright:60;4000:sleft:80;4500:sright:40;5000:sleft:60;5600:sright:80;6200:sleft:40"
+learn_frames = 7000

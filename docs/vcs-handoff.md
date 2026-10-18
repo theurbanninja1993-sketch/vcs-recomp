@@ -4,6 +4,36 @@ State as of 2026-10-17 (`vcs-bringup` is `9b42cc6`; the `release` branch players
 from is `f4a8c39` = `stories-v0.1.1`, and the launcher is its own repo at `8211126`).
 Read this before changing anything. A reviewer will check work against it.
 
+## Read first: the compiled VU program set (2026-10-17, Claude)
+
+**Slowdown since 10-16 found and fixed in the dev build.** The owner saw dips to
+~20 fps, including the cutscenes, with the cutscene audio drifting. The cause is
+the set of compiled VU programs, not textures, scale, draw distance or prompts:
+an A/B of each of those changed nothing.
+- `build` and `build-win` were configured with
+  `PS2X_VU1_PROGRAMS=/tmp/opencode/workspace/build/vu1`, which holds **15
+  programs**: the pipeline's intro-only learn, with no VU0 programs at all. The
+  full set from the three gameplay captures plus the VU0 capture is **30**
+  (`vcs-vu1`). Everything missing ran interpreted: VU1 worker 72-88% (was 14-21%
+  in the 10-14 build), VU0 ~2 s per 10 s on the game thread, and the opening
+  cutscene 155-181/600 VBlanks late with 60-76k audio underruns.
+- **Fix:** regenerated all 30 with today's `vu1_recomp` (replay: mismatches=0 on
+  all four captures, 4.7-6.3 us per VU1 call). Installed into `vcs-vu1` (old set
+  kept in `scratch/vcs-vu1.backup-20261017`). `build` is reconfigured to it.
+  Same test after: cutscene 0-1/600 late, no underruns, VU1 worker 12-20%. The
+  owner reports a locked 60.
+- **`build-win` still points at the 15-program `/tmp` set**: reconfigure it with
+  `-DPS2X_VU1_PROGRAMS=<root>/vcs-vu1` before the next Windows build. This is
+  likely part of the Windows 20-30 fps. `/tmp` is tmpfs, so that set also
+  vanishes on reboot.
+- **Player builds (`build.sh`):** the learn run now records VU0 programs too
+  (`PS2X_VU0_CAPTURE`), and `games/vcs/game.toml` rides Sgt. Martinez's bike after
+  the intro (7000 frames). Measured with this route: 22 programs (8 VU0) instead
+  of 15. That is still short of 30, because a scripted route cannot reach
+  everything. Next step: keep learning during normal play (record uncompiled
+  programs into the config dir) plus a launcher "optimize" action that compiles
+  them and relinks.
+
 ## If you are reviewing this
 
 Three things are waiting for a second pair of eyes, and they are the three worth

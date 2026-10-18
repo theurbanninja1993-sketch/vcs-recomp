@@ -400,17 +400,24 @@ if [ "$FROM" -le 5 ] && [ "$TO" -ge 5 ]; then
         uncompiled=""
         [ "$pass" -eq 1 ] && uncompiled="PS2X_VU1_NO_COMPILED=1"   # pass 1 must start from nothing
         if [ "$DRY_RUN" -eq 0 ]; then
+            # VU0 programs are recorded too (PS2X_VU0_CAPTURE): without them every
+            # VU0 call is interpreted on the game thread. Pass 1 runs everything
+            # interpreted, so it is slow - hence the long timeout.
             ( cd "$learn" && env $uncompiled PS2X_HIDDEN_WINDOW=1 PS2X_NO_LAUNCH_MENU=1 \
-                  PS2X_VU1_LEARN="$learn" PS2X_PAD_SCRIPT="$vu1_learn_pad_script" \
+                  PS2X_VU1_LEARN="$learn" PS2X_VU0_CAPTURE="$learn/vu0_learn_pass$pass.bin" \
+                  PS2X_PAD_SCRIPT="$vu1_learn_pad_script" \
                   ${vu1_learn_frames:+PS2X_EXIT_AFTER_FRAME="$vu1_learn_frames"} \
-                  timeout 400 "$runner" "$disc_dir/$game_boot_file" >"$learn/pass$pass.log" 2>&1 ) || \
+                  timeout 900 "$runner" "$disc_dir/$game_boot_file" >"$learn/pass$pass.log" 2>&1 ) || \
                 note "pass $pass ended early (fine if it recorded something)"
             note "  $(find "$learn" -name 'vu1_learn_*.bin' | wc -l) capture(s) total"
             rm -rf "$vu1_dir"; mkdir -p "$vu1_dir"
             # vu1_recomp takes an OUTPUT DIRECTORY - the usage comment in its
             # source says <out.cpp> and is stale - and writes vu1p_<key>.cpp per
             # program plus the registry vu1_programs.cpp.
-            "$vu1_recomp" "$vu1_dir" "$learn"/vu1_learn_*.bin || die "vu1_recomp failed"
+            # Every recording so far (a later pass only adds what is still
+            # missing); empty files are passes that found nothing new.
+            mapfile -t recordings < <(find "$learn" -name 'vu[01]_learn_*.bin' -size +0 | sort)
+            "$vu1_recomp" "$vu1_dir" "${recordings[@]}" || die "vu1_recomp failed"
             [ -f "$vu1_dir/vu1_programs.cpp" ] || die "vu1_recomp wrote no registry"
             note "  $(ls "$vu1_dir"/vu1p_*.cpp 2>/dev/null | wc -l) program file(s)"
             # Re-configure as well as build: the CMake only adds the VU1 sources
