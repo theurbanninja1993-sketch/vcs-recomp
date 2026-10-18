@@ -1,8 +1,58 @@
 # GTA Vice City Stories (SLUS_215.90) recomp: handoff notes
 
 State as of 2026-10-18 (`vcs-bringup` is the tip the `release` branch players build
-from was cut at, tagged `stories-v0.1.3`; the launcher is its own repo at `d964ca8` =
-`v0.1.2`). Read this before changing anything. A reviewer will check work against it.
+from was cut at, tagged `stories-v0.1.6`; the launcher is its own repo at `d462890` =
+`v0.1.10`). Read this before changing anything. A reviewer will check work against it.
+
+## 2026-10-18 late (Claude): the launcher updates itself, and two fetch bugs
+
+Owner: *"updating brings us to the release page which is an okay way to do it I
+guess. is it possible to make it actually fetch the new version and install the
+files to the folder where the launcher exe is?"* - it is, and it does. Launcher
+`v0.1.10` (`d462890`), released for Linux and Windows in both archive formats.
+
+**The shape of it.** A running program cannot replace its own files: on Windows
+they are locked, and on either platform the code that would run afterwards is not
+the code being replaced. So the work is split. The launcher downloads the release
+asset for its platform into the system temp folder and unpacks it there (PowerShell
+`Expand-Archive` on Windows, `tar` elsewhere - the zip exists so that the Windows
+path needs nothing installed, which the `rm` bug below is the argument for). The
+archive's single top folder is flattened, the player's own `launcher.ini` is copied
+over the one that ships, and the staged executable has to actually be there. Only
+then is a script written and handed the swap, and only then does the launcher exit:
+the script waits for the process to end, renames the old executable to
+`ps2x_launcher.old`, overlays the staged files, removes the staging folder and the
+download, starts the launcher again and deletes itself. A failure at any point
+leaves the install untouched and falls back to the release page.
+
+**Two real bugs, both mine, both found by testing this:**
+
+1. **`rm` in the Windows fetch chain.** *"'rm' is not recognized as an internal or
+   external command"* was the whole of a failed fetch - and the fetch log added in
+   `v0.1.9` is what said so, which is the point of it. `rm -f` had been left in the
+   chain by the relative-path rewrite. Deleting a file is now a platform command
+   like the others (`del /q` / `rm -f`).
+2. **The fetch changed into a folder before creating it.** On a *first* fetch the
+   port's parent folder does not exist, and a `cd` into a folder that is not there
+   carries on regardless - so every relative name after it pointed elsewhere: the
+   download landed beside the port instead of in it, and the unpack then failed on
+   the folder it had just been told to create. The parent is now created before the
+   shell moves into it. The owner's install already had `port/` from its git-clone
+   days, which is why his failure was the `rm` and not this.
+
+Verified here end to end on Linux, against a real install with a marker in
+`launcher.ini`, a picture in `art/`, music in `music/` and an image in `discs/`:
+the executable was replaced, the marker and every player file survived, the release
+files arrived, `ps2x_launcher.old` was kept, and the staging folder, the download
+and the script were all gone afterwards. A fetch into a folder that did not exist
+was verified too. `--self-update <version>` is the same update without the window -
+it is how this was tested, and it is how a stuck player can be walked through it.
+The button and the flag build their command from one function so they cannot drift
+apart.
+
+**Note for the owner:** the version he has cannot update itself - the button that
+does the work is in `v0.1.10` - so this one is a manual download. Every one after
+it is a click.
 
 ## 2026-10-18 (Claude): the local achievement set is built
 
