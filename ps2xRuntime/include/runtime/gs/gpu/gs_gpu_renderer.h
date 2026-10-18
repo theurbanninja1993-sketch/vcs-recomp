@@ -456,9 +456,15 @@ namespace gsgpu
             GLsync fence = nullptr;
             uint32_t width = 0, height = 0;
             uint32_t displayFbp = 0;
+            const uint8_t *mapped = nullptr; // persistent client-side mapping, when available
+            uint64_t serial = 0;             // issue order, to find the newest finished copy
         };
-        ReadbackSlot m_readbackRing[3];
+        ReadbackSlot m_readbackRing[4];
         uint32_t m_readbackNext = 0;
+        uint64_t m_readbackSerial = 0;
+        // The newest copy the GPU has finished, without waiting; older pending
+        // ones are dropped. nullptr: none is ready yet.
+        ReadbackSlot *newestFinishedReadback();
         void destroyReadbackRing();
         // PS2X_GS_GPU_TIMERS=1: where the GPU's time goes. Each draw / dispatch /
         // copy is bracketed by a GL_TIME_ELAPSED query (gpuMark ... gpuEnd), and

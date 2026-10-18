@@ -3565,7 +3565,7 @@ void main()
             upscalePresentation(request, frame);
             gpuEnd();
         }
-        if (!frame)
+        if (!frame && !frame.unchanged)
         {
             readbackVram();
             m_cpu->Sync(GSSyncReason::Presentation);
@@ -4837,9 +4837,21 @@ void main()
             if (slot.buffer == 0 || slot.capacity < bytes)
             {
                 if (slot.buffer != 0)
+                {
+                    if (slot.mapped != nullptr)
+                        gl.glUnmapNamedBuffer(slot.buffer);
                     gl.glDeleteBuffers(1, &slot.buffer);
+                }
+                slot.mapped = nullptr;
+                // In client memory and mapped once: reading a finished copy is
+                // then a plain memcpy, where mapping a device buffer per frame
+                // could make the driver copy it down there and then.
                 gl.glCreateBuffers(1, &slot.buffer);
-                gl.glNamedBufferStorage(slot.buffer, static_cast<GLsizeiptr>(bytes), nullptr, GL_MAP_READ_BIT);
+                const GLbitfield persistent = GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+                gl.glNamedBufferStorage(slot.buffer, static_cast<GLsizeiptr>(bytes), nullptr,
+                                        persistent | GL_CLIENT_STORAGE_BIT);
+                slot.mapped = static_cast<const uint8_t *>(
+                    gl.glMapNamedBufferRange(slot.buffer, 0, static_cast<GLsizeiptr>(bytes), persistent));
                 slot.capacity = bytes;
             }
             gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, slot.buffer);
@@ -4851,17 +4863,26 @@ void main()
             slot.width = readWidth;
             slot.height = readHeight;
             slot.displayFbp = displayFbp;
+            slot.serial = ++m_readbackSerial;
             // Start the GPU on it now rather than at the next flush point.
             gl.glFlush();
-
-            // Hand over the copy from the previous present. The first present
-            // has none yet, so it waits for its own (once).
-            const uint32_t prevIndex = (m_readbackNext + kRing - 1u) % kRing;
-            ReadbackSlot &ready = m_readbackRing[prevIndex].fence != nullptr ? m_readbackRing[prevIndex] : slot;
             m_readbackNext = (m_readbackNext + 1u) % kRing;
-            takeReadback(ready, frame);
-            readWidth = ready.width;
-            readHeight = ready.height;
+
+            // Hand over the newest copy the GPU has finished - never wait for
+            // one. On a busy driver (an NVIDIA laptop in a dense cutscene) the
+            // frame copied a present ago is often not done yet, and waiting for
+            // it here held this thread, which backed up the GS frontend, the
+            // VU1 worker and the game thread behind it. Nothing finished yet:
+            // the host keeps the frame it has, and a later VBlank collects this
+            // one (PollPresentation).
+            if (ReadbackSlot *ready = newestFinishedReadback())
+            {
+                takeReadback(*ready, frame);
+                readWidth = ready->width;
+                readHeight = ready->height;
+            }
+            else
+                frame.unchanged = true;
         }
         // PS2X_GS_PRESENT_DUMP=<prefix>: write presented frames 20..80 as binary
         // PPMs <prefix>_NNN.ppm, for A/B checks. Every present, so consecutive
@@ -4888,14 +4909,42 @@ void main()
         }
     }
 
+    Renderer::ReadbackSlot *Renderer::newestFinishedReadback()
+    {
+        GL &gl = m_context.gl;
+        ReadbackSlot *newest = nullptr;
+        for (ReadbackSlot &slot : m_readbackRing)
+        {
+            if (slot.fence == nullptr || (newest != nullptr && slot.serial < newest->serial))
+                continue;
+            const GLenum state = gl.glClientWaitSync(slot.fence, 0, 0);
+            if (state == GL_ALREADY_SIGNALED || state == GL_CONDITION_SATISFIED)
+                newest = &slot;
+        }
+        if (newest != nullptr)
+            for (ReadbackSlot &slot : m_readbackRing)
+                if (slot.fence != nullptr && slot.serial < newest->serial)
+                {
+                    // Superseded by a newer finished copy.
+                    gl.glDeleteSync(slot.fence);
+                    slot.fence = nullptr;
+                }
+        return newest;
+    }
+
     void Renderer::takeReadback(ReadbackSlot &slot, PresentationFrame &frame)
     {
         GL &gl = m_context.gl;
-        gl.glClientWaitSync(slot.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+        gl.glClientWaitSync(slot.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull); // finished already, normally
         gl.glDeleteSync(slot.fence);
         slot.fence = nullptr;
         const size_t bytes = static_cast<size_t>(slot.width) * slot.height * 4u;
-        if (const void *mapped = gl.glMapNamedBufferRange(slot.buffer, 0, static_cast<GLsizeiptr>(bytes), GL_MAP_READ_BIT))
+        if (slot.mapped != nullptr)
+        {
+            frame.pixels = gsTakeFrameBuffer(); // reuses its capacity
+            frame.pixels.assign(slot.mapped, slot.mapped + bytes);
+        }
+        else if (const void *mapped = gl.glMapNamedBufferRange(slot.buffer, 0, static_cast<GLsizeiptr>(bytes), GL_MAP_READ_BIT))
         {
             // One pass (resize would zero the buffer first).
             const uint8_t *src = static_cast<const uint8_t *>(mapped);
@@ -4915,13 +4964,10 @@ void main()
     {
         if (!m_gpu)
             return false;
-        // At most one is pending after a present (the older ones were taken),
-        // and it is the one written last.
-        constexpr uint32_t kRing = sizeof(m_readbackRing) / sizeof(m_readbackRing[0]);
-        ReadbackSlot &newest = m_readbackRing[(m_readbackNext + kRing - 1u) % kRing];
-        if (newest.fence == nullptr)
+        ReadbackSlot *ready = newestFinishedReadback();
+        if (ready == nullptr)
             return false;
-        takeReadback(newest, frame);
+        takeReadback(*ready, frame);
         return true;
     }
 
@@ -5067,7 +5113,11 @@ void main()
             if (slot.fence != nullptr)
                 gl.glDeleteSync(slot.fence);
             if (slot.buffer != 0)
+            {
+                if (slot.mapped != nullptr)
+                    gl.glUnmapNamedBuffer(slot.buffer);
                 gl.glDeleteBuffers(1, &slot.buffer);
+            }
             slot = ReadbackSlot{};
         }
     }

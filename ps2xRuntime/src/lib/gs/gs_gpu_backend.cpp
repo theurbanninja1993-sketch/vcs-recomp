@@ -329,6 +329,8 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
         command.payload->call = [this, request]()
         {
             PresentationFrame frame = m_renderer->present(request);
+            if (frame.unchanged)
+                return; // nothing finished yet: a later poll collects it
             std::lock_guard<std::mutex> lock(m_frameMutex);
             m_lastFrame = std::move(frame);
             ++m_lastFrameSeq;
