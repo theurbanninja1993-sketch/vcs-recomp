@@ -105,6 +105,11 @@ namespace gsgpu
     X(PFNGLDELETESYNCPROC, glDeleteSync)                                   \
     X(PFNGLGENQUERIESPROC, glGenQueries)                                   \
     X(PFNGLBEGINQUERYPROC, glBeginQuery)                                   \
+    X(PFNGLBINDBUFFERRANGEPROC, glBindBufferRange)                         \
+    X(PFNGLCREATESAMPLERSPROC, glCreateSamplers)                           \
+    X(PFNGLDELETESAMPLERSPROC, glDeleteSamplers)                           \
+    X(PFNGLSAMPLERPARAMETERIPROC, glSamplerParameteri)                     \
+    X(PFNGLBINDSAMPLERPROC, glBindSampler)                                 \
     X(PFNGLENDQUERYPROC, glEndQuery)                                       \
     X(PFNGLGETQUERYOBJECTIVPROC, glGetQueryObjectiv)                       \
     X(PFNGLGETQUERYOBJECTUI64VPROC, glGetQueryObjectui64v)                 \

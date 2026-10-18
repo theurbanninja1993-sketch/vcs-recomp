@@ -1192,7 +1192,11 @@ void main()
             readbackVram(); // leave local memory complete for the owner
         }
         if (m_gpu)
+        {
             destroyReadbackRing();
+            destroyStreamRing(m_vertexRing);
+            destroyStreamRing(m_stagingRing);
+        }
         if (std::getenv("PS2X_TEXREPL_STATS") && replacementsActive())
             emitTexreplStats();
         if (std::getenv("PS2X_GS_GPU_STATS"))
@@ -1335,6 +1339,22 @@ void main()
         gl.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, m_clutBuffer);
 
         gl.glCreateVertexArrays(1, &m_emptyVao);
+        {
+            const char *env = std::getenv("PS2X_GS_STREAM_RING");
+            m_streamRing = env == nullptr || std::atoi(env) != 0;
+            gl.glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &m_ssboAlign);
+            m_ssboAlign = std::max<GLint>(m_ssboAlign, 4);
+            for (int i = 0; i < 8; ++i)
+            {
+                const bool linear = (i & 4) != 0, clampS = (i & 2) != 0, clampT = (i & 1) != 0;
+                gl.glCreateSamplers(1, &m_replSamplers[i]);
+                gl.glSamplerParameteri(m_replSamplers[i], GL_TEXTURE_MIN_FILTER,
+                                       linear ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST);
+                gl.glSamplerParameteri(m_replSamplers[i], GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+                gl.glSamplerParameteri(m_replSamplers[i], GL_TEXTURE_WRAP_S, clampS ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                gl.glSamplerParameteri(m_replSamplers[i], GL_TEXTURE_WRAP_T, clampT ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+            }
+        }
         gl.glCreateVertexArrays(1, &m_vao);
         gl.glEnableVertexArrayAttrib(m_vao, 0);
         gl.glVertexArrayAttribFormat(m_vao, 0, 2, GL_FLOAT, GL_FALSE, offsetof(Vertex, x));
@@ -2047,11 +2067,11 @@ void main()
         if (replacement != 0)
         {
             // The game's filter and wrap modes (region modes never get here).
+            // As a sampler object: changing the texture's own parameters on
+            // every draw costs the driver a revalidation each time.
             const bool linear = state.linearFilter;
-            gl.glTextureParameteri(replacement, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST);
-            gl.glTextureParameteri(replacement, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-            gl.glTextureParameteri(replacement, GL_TEXTURE_WRAP_S, (ctx.clamp & 3u) == 1u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-            gl.glTextureParameteri(replacement, GL_TEXTURE_WRAP_T, ((ctx.clamp >> 2) & 3u) == 1u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+            const int sampler = (linear ? 4 : 0) | ((ctx.clamp & 3u) == 1u ? 2 : 0) | (((ctx.clamp >> 2) & 3u) == 1u ? 1 : 0);
+            gl.glBindSampler(4, m_replSamplers[sampler]);
             gl.glBindTextureUnit(4, replacement);
         }
         bindVao(m_vao);
@@ -2111,8 +2131,10 @@ void main()
         setColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         // Viewport, scissor and VAO are the ones applyDrawState just set for this
         // same target, and the next draw re-applies all of it.
-        gl.glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_vertices.size()));
-        gl.glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+        // No barrier after: the mask is only ever sampled by later draws, which
+        // GL orders after this render without one. (It used to issue
+        // glMemoryBarrier here for every overlay draw.)
+        gl.glDrawArrays(GL_TRIANGLES, m_firstVertex, static_cast<GLsizei>(m_vertices.size()));
     }
 
     // A screen-space pass that reads one target and writes another is a copy of
@@ -2137,8 +2159,7 @@ void main()
         setBlend(false);
         setDepthTest(false);
         setColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        gl.glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_vertices.size()));
-        gl.glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+        gl.glDrawArrays(GL_TRIANGLES, m_firstVertex, static_cast<GLsizei>(m_vertices.size()));
     }
 
     void Renderer::flushBatch()
@@ -2342,18 +2363,37 @@ void main()
 
         ScopeTimer timer{m_timeDraw};
         const size_t bytes = m_vertices.size() * sizeof(Vertex);
-        if (bytes > m_vboCapacity)
+        size_t ringOffset = SIZE_MAX;
+        if (m_streamRing)
         {
-            if (m_vbo)
-                gl.glDeleteBuffers(1, &m_vbo);
-            m_vboCapacity = std::max<size_t>(bytes * 2u, 1u << 20);
-            gl.glCreateBuffers(1, &m_vbo);
-            gl.glNamedBufferStorage(m_vbo, static_cast<GLsizeiptr>(m_vboCapacity), nullptr, GL_DYNAMIC_STORAGE_BIT);
+            bool recreated = false;
+            ringOffset = ringAlloc(m_vertexRing, bytes, sizeof(Vertex), 8u << 20, recreated);
+            if (ringOffset != SIZE_MAX)
+            {
+                if (recreated)
+                    gl.glVertexArrayVertexBuffer(m_vao, 0, m_vertexRing.buffer, 0, sizeof(Vertex));
+                std::memcpy(m_vertexRing.base + ringOffset, m_vertices.data(), bytes);
+                m_firstVertex = static_cast<GLint>(ringOffset / sizeof(Vertex));
+            }
+            else
+                m_streamRing = false; // could not map: the old path from here on
         }
-        gl.glNamedBufferSubData(m_vbo, 0, static_cast<GLsizeiptr>(bytes), m_vertices.data());
-        gl.glVertexArrayVertexBuffer(m_vao, 0, m_vbo, 0, sizeof(Vertex));
+        if (ringOffset == SIZE_MAX)
+        {
+            if (bytes > m_vboCapacity)
+            {
+                if (m_vbo)
+                    gl.glDeleteBuffers(1, &m_vbo);
+                m_vboCapacity = std::max<size_t>(bytes * 2u, 1u << 20);
+                gl.glCreateBuffers(1, &m_vbo);
+                gl.glNamedBufferStorage(m_vbo, static_cast<GLsizeiptr>(m_vboCapacity), nullptr, GL_DYNAMIC_STORAGE_BIT);
+            }
+            gl.glNamedBufferSubData(m_vbo, 0, static_cast<GLsizeiptr>(bytes), m_vertices.data());
+            gl.glVertexArrayVertexBuffer(m_vao, 0, m_vbo, 0, sizeof(Vertex));
+            m_firstVertex = 0;
+        }
         gpuMark(GpuWork::Draw);
-        gl.glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_vertices.size()));
+        gl.glDrawArrays(GL_TRIANGLES, m_firstVertex, static_cast<GLsizei>(m_vertices.size()));
         gpuEnd();
         if (m_maskEnabled && m_drawColor != nullptr)
         {
@@ -2669,25 +2709,42 @@ void main()
     {
         GL &gl = m_context.gl;
         const size_t bytes = (streamBytes + 3u) & ~3u;
-        if (bytes > m_stagingCapacity)
+        size_t ringOffset = SIZE_MAX;
+        if (m_streamRing)
         {
-            if (m_stagingBuffer)
-                gl.glDeleteBuffers(1, &m_stagingBuffer);
-            m_stagingCapacity = std::max<size_t>(bytes, 1u << 20);
-            gl.glCreateBuffers(1, &m_stagingBuffer);
-            gl.glNamedBufferStorage(m_stagingBuffer, static_cast<GLsizeiptr>(m_stagingCapacity), nullptr,
-                                    GL_DYNAMIC_STORAGE_BIT);
+            bool recreated = false;
+            ringOffset = ringAlloc(m_stagingRing, bytes, static_cast<size_t>(m_ssboAlign), 16u << 20, recreated);
+            if (ringOffset != SIZE_MAX)
+            {
+                std::memcpy(m_stagingRing.base + ringOffset, data, streamBytes);
+                if (bytes != streamBytes)
+                    std::memset(m_stagingRing.base + ringOffset + streamBytes, 0, bytes - streamBytes);
+                gl.glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 3, m_stagingRing.buffer, static_cast<GLintptr>(ringOffset),
+                                     static_cast<GLsizeiptr>(bytes));
+            }
+        }
+        if (ringOffset == SIZE_MAX)
+        {
+            if (bytes > m_stagingCapacity)
+            {
+                if (m_stagingBuffer)
+                    gl.glDeleteBuffers(1, &m_stagingBuffer);
+                m_stagingCapacity = std::max<size_t>(bytes, 1u << 20);
+                gl.glCreateBuffers(1, &m_stagingBuffer);
+                gl.glNamedBufferStorage(m_stagingBuffer, static_cast<GLsizeiptr>(m_stagingCapacity), nullptr,
+                                        GL_DYNAMIC_STORAGE_BIT);
+            }
             gl.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, m_stagingBuffer);
-        }
-        if (streamBytes & 3u)
-        {
-            std::vector<uint8_t> padded(bytes, 0u);
-            std::memcpy(padded.data(), data, streamBytes);
-            gl.glNamedBufferSubData(m_stagingBuffer, 0, static_cast<GLsizeiptr>(bytes), padded.data());
-        }
-        else
-        {
-            gl.glNamedBufferSubData(m_stagingBuffer, 0, static_cast<GLsizeiptr>(bytes), data);
+            if (streamBytes & 3u)
+            {
+                std::vector<uint8_t> padded(bytes, 0u);
+                std::memcpy(padded.data(), data, streamBytes);
+                gl.glNamedBufferSubData(m_stagingBuffer, 0, static_cast<GLsizeiptr>(bytes), padded.data());
+            }
+            else
+            {
+                gl.glNamedBufferSubData(m_stagingBuffer, 0, static_cast<GLsizeiptr>(bytes), data);
+            }
         }
         const auto &buf = m_transfer.bitbltbuf;
         gl.glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT); // earlier draws finish reading VRAM first
@@ -4922,8 +4979,80 @@ void main()
             total += m_gpuWorkNs[i];
             m_gpuWorkNs[i] = 0.0;
         }
-        std::fprintf(stderr, " busy=%.2f\n", total / 1e6 / m_gpuTimerFrames);
+        std::fprintf(stderr, " busy=%.2f ringStalls=%u\n", total / 1e6 / m_gpuTimerFrames, m_ringStalls);
+        m_ringStalls = 0;
         m_gpuTimerFrames = 0;
+    }
+
+    size_t Renderer::ringAlloc(StreamRing &ring, size_t bytes, size_t align, size_t initialSize, bool &recreated)
+    {
+        constexpr int kSegments = 4;
+        GL &gl = m_context.gl;
+        recreated = false;
+        if (ring.buffer == 0 || bytes > ring.size / kSegments)
+        {
+            destroyStreamRing(ring);
+            size_t size = initialSize;
+            while (bytes > size / kSegments)
+                size *= 2u;
+            const GLbitfield flags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+            gl.glCreateBuffers(1, &ring.buffer);
+            gl.glNamedBufferStorage(ring.buffer, static_cast<GLsizeiptr>(size), nullptr, flags);
+            ring.base = static_cast<uint8_t *>(gl.glMapNamedBufferRange(ring.buffer, 0, static_cast<GLsizeiptr>(size), flags));
+            if (ring.base == nullptr)
+            {
+                std::cerr << "[gs:gpu] persistent buffer mapping failed; streaming with glBufferSubData" << std::endl;
+                gl.glDeleteBuffers(1, &ring.buffer);
+                ring = StreamRing{};
+                return SIZE_MAX;
+            }
+            ring.size = size;
+            recreated = true;
+        }
+        const size_t segmentSize = ring.size / kSegments;
+        size_t offset = (ring.head + align - 1u) / align * align;
+        // Never straddle two segments: a segment's fence has to come after
+        // every command that reads from it.
+        if (offset / segmentSize != (offset + bytes - 1u) / segmentSize)
+            offset = (offset / segmentSize + 1u) * segmentSize;
+        if (offset + bytes > ring.size)
+            offset = 0;
+        const int segment = static_cast<int>(offset / segmentSize);
+        if (segment != ring.segment)
+        {
+            // Every command reading the segment being left has been submitted.
+            if (ring.fence[ring.segment] != nullptr)
+                gl.glDeleteSync(ring.fence[ring.segment]);
+            ring.fence[ring.segment] = gl.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            // The one being entered was last used a full lap ago.
+            if (ring.fence[segment] != nullptr)
+            {
+                if (gl.glClientWaitSync(ring.fence[segment], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull) != GL_ALREADY_SIGNALED)
+                    ++m_ringStalls;
+                gl.glDeleteSync(ring.fence[segment]);
+                ring.fence[segment] = nullptr;
+            }
+            ring.segment = segment;
+        }
+        ring.head = offset + bytes;
+        return offset;
+    }
+
+    void Renderer::destroyStreamRing(StreamRing &ring)
+    {
+        GL &gl = m_context.gl;
+        for (GLsync &fence : ring.fence)
+        {
+            if (fence != nullptr)
+                gl.glDeleteSync(fence);
+            fence = nullptr;
+        }
+        if (ring.buffer != 0)
+        {
+            gl.glUnmapNamedBuffer(ring.buffer);
+            gl.glDeleteBuffers(1, &ring.buffer);
+        }
+        ring = StreamRing{};
     }
 
     void Renderer::destroyReadbackRing()
