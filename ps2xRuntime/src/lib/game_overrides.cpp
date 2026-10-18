@@ -456,6 +456,35 @@ namespace
         return value != 0u;
     }
 
+    // The player's ped: CWorld::Players[CWorld::PlayerInFocus].m_pPed
+    // (FindPlayerPed 0x24A430: 0x4E4910 + index byte 0x4CD128 * 0x190).
+    uint32_t vcsPlayerPed(const uint8_t *rdram)
+    {
+        const uint32_t index = rdram[0x004CD128u];
+        uint32_t ped = 0;
+        std::memcpy(&ped, rdram + 0x004E4910u + index * 0x190u, 4);
+        return (ped >= 0x00100000u && ped + 0x900u <= PS2_RAM_SIZE) ? ped : 0u;
+    }
+
+    // Free aim applies on foot with a gun. The current weapon slot is the
+    // signed byte at ped+0x789 (weapons at ped+0x574, 0x1C each, type at +4).
+    // Slots 3-6 and 8: handgun, shotgun, SMG, assault rifle, heavy. The sniper
+    // rifle (7) keeps its scope, and melee / thrown keep the lock-on.
+    bool vcsFreeAimWeapon(const uint8_t *rdram)
+    {
+        if (rdram == nullptr || vcsPlayerInVehicle(rdram) || vcsInCutscene(rdram))
+            return false;
+        const uint32_t ped = vcsPlayerPed(rdram);
+        if (ped == 0u)
+            return false;
+        const int slot = static_cast<int8_t>(rdram[ped + 0x789u]);
+        if (slot < 3 || slot > 8 || slot == 7)
+            return false;
+        uint32_t type = 0;
+        std::memcpy(&type, rdram + ped + 0x574u + static_cast<uint32_t>(slot) * 0x1Cu + 4u, 4);
+        return type != 0u;
+    }
+
     // The current in-vehicle radio station: 0..8 = the nine real stations,
     // 9 = the game's silent "Radio Off" slot. The station field is at +0x2BA
     // of the audio/vehicle entity (not byte 0x4E4755, which is overloaded with
@@ -1264,9 +1293,97 @@ namespace
         }
     }
 
+    // Free aim (modern controls; the pad withholds the lock-on button while
+    // the aim is held, see PSPadBackend::setFreeAimProbe). While aiming:
+    //  - the player turns to face where the camera looks (vcsFreeAimPedCam);
+    //  - the camera slides over the right shoulder, so the screen centre is
+    //    not the player (vcsFreeAimOffsetCam, undone before the next update
+    //    like the vehicle look offset);
+    //  - the crosshair ray (camera through screen centre) is cast once per
+    //    camera update after the game's own processing (vcsFreeAimMeasure);
+    //  - the player's instant-hit shots are turned from the ped's facing to
+    //    that point (vcsLineOfSightHook): spread (the shotgun's pellets) is
+    //    kept, and the shot can go up or down, which the PS2 game never did
+    //    without a target.
+    struct VcsFreeAim
+    {
+        bool held = false;        // aiming this camera update
+        float blend = 0.0f;       // shoulder offset, eased in and out (0..1)
+        uint32_t pedCam = 0;      // the on-foot CCam of the last update
+        bool aimValid = false;
+        float aimPoint[3] = {};   // where the crosshair ray meets the world (or its far end)
+        uint64_t aimFrame = 0;
+        // The shoulder offset's undo: the camera position (+0x20, copy +0x50)
+        // before and after the offset. The on-foot camera eases its position
+        // from the last one, so an offset left in place would pile up every
+        // update; each field goes back if it still holds what we wrote.
+        uint32_t offsetCam = 0;
+        float original[4][3] = {};
+        float written[4][3] = {};
+    };
+    VcsFreeAim g_vcsFreeAim;
+
+    void vcsFreeAimUndoOffset(uint8_t *rdram)
+    {
+        VcsFreeAim &aim = g_vcsFreeAim;
+        if (aim.offsetCam == 0u)
+            return;
+        const uint32_t fields[4] = {0x10u, 0x20u, 0x50u, 0x60u}; // Front, Source, its copy, Up
+        for (int f = 0; f < 4; ++f)
+            if (std::memcmp(rdram + aim.offsetCam + fields[f], aim.written[f], 12) == 0)
+                std::memcpy(rdram + aim.offsetCam + fields[f], aim.original[f], 12);
+        aim.offsetCam = 0u;
+    }
+
+    void vcsFreeAimPedCam(uint8_t *rdram, PS2Runtime *runtime, uint32_t cam)
+    {
+        VcsFreeAim &aim = g_vcsFreeAim;
+        aim.held = ps2HostSettings().freeAim && runtime->padBackend().freeAimHeld() && vcsFreeAimWeapon(rdram);
+        aim.blend = std::clamp(aim.blend + (aim.held ? 0.25f : -0.25f), 0.0f, 1.0f);
+        aim.pedCam = cam;
+        g_ps2Crosshair.store(aim.held, std::memory_order_relaxed);
+        static const bool s_log = std::getenv("PS2X_FREE_AIM_LOG") != nullptr;
+        if (s_log)
+        {
+            static bool s_lastHeld = false;
+            if (aim.held != s_lastHeld)
+                std::fprintf(stderr, "[freeaim] f=%llu held=%d (pad %d, weapon %d)\n",
+                             (unsigned long long)g_ps2PresentedFrameCounter.load(std::memory_order_relaxed), aim.held ? 1 : 0,
+                             runtime->padBackend().freeAimHeld() ? 1 : 0, vcsFreeAimWeapon(rdram) ? 1 : 0);
+            s_lastHeld = aim.held;
+        }
+        if (!aim.held || cam < 0x00100000u || cam + 0x80u > PS2_RAM_SIZE)
+            return;
+        // Standing: face the camera. Moving: the game turns the ped towards
+        // the stick as usual (it has no strafe outside its lock-on, and
+        // overriding the heading there just fought the turn); shots still
+        // follow the crosshair within 90 degrees of where the ped faces.
+        if (runtime->padBackend().movingInput())
+            return;
+        uint32_t ped = 0;
+        std::memcpy(&ped, rdram + cam + 0x70u, 4);
+        if (ped == 0u || ped != vcsPlayerPed(rdram))
+            return;
+        // Face the camera's direction: GTA headings point along
+        // (-sin h, cos h), current and wanted (+0x8E0, +0x8E4).
+        float front[3];
+        std::memcpy(front, rdram + cam + 0x10u, 12);
+        if (!(std::fabs(front[0]) + std::fabs(front[1]) > 1e-4f))
+            return;
+        const float heading = std::atan2(-front[0], front[1]);
+        if (std::isfinite(heading))
+            for (uint32_t off : {0x8E0u, 0x8E4u})
+                std::memcpy(rdram + ped + off, &heading, 4);
+    }
+
     void vcsFollowPedCam(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // Last update's shoulder offset comes off first: the camera logic
+        // must build on its own values.
+        vcsFreeAimUndoOffset(rdram);
+        const uint32_t cam = getRegU32(ctx, 4);
         vcsRunCameraWithMouse(g_vcsOrigFollowPedCam, rdram, ctx, runtime);
+        vcsFreeAimPedCam(rdram, runtime, cam);
     }
 
     // Vehicle cameras have no stick look on the PS2, so the mouse adds a view
@@ -1421,6 +1538,9 @@ namespace
     PS2Runtime::RecompiledFunction g_vcsOrigAfterCamProcess = nullptr;
     void vcsPushFrameCamera(const uint8_t *rdram); // after the camera reader below
 
+    void vcsFreeAimOffsetCam(uint8_t *rdram, uint32_t cam);
+    void vcsFreeAimMeasure(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t cam);
+
     void vcsAfterCamProcess(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         vcsCarLookRecoverIgnore(rdram);
@@ -1438,6 +1558,9 @@ namespace
                              g_ps2PresentedFrameCounter.load(std::memory_order_relaxed) <= g_vcsCarLook.vehicleFrame + 1u;
         if (rotated)
             vcsRotateVehicleCam(rdram, cam, ctx, runtime);
+        const bool aiming = !rotated && cam != 0u && cam == g_vcsFreeAim.pedCam && g_vcsFreeAim.blend > 0.0f;
+        if (aiming)
+            vcsFreeAimOffsetCam(rdram, cam);
         // The game's own processing builds TheCamera (and the RenderWare
         // camera) from the rotated vectors; only after it may the wall
         // raycast run (a guest call that can yield and unwind this frame).
@@ -1448,6 +1571,10 @@ namespace
         vcsPushFrameCamera(rdram);
         if (rotated)
             vcsMeasureCarWall(rdram, ctx, runtime, cam);
+        if (aiming && g_vcsFreeAim.held)
+            vcsFreeAimMeasure(rdram, ctx, runtime, cam);
+        else if (!g_vcsFreeAim.held)
+            g_vcsFreeAim.aimValid = false;
     }
 
     // The main RenderWare camera and the FOV state (see vcsSetViewWindow).
@@ -1478,10 +1605,14 @@ namespace
     // ...) (0x1908C0, as the vehicle camera calls it; ignores the entity at
     // CWorld::pIgnoreEntity, 0x4CD184). Called from a hook on the game
     // thread with a scratch stack frame; true and the hit point when blocked.
+    PS2Runtime::RecompiledFunction g_vcsOrigLineOfSight = nullptr; // the game's, under vcsLineOfSightHook
+
     bool vcsLineOfSightBlocked(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, const float from[3], const float to[3],
-                               uint32_t ignoreEntity, float hit[3])
+                               uint32_t ignoreEntity, float hit[3], bool peds = false)
     {
-        static PS2Runtime::RecompiledFunction s_lineOfSight = runtime->lookupFunction(0x001908C0u);
+        // The original, not our hook (installed over 0x1908C0 at startup).
+        PS2Runtime::RecompiledFunction s_lineOfSight =
+            g_vcsOrigLineOfSight ? g_vcsOrigLineOfSight : runtime->lookupFunction(0x001908C0u);
         if (!s_lineOfSight)
             return false;
         const R5900Context saved = *ctx;
@@ -1504,7 +1635,7 @@ namespace
         SET_GPR_U32(ctx, 7, sp + 0xA0u); // CEntity *
         SET_GPR_U32(ctx, 8, 1u);         // buildings
         SET_GPR_U32(ctx, 9, 1u);         // vehicles
-        SET_GPR_U32(ctx, 10, 0u);        // peds
+        SET_GPR_U32(ctx, 10, peds ? 1u : 0u); // peds
         SET_GPR_U32(ctx, 11, 1u);        // objects
         s_lineOfSight(rdram, ctx, runtime);
         const bool blocked = (getRegU32(ctx, 2) & 0xFFu) != 0u;
@@ -2085,6 +2216,192 @@ namespace
         g_vcsOrigFrameUpdate(rdram, ctx, runtime);
     }
 
+    // ---------------------------------------------------------------------
+    // Weapon-work test aid.
+    // PS2X_VCS_LOS_TRACE=1: who calls CWorld::ProcessLineOfSight (0x1908C0), by
+    // return address, with a sample of the segment; reported every ~10 s.
+    // Over the right shoulder: Source (+0x20, copy +0x50) moved right, up a
+    // little and in, Front unchanged - the crosshair at the screen centre
+    // then looks past the player. Undone by vcsRestoreCamBackups before the
+    // next camera update.
+    void vcsFreeAimOffsetCam(uint8_t *rdram, uint32_t cam)
+    {
+        if (cam < 0x00100000u || cam + 0x80u > PS2_RAM_SIZE)
+            return;
+        VcsFreeAim &aim = g_vcsFreeAim;
+        vcsFreeAimUndoOffset(rdram); // never stack two
+        float *c = reinterpret_cast<float *>(rdram + cam);
+        float *front = c + 0x10 / 4, *source = c + 0x20 / 4, *copy = c + 0x50 / 4, *up = c + 0x60 / 4;
+        float right[3] = {front[1] * up[2] - front[2] * up[1], front[2] * up[0] - front[0] * up[2],
+                          front[0] * up[1] - front[1] * up[0]};
+        const float length = std::sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
+        if (!(length > 1e-4f) || !std::isfinite(length))
+            return;
+        for (float &v : right)
+            v /= length;
+        float *fields[4] = {front, source, copy, up};
+        for (int f = 0; f < 4; ++f)
+            std::memcpy(aim.original[f], fields[f], 12);
+        const float b = aim.blend;
+        // Level the view: the follow camera looks down at the player, which
+        // put the screen centre on the ground a few metres ahead. Front and
+        // Up turn up about the camera's right axis.
+        constexpr float kTiltUp = 0.12f; // ~7 degrees
+        // About +right a positive angle takes Front towards Up (right x
+        // front = up), i.e. tilts the view up.
+        vcsRotate(front, right, b * kTiltUp);
+        vcsRotate(up, right, b * kTiltUp);
+        // Over the right shoulder, a little lower (nearer head height: with
+        // the view levelled the player otherwise sinks to the bottom) and in.
+        constexpr float kRight = 0.45f, kUp = -0.25f, kIn = 0.35f;
+        float offset[3];
+        for (int i = 0; i < 3; ++i)
+            offset[i] = b * (kRight * right[i] + kUp * up[i] + kIn * front[i]);
+        for (float *v : {source, copy})
+            for (int i = 0; i < 3; ++i)
+                v[i] += offset[i];
+        for (int f = 0; f < 4; ++f)
+            std::memcpy(aim.written[f], fields[f], 12);
+        aim.offsetCam = cam;
+    }
+
+    // The crosshair ray, from the (offset) camera through the screen centre,
+    // against buildings, vehicles, peds and objects (not the player).
+    void vcsFreeAimMeasure(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t cam)
+    {
+        VcsFreeAim &aim = g_vcsFreeAim;
+        float source[3], front[3];
+        std::memcpy(source, rdram + cam + 0x20u, 12);
+        std::memcpy(front, rdram + cam + 0x10u, 12);
+        const float length = std::sqrt(front[0] * front[0] + front[1] * front[1] + front[2] * front[2]);
+        if (!(length > 1e-4f) || !std::isfinite(length + source[0] + source[1] + source[2]))
+            return;
+        constexpr float kReach = 150.0f;
+        float far[3], hit[3];
+        for (int i = 0; i < 3; ++i)
+            far[i] = source[i] + front[i] / length * kReach;
+        const bool blocked = vcsLineOfSightBlocked(rdram, ctx, runtime, source, far, vcsPlayerPed(rdram), hit, true);
+        std::memcpy(aim.aimPoint, blocked ? hit : far, sizeof(aim.aimPoint));
+        aim.aimValid = true;
+        aim.aimFrame = g_ps2PresentedFrameCounter.load(std::memory_order_relaxed);
+    }
+
+    // Turns a player instant-hit shot (CWeapon::FireInstantHit 0x2C3E48 calls
+    // ProcessLineOfSight through the wrapper 0x2D0870, which returns to
+    // 0x2D08B8 and keeps its caller's return address at sp+0x30; the shooter
+    // stays in s4) by the rotation that takes the ped's facing to the
+    // crosshair point. Writes the end point (a1) in place: the impact and the
+    // tracer are both built from it.
+    void vcsFreeAimShot(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const VcsFreeAim &aim = g_vcsFreeAim;
+        static const bool s_log = std::getenv("PS2X_FREE_AIM_LOG") != nullptr;
+        auto skip = [&](const char *why)
+        {
+            if (s_log)
+                std::fprintf(stderr, "[freeaim] f=%llu shot left alone: %s\n",
+                             (unsigned long long)g_ps2PresentedFrameCounter.load(std::memory_order_relaxed), why);
+        };
+        if (!aim.held || !aim.aimValid || !runtime->padBackend().freeAimHeld())
+            return skip(!aim.held ? "not aiming" : !aim.aimValid ? "no aim point" : "aim released");
+        const uint64_t frame = g_ps2PresentedFrameCounter.load(std::memory_order_relaxed);
+        if (frame > aim.aimFrame + 8u)
+            return skip("aim point stale");
+        const uint32_t sp = getRegU32(ctx, 29);
+        if (sp + 0x34u > PS2_RAM_SIZE)
+            return;
+        uint32_t outer = 0;
+        std::memcpy(&outer, rdram + sp + 0x30u, 4);
+        if (outer < 0x002C3E48u || outer >= 0x002C5320u)
+            return; // not FireInstantHit
+        const uint32_t ped = vcsPlayerPed(rdram);
+        if (ped == 0u || getRegU32(ctx, 20) != ped)
+            return; // someone else's shot
+        const uint32_t p1 = getRegU32(ctx, 4), p2 = getRegU32(ctx, 5);
+        if (p1 < 0x1000u || p1 + 12u > PS2_RAM_SIZE || p2 < 0x1000u || p2 + 12u > PS2_RAM_SIZE)
+            return;
+        float from[3], to[3], facing[3];
+        std::memcpy(from, rdram + p1, 12);
+        std::memcpy(to, rdram + p2, 12);
+        std::memcpy(facing, rdram + ped + 0x10u, 12); // the ped matrix's forward
+        auto normalize = [](float v[3])
+        {
+            const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            if (!(l > 1e-5f) || !std::isfinite(l))
+                return false;
+            for (int i = 0; i < 3; ++i)
+                v[i] /= l;
+            return true;
+        };
+        float want[3] = {aim.aimPoint[0] - from[0], aim.aimPoint[1] - from[1], aim.aimPoint[2] - from[2]};
+        float shot[3] = {to[0] - from[0], to[1] - from[1], to[2] - from[2]};
+        if (!normalize(want) || !normalize(facing))
+            return;
+        const float c = facing[0] * want[0] + facing[1] * want[1] + facing[2] * want[2];
+        if (!(c > 0.0f)) // more than 90 degrees off: the ped has not turned yet
+            return skip("more than 90 degrees from the ped's facing");
+        // Rodrigues with k = facing x want: v' = v c + k x v + k (k.v) / (1 + c).
+        const float k[3] = {facing[1] * want[2] - facing[2] * want[1], facing[2] * want[0] - facing[0] * want[2],
+                            facing[0] * want[1] - facing[1] * want[0]};
+        const float kv = k[0] * shot[0] + k[1] * shot[1] + k[2] * shot[2];
+        const float kxv[3] = {k[1] * shot[2] - k[2] * shot[1], k[2] * shot[0] - k[0] * shot[2], k[0] * shot[1] - k[1] * shot[0]};
+        float out[3];
+        for (int i = 0; i < 3; ++i)
+            out[i] = from[i] + shot[i] * c + kxv[i] + k[i] * kv / (1.0f + c);
+        if (std::isfinite(out[0] + out[1] + out[2]))
+            std::memcpy(rdram + p2, out, 12);
+        if (s_log)
+            std::fprintf(stderr, "[freeaim] f=%llu shot from=(%.2f,%.2f,%.2f) to=(%.2f,%.2f,%.2f) -> (%.2f,%.2f,%.2f) aim=(%.2f,%.2f,%.2f)\n",
+                         (unsigned long long)frame, from[0], from[1], from[2], to[0], to[1], to[2], out[0], out[1], out[2],
+                         aim.aimPoint[0], aim.aimPoint[1], aim.aimPoint[2]);
+    }
+
+    void vcsLineOfSightTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+
+    // CWorld::ProcessLineOfSight (0x1908C0): free aim shots, and the
+    // PS2X_VCS_LOS_TRACE caller report.
+    void vcsLineOfSightHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (getRegU32(ctx, 31) == 0x002D08B8u)
+            vcsFreeAimShot(rdram, ctx, runtime);
+        static const bool s_trace = std::getenv("PS2X_VCS_LOS_TRACE") != nullptr;
+        if (s_trace)
+            vcsLineOfSightTrace(rdram, ctx, runtime);
+        else
+            g_vcsOrigLineOfSight(rdram, ctx, runtime);
+    }
+
+    void vcsLineOfSightTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        struct Site
+        {
+            uint64_t calls = 0;
+            float from[3] = {}, to[3] = {};
+        };
+        static std::map<uint32_t, Site> s_sites;
+        static uint64_t s_lastReport = 0;
+        const uint32_t ra = getRegU32(ctx, 31);
+        Site &site = s_sites[ra];
+        ++site.calls;
+        const uint32_t p1 = getRegU32(ctx, 4), p2 = getRegU32(ctx, 5);
+        if (p1 >= 0x1000u && p1 + 12u <= PS2_RAM_SIZE && p2 >= 0x1000u && p2 + 12u <= PS2_RAM_SIZE)
+        {
+            std::memcpy(site.from, rdram + p1, 12);
+            std::memcpy(site.to, rdram + p2, 12);
+        }
+        const uint64_t frame = g_ps2PresentedFrameCounter.load(std::memory_order_relaxed);
+        if (frame >= s_lastReport + 600u)
+        {
+            s_lastReport = frame;
+            for (const auto &[addr, entry] : s_sites)
+                std::fprintf(stderr, "[los] f=%llu ra=0x%x calls=%llu from=(%.1f,%.1f,%.1f) to=(%.1f,%.1f,%.1f)\n",
+                             (unsigned long long)frame, addr, (unsigned long long)entry.calls, entry.from[0], entry.from[1],
+                             entry.from[2], entry.to[0], entry.to[1], entry.to[2]);
+            s_sites.clear();
+        }
+        g_vcsOrigLineOfSight(rdram, ctx, runtime);
+    }
+
     void applyGtaVcsUs(PS2Runtime &runtime)
     {
         if ((g_vcsOrigFollowPedCam = runtime.lookupFunction(0x0029DAB0u)))
@@ -2099,6 +2416,9 @@ namespace
             runtime.replaceFunction(0x0018F2D8u, &vcsSetViewWindow);
         if ((g_vcsOrigSetFarClip = runtime.lookupFunction(0x0018F400u)))
             runtime.replaceFunction(0x0018F400u, &vcsSetFarClip);
+        if ((g_vcsOrigLineOfSight = runtime.lookupFunction(0x001908C0u)))
+            runtime.replaceFunction(0x001908C0u, &vcsLineOfSightHook);
+        runtime.padBackend().setFreeAimProbe(&vcsFreeAimWeapon, runtime.memory().getRDRAM());
 
         runtime.padBackend().setVehicleProbe(&vcsPlayerInVehicle, runtime.memory().getRDRAM());
         runtime.padBackend().setMenuProbe(&vcsPauseMenuOpen, runtime.memory().getRDRAM());

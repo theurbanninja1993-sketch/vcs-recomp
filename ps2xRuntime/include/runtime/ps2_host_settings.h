@@ -133,6 +133,10 @@ struct PS2HostSettings
     float mouseSensitivity = 1.0f;
     bool mouseInvertY = false;
     bool mouseTurnsPlayer = true; // on foot, mouse turns also turn a moving player (no skid stops)
+    // Modern free aim: on foot with a gun, the aim button (right mouse; the
+    // aim trigger on the Modern/Custom pad layouts) aims where the camera
+    // looks, with a crosshair, instead of locking on (the PS2's R1).
+    bool freeAim = true;
 
     bool musicStation = true;          // play the music folder as a radio station (VCS: the unused 10th station slot)
     float musicStationVolume = 0.8f;

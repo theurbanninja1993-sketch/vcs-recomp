@@ -817,6 +817,12 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     // menu layout never leaks into gameplay.
     const int context = inMenu ? ps2controls::Menus : (driving ? ps2controls::InVehicle : ps2controls::OnFoot);
     ps2controls::setCurrentContext(context);
+    // Free aim (see PSPadBackend::setFreeAimProbe): the lock-on button (R1)
+    // is withheld and the aim is reported instead.
+    const bool freeAimAllowed = settings.freeAim && context == ps2controls::OnFoot && m_freeAimProbe != nullptr &&
+                                m_freeAimRdram != nullptr && m_freeAimProbe(m_freeAimRdram);
+    bool freeAimHeld = false;
+    constexpr int kPs2R1 = 11;
     // The game's pause flag only becomes visible next frame, so the prompt
     // art would show the gameplay keys for one frame after pressing Start.
     // A fresh Start press predicts the toggle for the art only; the pad
@@ -908,6 +914,12 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
                 }
                 if (!hostDown[b])
                     continue;
+                if (ps2Button == kPs2R1 && freeAimAllowed &&
+                    settings.gamepadLayout != ps2controls::GamepadLayout::Classic)
+                {
+                    freeAimHeld = true;
+                    continue;
+                }
                 press(ps2Button);
             }
 
@@ -1050,7 +1062,12 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
                 if (held(pc::Interact))
                     press(L1);
                 if (held(pc::Aim))
-                    press(R1);
+                {
+                    if (freeAimAllowed)
+                        freeAimHeld = true;
+                    else
+                        press(R1);
+                }
                 if (held(pc::MoveForward))
                     moveY -= 1.0f;
                 if (held(pc::MoveBackward))
@@ -1086,6 +1103,21 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         }
     }
 
+    // PS2X_FREE_AIM_TEST=<from>-<to>: hold the free aim between those
+    // presented frames (headless tests; only where free aim applies).
+    {
+        static const std::pair<uint64_t, uint64_t> s_test = []()
+        {
+            unsigned long long from = 0, to = 0;
+            if (const char *env = std::getenv("PS2X_FREE_AIM_TEST"))
+                std::sscanf(env, "%llu-%llu", &from, &to);
+            return std::make_pair(static_cast<uint64_t>(from), static_cast<uint64_t>(to));
+        }();
+        const uint64_t frame = g_ps2PresentedFrameCounter.load(std::memory_order_relaxed);
+        if (freeAimAllowed && frame >= s_test.first && frame < s_test.second)
+            freeAimHeld = true;
+    }
+    m_freeAimHeld.store(freeAimHeld, std::memory_order_relaxed);
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
     // Analog pressure, by PS2 button bit, for readPadPortData to pick up.

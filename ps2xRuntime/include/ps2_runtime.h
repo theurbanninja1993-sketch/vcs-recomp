@@ -246,6 +246,8 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
 // (e.g. the display settings the frontend reads back). Debug aid only.
 extern bool g_ps2TraceBoolWrites;
 extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
+// Free aim: the host draws a crosshair at the centre of the picture.
+extern std::atomic<bool> g_ps2Crosshair;
 
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,

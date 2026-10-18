@@ -353,6 +353,8 @@ void ps2HostSettingsLoad()
             s.drawDistance = std::clamp(std::strtof(v, nullptr), 0.5f, 4.0f);
         else if (key == "mouse_turns_player")
             s.mouseTurnsPlayer = std::atoi(v) != 0;
+        else if (key == "free_aim")
+            s.freeAim = std::atoi(v) != 0;
         else if (key == "mouse_invert_y")
             s.mouseInvertY = std::atoi(v) != 0;
         else if (key == "music_station")
@@ -518,6 +520,7 @@ void ps2HostSettingsSave()
         << "mouse_sensitivity=" << s.mouseSensitivity << "\n"
         << "mouse_invert_y=" << (s.mouseInvertY ? 1 : 0) << "\n"
         << "mouse_turns_player=" << (s.mouseTurnsPlayer ? 1 : 0) << "\n"
+        << "free_aim=" << (s.freeAim ? 1 : 0) << "\n"
         << "controller=" << s.controllerName << "\n"
         << "music_station=" << (s.musicStation ? 1 : 0) << "\n"
         << "music_station_volume=" << s.musicStationVolume << "\n"

@@ -2945,6 +2945,12 @@ void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
                 }
                 ImGui::TextDisabled("Mouse wheel cycles weapons. Left Alt releases the mouse.");
 
+                ImGui::SeparatorText("Aiming");
+                changed |= ImGui::Checkbox("Free aim", &settings.freeAim);
+                ImGui::TextDisabled("On foot with a gun, the aim button aims where the camera looks (crosshair)\n"
+                                    "instead of locking on. Keyboard/mouse and the Modern/Custom gamepad layouts;\n"
+                                    "the Classic layout keeps the PS2 lock-on. The sniper rifle keeps its scope.");
+
                 ImGui::SeparatorText("Mouse");
                 changed |= ImGui::SliderFloat("Sensitivity", &settings.mouseSensitivity, 0.05f, 5.0f, "%.2f",
                                               ImGuiSliderFlags_Logarithmic);

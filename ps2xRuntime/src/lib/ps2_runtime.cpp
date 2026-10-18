@@ -160,6 +160,7 @@ struct ProgramHeader
 };
 
 extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
+std::atomic<bool> g_ps2Crosshair{false};
 // Present only in -fprofile-generate builds.
 extern "C" void __gcov_dump(void) __attribute__((weak));
 // And clang's equivalent, which both of its profiling modes provide. The port is
@@ -3802,6 +3803,30 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
             dstWidth,
             dstHeight};
         DrawTexturePro(presentDraw, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        if (g_ps2Crosshair.load(std::memory_order_relaxed))
+        {
+            // Free aim: four ticks around a dot, white over a dark outline,
+            // sized to the picture.
+            const float cx = dstRect.x + dstRect.width * 0.5f, cy = dstRect.y + dstRect.height * 0.5f;
+            const float unit = std::max(1.0f, dstRect.height / 480.0f);
+            const float gap = 4.0f * unit, len = 7.0f * unit, thick = 1.5f * unit;
+            auto tick = [&](float dx, float dy, Color color, float width)
+            {
+                DrawLineEx(Vector2{cx + dx * gap, cy + dy * gap}, Vector2{cx + dx * (gap + len), cy + dy * (gap + len)},
+                           width, color);
+            };
+            const Color shadow{0, 0, 0, 170};
+            for (int pass = 0; pass < 2; ++pass)
+            {
+                const Color color = pass == 0 ? shadow : Color{255, 255, 255, 230};
+                const float width = pass == 0 ? thick + 2.0f * unit : thick;
+                tick(1.0f, 0.0f, color, width);
+                tick(-1.0f, 0.0f, color, width);
+                tick(0.0f, 1.0f, color, width);
+                tick(0.0f, -1.0f, color, width);
+                DrawCircleV(Vector2{cx, cy}, pass == 0 ? 2.0f * unit : 1.0f * unit, color);
+            }
+        }
         if (hostSettings.showFps)
         {
             // Two different rates, and the one that matters is the game's. The

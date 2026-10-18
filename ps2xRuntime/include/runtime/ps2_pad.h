@@ -116,8 +116,22 @@ public:
         m_cutsceneRdram = rdram;
     }
 
+    // Free aim: whether the player is on foot holding a weapon that free aim
+    // applies to (game-specific), and whether the aim button is held for it
+    // this frame - the pad then withholds the lock-on button.
+    using FreeAimProbe = bool (*)(const uint8_t *rdram);
+    void setFreeAimProbe(FreeAimProbe probe, const uint8_t *rdram)
+    {
+        m_freeAimProbe = probe;
+        m_freeAimRdram = rdram;
+    }
+    bool freeAimHeld() const { return m_freeAimHeld.load(std::memory_order_relaxed); }
+
 private:
     static bool applyFakeMouse(float &yaw, float &pitch); // PS2X_MOUSE_FAKE=<yaw>,<pitch> per camera update (tests)
+    FreeAimProbe m_freeAimProbe = nullptr;
+    const uint8_t *m_freeAimRdram = nullptr;
+    std::atomic<bool> m_freeAimHeld{false};
     VehicleProbe m_vehicleProbe = nullptr;
     const uint8_t *m_rdram = nullptr;
     MenuProbe m_menuProbe = nullptr;
