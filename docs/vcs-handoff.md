@@ -47,6 +47,14 @@ wait, not work). The owner's real sessions load fine, so this was left alone;
 if loads ever feel slow in play, the CD stream timing model
 (`cdStreamWakeTickForSectors` in `CD.cpp`) is the suspect.
 
+## 2026-10-18 evening (Claude): settings.ini changes the launcher must accept
+
+- `internal_scale=0` now means **Auto** (pick 1x-4x from the window height;
+  1080p -> 3x). The launcher must not clamp it to 1-4.
+- `free_aim=0|1` (default 1) - Controls > Aiming > Free aim.
+- Cutscene dialogue: IOP clocked by game time during in-engine cutscenes
+  (`8d9658a`), IOP backlog dropped only after 20 VBlanks.
+
 ## 2026-10-18 later (Claude): laptop cutscenes - profile, don't guess
 
 Perf-log thread % is of *emulated* time (>100% = can't keep up). On the owner's
