@@ -1,8 +1,56 @@
 # GTA Vice City Stories (SLUS_215.90) recomp: handoff notes
 
 State as of 2026-10-18 (`vcs-bringup` is the tip the `release` branch players build
-from was cut at, tagged `stories-v0.1.6`; the launcher is its own repo at `171e2b3` =
-`v0.1.11`). Read this before changing anything. A reviewer will check work against it.
+from was cut at, tagged `stories-v0.1.6`; the launcher is its own repo at `397239b` =
+`v0.1.14`). Read this before changing anything. A reviewer will check work against it.
+
+## 2026-10-18 evening (Claude): Windows players can build, without a command line
+
+Owner: *"is there a way to make the windows launcher automatically run the command
+when you try to build. Windows users are notoriously affraid of command lines"* and
+*"also is WSL incluided in Windows or would that need to be installed? if it needs
+to be installed can our launcher do that too?"* - the answer to both is yes, and it
+is now what happens. Launcher `v0.1.12` through `v0.1.14` (`397239b`).
+
+**B on Windows hands the build to WSL itself.** The Windows launcher starts the Linux
+launcher under WSL on the build for that game - the same folder, so the same
+`launcher.ini` and the same `port/`, and under WSL the launcher cross-compiles the
+*Windows* port, which is the build the Windows launcher then plays. `--build <n>`
+and `--image <path>` are how it asks (the game by its place in the same config), and
+`make_release.sh` now puts the Linux launcher in the Windows folder, because that one
+line is the whole of the Windows build story.
+
+**WSL is not part of Windows**, and the launcher offers both halves of setting it up,
+each as a script in a window that stays open - the last line of an install is usually
+the one that says what to do next:
+
+- no WSL -> `wsl --install`, elevated through `ShellExecute`'s "runas", which is what
+  raises Windows' consent prompt;
+- WSL without a compiler -> cmake and a C++ toolchain installed as root *inside* WSL,
+  which needs no password and cannot reach anything outside WSL.
+
+**Three reports in a row, and what each one taught:**
+
+1. *"clicking B appears to crash the launcher"* - it did not. `wsl.exe -e uname`
+   *starts* Linux, and three such questions were being asked on the thread that draws
+   the menu, so the window stopped answering. The question is asked in the background
+   now, with a **waiting** screen whose dots move, because a still screen is what a
+   crash looks like.
+2. *"it says to press b again but nothing happens"* - a design error: the answer was
+   remembered, including the **no**, so pressing B after installing WSL re-read the
+   old no and changed nothing. Only a yes is remembered now.
+3. *"it still keeps saying WSL is not setup everytime I click B"* - the message was
+   right (a restart is what an install needs) and the owner reached for it from that
+   message alone. But a no should not need a person to work out what it means, so
+   `v0.1.14` keeps the **evidence**: what was asked, the exit code, and the first line
+   of the answer, shown in the notice. WSL prints UTF-16, so the report makes that
+   readable rather than showing mojibake, and a mention of a restart, the virtual
+   machine platform or no installed distributions is called out explicitly.
+
+The lesson worth carrying: every one of these was a *silent* or *misleading* answer
+from the launcher, and every fix was to make it say what it actually knew. The two
+boolean probes that `v0.1.14` replaced were removed rather than left, because two
+ways to ask one question is two ways to disagree.
 
 ## 2026-10-18 later still (Claude): B says why it cannot build on Windows
 
