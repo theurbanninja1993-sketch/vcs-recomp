@@ -69,9 +69,11 @@ version = 1
 # The story counter is a float at 0x004CD18C: 0.0 before the first story mission,
 # and one more for each story mission passed (found by RAM dumps, Soldier through
 # Conduct Unbecoming: 0, 1, 2, 3). Its value at each milestone is the number of
-# missions passed so far. A milestone fires on the step from n-1 to n, which is
-# `0xf4CD18C==n && d0xf4CD18C==n-1`: a plain `>=n` also fires on a transient spike
-# in the float, which unlocked every milestone at once in gameplay.
+# missions passed so far. Each milestone fires on the step from n-1 to n, as the raw
+# 32-bit pattern of the float, compared as an integer: `0xX4CD18C==<bits(n)> &&
+# d0xX4CD18C==<bits(n-1)>`. Comparing the float itself (`0xf...`) is not reliable in
+# this build: a value of 0.0 was seen to satisfy `>=1`. Integer compares on the bits
+# are exact for whole numbers.
 #
 # The thresholds are the milestones' place in the story order: To Victor, the Spoils
 # ends chapter 1 at 16, Jive Drive starts chapter 2 at 17, From Zero to Hero ends it at
@@ -84,7 +86,7 @@ title = Soldier
 description = Complete "Soldier".
 category = Story
 points = 10
-trigger = 0xf4CD18C==1 && d0xf4CD18C==0
+trigger = 0xX4CD18C==1065353216 && d0xX4CD18C==0
 
 [achievement]
 id = 2
@@ -92,7 +94,7 @@ title = To Victor, the Spoils
 description = Complete "To Victor, the Spoils".
 category = Story
 points = 10
-trigger = 0xf4CD18C==16 && d0xf4CD18C==15
+trigger = 0xX4CD18C==1098907648 && d0xX4CD18C==1097859072
 
 [achievement]
 id = 3
@@ -100,7 +102,7 @@ title = Jive Drive
 description = Complete "Jive Drive".
 category = Story
 points = 10
-trigger = 0xf4CD18C==17 && d0xf4CD18C==16
+trigger = 0xX4CD18C==1099431936 && d0xX4CD18C==1098907648
 
 [achievement]
 id = 4
@@ -108,7 +110,7 @@ title = From Zero to Hero
 description = Complete "From Zero to Hero".
 category = Story
 points = 10
-trigger = 0xf4CD18C==30 && d0xf4CD18C==29
+trigger = 0xX4CD18C==1106247680 && d0xX4CD18C==1105723392
 
 [achievement]
 id = 5
@@ -116,7 +118,7 @@ title = Brawn of the Dead
 description = Complete "Brawn of the Dead".
 category = Story
 points = 10
-trigger = 0xf4CD18C==31 && d0xf4CD18C==30
+trigger = 0xX4CD18C==1106771968 && d0xX4CD18C==1106247680
 
 [achievement]
 id = 6
@@ -124,7 +126,7 @@ title = Last Stand
 description = Complete "Last Stand".
 category = Story
 points = 25
-trigger = 0xf4CD18C==59 && d0xf4CD18C==58
+trigger = 0xX4CD18C==1114374144 && d0xX4CD18C==1114112000
 
 # ------------------------------------------------- hidden mission challenges (4)
 # The four slots the official sets fill with a special way through one mission,
@@ -257,7 +259,9 @@ points = 10
 # which is the wanted level itself. Three cheat entries reach six.
 # A wanted level is 0-6, so a value above that is not one: this byte read 53 on a
 # gameplay frame during the learn route. Hence the step, not `>=6`.
-trigger = 0xH52FC74==6 && d0xH52FC74==5
+# Disabled until the address is known to be the wanted level. The trace of a real
+# session shows 0x52FC74 going through 128, 64, 192, 240 and others, which are not
+# star counts, so the cheat-search address was wrong. Listed, never unlocks.
 
 [achievement]
 id = 27
