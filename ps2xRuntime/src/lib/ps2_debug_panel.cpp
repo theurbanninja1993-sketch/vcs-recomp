@@ -4,6 +4,9 @@
 #include "ps2_log.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_host_settings.h"
+#include "runtime/ps2_mods.h"
+#include "runtime/ps2_pad.h"
+#include "runtime/ps2_music_station.h"
 
 #include <unordered_set>
 #include <utility>
@@ -15,6 +18,7 @@
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
 #include "rlImGui.h"
+extern int (*g_ps2xImGuiPadSelector)(); // rlImGui_patched.cpp: which pad drives menu navigation
 #include "raylib.h"
 #endif
 
@@ -2184,6 +2188,8 @@ void PS2DebugPanel::initialize()
     if (!m_initialized)
     {
         rlImGuiSetup(true);
+        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad; // menus work with a controller
+        g_ps2xImGuiPadSelector = &ps2ActiveGamepad;                     // ...the one the game uses
         m_initialized = true;
     }
 #endif
@@ -2213,7 +2219,18 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         toggleVisible();
     }
     static bool s_openAtStart = std::getenv("PS2X_OPEN_SETTINGS") != nullptr; // UI checks
-    if ((IsKeyPressed(KEY_F2) && !g_ps2LaunchMenuPending.load(std::memory_order_relaxed) && m_captureAction < 0) ||
+    // Controller: Select+Start together (not the PS / Guide button, which
+    // belongs to Steam's overlay when the game is added to Steam).
+    bool padToggle = false;
+    if (const int pad = ps2ActiveGamepad(); pad >= 0)
+    {
+        static bool s_padComboLatched = false;
+        const bool combo = IsGamepadButtonDown(pad, GAMEPAD_BUTTON_MIDDLE_LEFT) && IsGamepadButtonDown(pad, GAMEPAD_BUTTON_MIDDLE_RIGHT);
+        if (combo && !s_padComboLatched)
+            padToggle = true;
+        s_padComboLatched = combo;
+    }
+    if (((IsKeyPressed(KEY_F2) || padToggle) && !g_ps2LaunchMenuPending.load(std::memory_order_relaxed) && m_captureAction < 0) ||
         std::exchange(s_openAtStart, false))
     {
         g_ps2SettingsMenuOpen.store(!g_ps2SettingsMenuOpen.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -2343,7 +2360,7 @@ void PS2DebugPanel::drawSettingsHint()
                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav))
     {
         ImGui::SetWindowFontScale(scale);
-        ImGui::TextUnformatted("F2: Settings");
+        ImGui::TextUnformatted(ps2ActiveGamepad() >= 0 ? "F2 / Select+Start: Settings" : "F2: Settings");
     }
     ImGui::End();
 #endif
@@ -2384,10 +2401,20 @@ void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
         const ImGuiStyle &style = ImGui::GetStyle();
         const float footerH = ImGui::GetFrameHeightWithSpacing() * 2.0f + style.ItemSpacing.y * 2.0f + 4.0f;
         ImGui::PushItemWidth(columnW * 0.5f);
+        // L1 / R1 switch tabs (as in VCS).
+        constexpr int kSettingsTabs = 3;
+        static int s_settingsTab = 0, s_settingsTabRequest = -1;
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false))
+            s_settingsTabRequest = (s_settingsTab + kSettingsTabs - 1) % kSettingsTabs;
+        else if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false))
+            s_settingsTabRequest = (s_settingsTab + 1) % kSettingsTabs;
+        auto tabFlags = [](int tab)
+        { return s_settingsTabRequest == tab ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None; };
         if (ImGui::BeginTabBar("settings-tabs"))
         {
-            if (ImGui::BeginTabItem("Display"))
+            if (ImGui::BeginTabItem("Display", nullptr, tabFlags(0)))
             {
+                s_settingsTab = 0;
                 ImGui::BeginChild("display-scroll", ImVec2(0.0f, -footerH));
                 static const char *kModes[] = {"Windowed", "Borderless fullscreen", "Fullscreen"};
                 int mode = static_cast<int>(settings.displayMode);
@@ -2442,32 +2469,116 @@ void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
                     ImGui::TextDisabled("Also set Widescreen ON in the game's Display options.");
 
                 changed |= ImGui::Checkbox("Smooth scaling", &settings.smoothFiltering);
+                changed |= ImGui::Checkbox("FPS overlay", &settings.showFps);
 
                 const bool gpu = ps2HostSettingsGpuRenderer();
                 ImGui::BeginDisabled(!gpu);
-                static const char *kInternal[] = {"Native (640 x 448)", "2x (1280 x 896)", "3x (1920 x 1344)",
-                                                  "4x (2560 x 1792)"};
-                int internal = std::clamp(settings.internalScale, 1, 4) - 1;
+                // In display terms: the PS2 draws 448 lines, so each step is a
+                // multiple of that. Auto picks from the window height.
+                static const char *kInternal[] = {
+                    "Auto (match my display)", "Native - PS2 (about 480p)", "2x - about 900p (HD)",
+                    "3x - about 1350p (great for 1080p and 1440p)", "4x - about 1800p (great for 4K)"};
+                int internal = std::clamp(settings.internalScale, 0, 4);
                 if (ImGui::Combo("Internal resolution", &internal, kInternal, IM_ARRAYSIZE(kInternal)))
                 {
-                    settings.internalScale = internal + 1;
+                    settings.internalScale = internal;
                     changed = true;
                 }
+                if (settings.internalScale == 0)
+                {
+                    const int scale = ps2HostSettingsEffectiveScale();
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("now %dx (%d lines)", scale, 448 * scale);
+                }
+                ImGui::TextDisabled("Higher looks sharper but needs a faster graphics card.");
                 ImGui::EndDisabled();
                 if (!gpu)
                     ImGui::TextDisabled("Needs the GPU renderer (PS2X_GS_GPU=1).");
 
                 changed |= ImGui::Checkbox("PS2 flicker filter (softer image)", &settings.flickerFilter);
+                {
+                    static const char *kMotionBlur[] = {"PS2 (original)", "Off"};
+                    int motionBlur = settings.motionBlurOff ? 1 : 0;
+                    if (ImGui::Combo("Motion blur", &motionBlur, kMotionBlur, IM_ARRAYSIZE(kMotionBlur)))
+                    {
+                        settings.motionBlurOff = motionBlur == 1;
+                        changed = true;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("PS2 is the console's motion trail (last frame blended over the new one).\n"
+                                          "Off skips it: a sharper picture and a little less work.");
+                }
+                ImGui::SeparatorText("View");
+                changed |= ImGui::SliderFloat("Draw distance", &settings.drawDistance, 1.0f, 3.0f, "%.1fx");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset##draw"))
+                {
+                    settings.drawDistance = 1.0f;
+                    changed = true;
+                }
+                ImGui::TextDisabled("Keeps buildings and objects detailed farther away. High values make the\n"
+                                    "game stream more of the city than the PS2 was built for.");
+                changed |= ImGui::Checkbox("VSync (tear-free; needed for VRR)", &settings.vsync);
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
 
             static bool s_controlsFirst = std::getenv("PS2X_SETTINGS_TAB_CONTROLS") != nullptr; // UI checks
             if (ImGui::BeginTabItem("Controls", nullptr,
-                                    std::exchange(s_controlsFirst, false) ? ImGuiTabItemFlags_SetSelected : 0))
+                                    std::exchange(s_controlsFirst, false) ? ImGuiTabItemFlags_SetSelected : tabFlags(1)))
             {
+                s_settingsTab = 1;
                 ImGui::BeginChild("controls-scroll", ImVec2(0.0f, -footerH));
                 ImGui::SeparatorText("Gamepad");
+                {
+                    // Which controller to use when several are connected
+                    // (e.g. a DualSense plus Steam's virtual pad for it).
+                    const int activePad = ps2ActiveGamepad();
+                    const std::string current = settings.controllerName.empty()
+                                                    ? std::string("Automatic (last controller used)")
+                                                    : settings.controllerName;
+                    bool picked = false;
+                    if (ImGui::BeginCombo("Controller", current.c_str()))
+                    {
+                        if (ImGui::Selectable("Automatic (last controller used)", settings.controllerName.empty()))
+                        {
+                            settings.controllerName.clear();
+                            picked = true;
+                        }
+                        for (int i = 0; i < 4; ++i)
+                        {
+                            if (!IsGamepadAvailable(i))
+                                continue;
+                            const std::string name = GetGamepadName(i);
+                            ImGui::PushID(i);
+                            // A keyboard or mouse posing as a joystick has no
+                            // gamepad mapping: selectable, but it cannot respond.
+                            const bool real = ps2IsRealGamepad(i);
+                            if (ImGui::Selectable(real ? name.c_str() : (name + "  (not a gamepad)").c_str(),
+                                                  settings.controllerName == name))
+                            {
+                                settings.controllerName = name;
+                                picked = true;
+                            }
+                            if (!real && ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Connected, but it has no gamepad mapping, so it cannot send\n"
+                                                  "input. Usually a keyboard or mouse exposing a phantom\n"
+                                                  "joystick - pick a real controller (or Automatic).");
+                            ImGui::PopID();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    if (picked)
+                    {
+                        ps2SetPreferredGamepad(settings.controllerName);
+                        changed = true;
+                    }
+                    ImGui::SameLine();
+                    if (activePad >= 0)
+                        ImGui::TextDisabled("using: %s", GetGamepadName(activePad));
+                    else
+                        ImGui::TextDisabled("none connected");
+                }
                 int layout = static_cast<int>(settings.gamepadLayout);
                 bool layoutChanged = ImGui::RadioButton("Classic (PS2)", &layout, 0);
                 ImGui::SameLine();
@@ -2483,13 +2594,16 @@ void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
                 }
                 if (ImGui::TreeNode("Gamepad buttons"))
                 {
-                    if (ImGui::BeginTable("pad-map", 3,
+                    if (ImGui::BeginTable("pad-map", 4,
                                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit,
                                           ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)))
                     {
                         ImGui::TableSetupColumn("Button", ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn("On foot", ImGuiTableColumnFlags_WidthFixed, columnW * 0.3f);
-                        ImGui::TableSetupColumn("In a vehicle", ImGuiTableColumnFlags_WidthFixed, columnW * 0.3f);
+                        ImGui::TableSetupColumn("On foot", ImGuiTableColumnFlags_WidthFixed, columnW * 0.24f);
+                        ImGui::TableSetupColumn("In a vehicle", ImGuiTableColumnFlags_WidthFixed, columnW * 0.24f);
+                        // The menus keep their own layout (classic by default) so
+                        // gameplay remaps never break menu navigation.
+                        ImGui::TableSetupColumn("In menus", ImGuiTableColumnFlags_WidthFixed, columnW * 0.24f);
                         ImGui::TableHeadersRow();
                         for (int b = 0; b < pc::kHostButtonCount; ++b)
                         {
@@ -2548,6 +2662,48 @@ void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
                     ImGui::TableHeadersRow();
                     for (int action = 0; action < pc::kActionCount; ++action)
                     {
+                        if (action >= pc::MenuAccept && action <= pc::SkipCutscene)
+                            continue; // the menu keys have their own section
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(pc::actionName(action));
+                        for (int slot = 0; slot < 2; ++slot)
+                        {
+                            ImGui::TableNextColumn();
+                            ImGui::PushID(action * 2 + slot);
+                            const bool capturing = m_captureAction == action && m_captureSlot == slot;
+                            const std::string label =
+                                capturing ? std::string("Press a key...") : pc::bindingName(settings.keys[action][slot]);
+                            if (ImGui::Button(label.c_str(), ImVec2(-FLT_MIN, 0.0f)))
+                            {
+                                m_captureAction = capturing ? -1 : action;
+                                m_captureSlot = slot;
+                            }
+                            if (ImGui::IsItemClicked(ImGuiMouseButton_Right))
+                            {
+                                settings.keys[action][slot] = pc::kNone;
+                                m_captureAction = -1;
+                                changed = true;
+                            }
+                            ImGui::PopID();
+                        }
+                    }
+                    ImGui::EndTable();
+                }
+                ImGui::SeparatorText("Menu keys");
+                ImGui::TextDisabled("Used in the game's menus, independent of the gameplay bindings above. "
+                                    "The wheel zooms the map; Backspace sends Triangle (back, and the map legend). "
+                                    "Skip cutscene works during cutscenes too (it sends Cross).");
+                if (ImGui::BeginTable("menu-keys", 3,
+                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit,
+                                      ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)))
+                {
+                    ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
+                    ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, columnW * 0.3f);
+                    ImGui::TableSetupColumn("Alternate", ImGuiTableColumnFlags_WidthFixed, columnW * 0.3f);
+                    ImGui::TableHeadersRow();
+                    for (int action = pc::MenuAccept; action <= pc::SkipCutscene; ++action)
+                    {
                         ImGui::TableNextRow();
                         ImGui::TableNextColumn();
                         ImGui::TextUnformatted(pc::actionName(action));
@@ -2582,10 +2738,18 @@ void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
                 }
                 ImGui::TextDisabled("Mouse wheel cycles weapons. Left Alt releases the mouse.");
 
+                ImGui::SeparatorText("Aiming");
+                changed |= ImGui::Checkbox("Free aim", &settings.freeAim);
+                ImGui::TextDisabled("On foot with a gun, the aim button aims where the camera looks (crosshair)\n"
+                                    "instead of locking on. Keyboard/mouse and the Modern/Custom gamepad layouts;\n"
+                                    "the Classic layout keeps the PS2 lock-on. The sniper rifle keeps its scope.");
+
                 ImGui::SeparatorText("Mouse");
                 changed |= ImGui::SliderFloat("Sensitivity", &settings.mouseSensitivity, 0.05f, 5.0f, "%.2f",
                                               ImGuiSliderFlags_Logarithmic);
                 changed |= ImGui::Checkbox("Invert vertical look", &settings.mouseInvertY);
+                changed |= ImGui::Checkbox("Player turns with the camera while moving", &settings.mouseTurnsPlayer);
+                ImGui::TextDisabled("On: no skid stop when the mouse turns you while running.");
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
@@ -2593,7 +2757,101 @@ void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
             {
                 m_captureAction = -1;
             }
+            if (ImGui::BeginTabItem("Mods", nullptr, tabFlags(2)))
+            {
+                s_settingsTab = 2;
+                ImGui::BeginChild("mods-scroll", ImVec2(0.0f, -footerH));
+                ImGui::TextWrapped("Put each mod in its own folder inside the mods folder. PCSX2 texture packs "
+                                   "for SLUS-21423 work as they are.");
+                ImGui::TextDisabled("%s", ps2ModsDirectory().c_str());
+                if (ImGui::Button("Open mods folder"))
+                    ps2ModsOpenFolder();
+                ImGui::SameLine();
+                if (ImGui::Button("Rescan"))
+                    ps2ModsRefresh();
+                if (ImGui::Checkbox("Apply .pnach memory patches", &settings.pnachCheats))
+                    ps2HostSettingsSave();
+                if (!ps2HostSettingsGpuRenderer())
+                    ImGui::TextDisabled("Texture packs need the GPU renderer (PS2X_GS_GPU=1).");
+                ImGui::Spacing();
+                const auto &mods = ps2Mods();
+                if (mods.empty())
+                {
+                    ImGui::TextDisabled("No mods installed.");
+                }
+                else if (ImGui::BeginTable("mods", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit,
+                                           ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)))
+                {
+                    ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_WidthFixed);
+                    ImGui::TableSetupColumn("Mod", ImGuiTableColumnFlags_WidthStretch);
+                    ImGui::TableSetupColumn("Contents", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 14.0f);
+                    ImGui::TableHeadersRow();
+                    std::string toggle;
+                    bool toggleTo = false;
+                    for (const PS2ModInfo &mod : mods)
+                    {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        bool enabled = mod.enabled;
+                        ImGui::PushID(mod.name.c_str());
+                        if (ImGui::Checkbox("##on", &enabled))
+                        {
+                            toggle = mod.name;
+                            toggleTo = enabled;
+                        }
+                        ImGui::PopID();
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(mod.name.c_str());
+                        ImGui::TableNextColumn();
+                        if (mod.textures)
+                            ImGui::Text("%zu replacement textures", mod.textures);
+                        if (mod.patches)
+                            ImGui::Text("%zu memory patches", mod.patches);
+                        if (!mod.textures && !mod.patches)
+                            ImGui::TextDisabled("nothing this version can use");
+                    }
+                    ImGui::EndTable();
+                    if (!toggle.empty())
+                        ps2ModsSetEnabled(toggle, toggleTo); // after drawing: rebuilds the list
+                }
+                if (ps2MusicStationSupported())
+                {
+                    ImGui::SeparatorText("Custom Soundtracks (music folder)");
+                    ImGui::TextWrapped("Your own music as a radio station, like the PC versions of GTA III and Vice "
+                                       "City. It plays on the game's silent station slot - one step past the ten "
+                                       "real stations (L1 in a vehicle), shown as \"Custom\". D-pad Left / Right "
+                                       "(F10 on the keyboard) skips tracks.");
+                    changed |= ImGui::Checkbox("Play the music folder on the silent station", &settings.musicStation);
+                    float volume = settings.musicStationVolume * 100.0f;
+                    if (ImGui::SliderFloat("Music volume", &volume, 0.0f, 100.0f, "%.0f%%"))
+                    {
+                        settings.musicStationVolume = volume / 100.0f;
+                        changed = true;
+                    }
+                    if (ImGui::Checkbox("Shuffle", &settings.musicShuffle))
+                    {
+                        changed = true;
+                        ps2MusicStationRescan();
+                    }
+                    if (ImGui::Checkbox("Hold D-pad Down / M in a vehicle turns the radio off", &settings.radioOffEnabled))
+                    {
+                        changed = true;
+                        if (!settings.radioOffEnabled)
+                            ps2MusicStationSetRadioOff(false); // don't strand the radio off
+                    }
+                    ImGui::Text("%zu tracks (MP3, OGG, FLAC, WAV)", ps2MusicStationTrackCount());
+                    ImGui::TextDisabled("%s", ps2MusicStationDirectory().c_str());
+                    if (ImGui::Button("Open music folder"))
+                        ps2OpenFolder(ps2MusicStationDirectory());
+                    ImGui::SameLine();
+                    if (ImGui::Button("Rescan##music"))
+                        ps2MusicStationRescan();
+                }
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
             ImGui::EndTabBar();
+            s_settingsTabRequest = -1;
         }
         ImGui::PopItemWidth();
 
@@ -2636,6 +2894,12 @@ void PS2DebugPanel::drawSettingsMenu(PS2Runtime &runtime)
         }
         ImGui::EndChild();
     }
+    // Controller: Circle (when not backing out of a list, slider or popup) or
+    // Options closes the menu.
+    if (!launch && m_captureAction < 0 && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+        ((ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) && !ImGui::IsAnyItemActive()) ||
+         (ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false) && !ImGui::IsKeyDown(ImGuiKey_GamepadBack))))
+        open = false; // (Start with Select held is the open combo itself)
     ImGui::End();
     ImGui::PopFont();
 

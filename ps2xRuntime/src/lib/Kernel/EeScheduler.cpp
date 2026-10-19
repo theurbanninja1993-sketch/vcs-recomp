@@ -5,6 +5,7 @@
 #include <chrono>
 #include <string>
 #include <map>
+#include <vector>
 #include <cstdlib>
 #include "runtime/ee_scheduler.h"
 
@@ -46,9 +47,42 @@ namespace
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
     constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
-    constexpr auto kVBlankCatchUpLimit = std::chrono::microseconds(4000);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+
+    // PS2X_REGION_WATCH=<hexBase>,<hexSize>: once a second, report which 4 KiB
+    // pages of the region changed since the previous sweep (any writer: guest
+    // stores, host bulk copies, device workers). Opt-in diagnostic for mapping
+    // game-owned memory before relocating the runtime's RPC pools.
+    struct RegionWatch
+    {
+        uint32_t base = 0;
+        uint32_t bytes = 0;
+        bool firstSweep = true;
+        uint32_t reports = 0;
+        std::vector<uint32_t> pageHash;
+        std::vector<bool> reported;
+    };
+    RegionWatch s_regionWatch;
+    const bool s_regionWatchInit = []()
+    {
+        const char *env = std::getenv("PS2X_REGION_WATCH");
+        if (env)
+        {
+            uint32_t base = 0, bytes = 0;
+            if (std::sscanf(env, "%x,%x", &base, &bytes) == 2 && bytes != 0u &&
+                (base & 0x1FFFFFFFu) <= PS2_RAM_SIZE && bytes <= PS2_RAM_SIZE - (base & 0x1FFFFFFFu))
+            {
+                base &= 0x1FFFFFFFu;
+                s_regionWatch.base = base;
+                s_regionWatch.bytes = bytes;
+                const uint32_t pages = (bytes + 0xFFFu) >> 12;
+                s_regionWatch.pageHash.assign(pages, 0u);
+                s_regionWatch.reported.assign(pages, false);
+            }
+        }
+        return true;
+    }();
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
@@ -577,6 +611,11 @@ void ps2PerfLogVBlank(double lateMs, uint64_t eeCycle)
         return;
     static uint64_t s_count = 0, s_late = 0;
     static double s_lostMs = 0.0;
+    // Lateness buckets: distinguishes "many small lates" from "a few big spikes"
+    // (the two feel very different on screen even at the same totals).
+    constexpr size_t kLateBins = 7;
+    static uint64_t s_lateHist[kLateBins] = {};
+    static constexpr double kBinEdge[kLateBins] = {5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 1e18};
     static std::map<std::string, uint64_t> s_lastTicks;
     static uint64_t s_lastCompiled = 0, s_lastInterpreted = 0;
     static auto s_lastTime = std::chrono::steady_clock::now();
@@ -585,6 +624,12 @@ void ps2PerfLogVBlank(double lateMs, uint64_t eeCycle)
     {
         ++s_late;
         s_lostMs += lateMs;
+        for (size_t bin = 0; bin < kLateBins; ++bin)
+            if (lateMs < kBinEdge[bin])
+            {
+                ++s_lateHist[bin];
+                break;
+            }
         static const bool s_each = std::getenv("PS2X_PERF_LOG_EACH") != nullptr;
         if (s_each)
             std::fprintf(s_file, "late f=%llu %.1f ms\n", static_cast<unsigned long long>(g_ps2PresentedFrameCounter.load()), lateMs);
@@ -597,15 +642,30 @@ void ps2PerfLogVBlank(double lateMs, uint64_t eeCycle)
     std::fprintf(s_file, "frame=%llu late=%llu/600 lostMs=%d", static_cast<unsigned long long>(g_ps2PresentedFrameCounter.load()),
                  static_cast<unsigned long long>(s_late), static_cast<int>(s_lostMs));
     {
+        // Lateness distribution (<5, <10, <20, <40, <80, <160, more ms).
+        std::fprintf(s_file, " lateHist=");
+        for (size_t bin = 0; bin < kLateBins; ++bin)
+            std::fprintf(s_file, "%s%llu", bin == 0 ? "" : ",", static_cast<unsigned long long>(s_lateHist[bin]));
+        for (size_t bin = 0; bin < kLateBins; ++bin)
+            s_lateHist[bin] = 0;
+    }
+    {
         // Audio frames produced / dropped (host ring full) this period: real
         // time is ~480480 per 600 VBlanks.
         extern std::atomic<uint64_t> g_ps2AudioFramesSubmitted, g_ps2AudioFramesDropped;
-        static uint64_t s_lastSubmitted = 0, s_lastDropped = 0;
+        extern std::atomic<uint64_t> g_ps2AudioFramesUnderrun;
+        extern std::atomic<uint32_t> g_ps2AudioRingDepth;
+        static uint64_t s_lastSubmitted = 0, s_lastDropped = 0, s_lastUnderrun = 0;
         const uint64_t submitted = g_ps2AudioFramesSubmitted.load(), dropped = g_ps2AudioFramesDropped.load();
-        std::fprintf(s_file, " audio=%llu dropped=%llu", static_cast<unsigned long long>(submitted - s_lastSubmitted),
-                     static_cast<unsigned long long>(dropped - s_lastDropped));
+        const uint64_t underrun = g_ps2AudioFramesUnderrun.load();
+        std::fprintf(s_file, " audio=%llu dropped=%llu underrun=%llu queued=%u",
+                     static_cast<unsigned long long>(submitted - s_lastSubmitted),
+                     static_cast<unsigned long long>(dropped - s_lastDropped),
+                     static_cast<unsigned long long>(underrun - s_lastUnderrun),
+                     g_ps2AudioRingDepth.load());
         s_lastSubmitted = submitted;
         s_lastDropped = dropped;
+        s_lastUnderrun = underrun;
         // EE cycles this period (timers/CTimer); real time is ~2952M.
         static uint64_t s_lastCycle = 0;
         std::fprintf(s_file, " eeMcyc=%llu", static_cast<unsigned long long>((eeCycle - s_lastCycle) / 1000000u));
@@ -617,6 +677,9 @@ void ps2PerfLogVBlank(double lateMs, uint64_t eeCycle)
         extern std::atomic<uint64_t> g_eeTimerWraps[4], g_eeTimerOvfIrqs[4];
         std::fprintf(s_file, " t1wraps=%llu t1ovfIrq=%llu", static_cast<unsigned long long>(g_eeTimerWraps[1].exchange(0)),
                      static_cast<unsigned long long>(g_eeTimerOvfIrqs[1].exchange(0)));
+        // Times the VU1 worker blocked on a full bounded GS queue (delta).
+        extern std::atomic<uint64_t> g_ps2GsSpaceBlocks;
+        std::fprintf(s_file, " gsSpaceBlocks=%llu", static_cast<unsigned long long>(g_ps2GsSpaceBlocks.exchange(0)));
     }
     // Thread CPU from /proc (ticks are 1/100 s), summed per thread name.
     std::map<std::string, uint64_t> ticks;
@@ -2091,7 +2154,22 @@ void EeScheduler::processDueDeadlines()
                 // wake-up jitter is still made up so the average stays 60 Hz.
                 auto anchor = scheduled.hostDeadline;
                 const auto now = std::chrono::steady_clock::now();
-                if (now - anchor > kVBlankCatchUpLimit)
+                // PS2X_VBLANK_CATCHUP_MS: how much lateness a VBlank may still
+                // make up. Beyond this the anchor jumps to now, so the deficit
+                // is dropped and never recovered - one long frame costs frame
+                // rate for the rest of the session. Ported from the VCS port's
+                // validated change (default 50 ms, was 4 ms upstream; VCS
+                // measured 51.2 -> 58.6 fps at matched scene density - the loss
+                // is in the tail, not the mean). No audio speed-up or lurching
+                // because the IOP is clocked by real time (advanceIopVBlank),
+                // which was the reason for the original 4 ms cap.
+                static const auto s_catchUpLimit = []()
+                {
+                    const char *env = std::getenv("PS2X_VBLANK_CATCHUP_MS");
+                    return env ? std::chrono::microseconds(std::strtoll(env, nullptr, 10) * 1000)
+                               : std::chrono::microseconds(50'000); // 50 ms
+                }();
+                if (now - anchor > s_catchUpLimit)
                     anchor = now;
                 ps2PerfLogVBlank(std::chrono::duration<double, std::milli>(now - scheduled.hostDeadline).count(), m_eeCycle);
                 static const bool s_stats = std::getenv("PS2X_SYNC_STATS") != nullptr;
@@ -2138,6 +2216,39 @@ void EeScheduler::processEvent(const EeEvent &event)
         m_runtime.advanceIopVBlank();
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+        // PS2X_DUMP_RAM_VSYNC=<tick>[,<tick>...]: write EE RAM at an exact guest
+        // VBlank. PS2X_DUMP_RAM_FRAME only runs on the presentation path, which
+        // headless runs never take, so A/B memory probes had no deterministic
+        // trigger; this one fires on the executor thread at the exact tick.
+        {
+            static const std::vector<uint64_t> s_dumpVsyncs = []()
+            {
+                std::vector<uint64_t> ticks;
+                if (const char *env = std::getenv("PS2X_DUMP_RAM_VSYNC"))
+                {
+                    for (const char *p = env; *p;)
+                    {
+                        char *end = nullptr;
+                        ticks.push_back(std::strtoull(p, &end, 10));
+                        p = (*end == ',') ? end + 1 : end;
+                        if (end == p && *p != 0)
+                            break;
+                    }
+                }
+                return ticks;
+            }();
+            if (m_rdram && !s_dumpVsyncs.empty() &&
+                std::find(s_dumpVsyncs.begin(), s_dumpVsyncs.end(), m_vsyncTick) != s_dumpVsyncs.end())
+            {
+                const std::string path = "ram_v" + std::to_string(m_vsyncTick) + ".bin";
+                if (FILE *file = std::fopen(path.c_str(), "wb"))
+                {
+                    std::fwrite(m_rdram, 1, PS2_RAM_SIZE, file);
+                    std::fclose(file);
+                }
+                std::cerr << "[ram:dump] vsync=" << m_vsyncTick << std::endl;
+            }
+        }
         if ((m_vsyncTick & 1u) != 0u)
         {
             m_runtime.memory().gs().csr.fetch_or(0x2000ull, std::memory_order_acq_rel);
@@ -2154,6 +2265,31 @@ void EeScheduler::processEvent(const EeEvent &event)
             {
                 std::memcpy(m_rdram + physical, &m_vsyncTick, sizeof(m_vsyncTick));
             }
+        }
+        if (s_regionWatch.base != 0u && (m_vsyncTick % 60u) == 0u)
+        {
+            // 1 Hz sweep: FNV-1a per 4 KiB page, one report per changed page.
+            const uint32_t pages = static_cast<uint32_t>(s_regionWatch.pageHash.size());
+            for (uint32_t p = 0; p < pages; ++p)
+            {
+                const uint32_t addr = s_regionWatch.base + p * 0x1000u;
+                uint32_t h = 0x811C9DC5u;
+                for (uint32_t off = 0; off < 0x1000u; off += 4u)
+                {
+                    uint32_t w = 0u;
+                    std::memcpy(&w, m_rdram + addr + off, 4u);
+                    h = (h ^ w) * 0x01000193u;
+                }
+                if (!s_regionWatch.firstSweep && h != s_regionWatch.pageHash[p] &&
+                    !s_regionWatch.reported[p] && s_regionWatch.reports < 256u)
+                {
+                    ++s_regionWatch.reports;
+                    s_regionWatch.reported[p] = true;
+                    std::cerr << std::hex << "[region-watch] page 0x" << addr << " changed\n" << std::dec;
+                }
+                s_regionWatch.pageHash[p] = h;
+            }
+            s_regionWatch.firstSweep = false;
         }
         m_vsyncFlagAddress = 0u;
         m_vsyncTickAddress = 0u;

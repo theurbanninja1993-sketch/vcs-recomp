@@ -5,6 +5,8 @@
 #include "ps2x/iop/iop_host.h"
 
 #include <string>
+#include <cstdlib>
+#include <sstream>
 
 namespace ps2x::iop::detail
 {
@@ -30,12 +32,20 @@ namespace ps2x::iop::detail
             const uint32_t address = a0 == 2u
                                          ? m_memory.allocate(a1, 16u, a2)
                                          : m_memory.allocate(a1, 16u);
+            if (std::getenv("PS2X_IOP_ALLOC_TRACE"))
+            {
+                std::ostringstream out;
+                out << "[IOP sysmem] alloc mode=" << a0 << " size=" << a1
+                    << " address=0x" << std::hex << address << " ra=0x" << cpu.gpr[31];
+                m_host.log(LogLevel::Info, out.str());
+            }
             if (address == 0u)
             {
                 m_host.log(LogLevel::Warning,
                            "[IOP] AllocSysMemory failed: mode=" + std::to_string(a0) +
                                " size=" + std::to_string(a1) +
-                               " maxFree=" + std::to_string(m_memory.maxFreeMemory()));
+                               " maxFree=" + std::to_string(m_memory.maxFreeMemory()) +
+                               " totalFree=" + std::to_string(m_memory.totalFreeMemory()));
             }
             setV0(address);
             return true;
@@ -47,8 +57,10 @@ namespace ps2x::iop::detail
             setV0(IopMemory::RamSize);
             return true;
         case 7: // QueryMaxFreeMemSize
-        case 8: // QueryTotalFreeMemSize
             setV0(m_memory.maxFreeMemory());
+            return true;
+        case 8: // QueryTotalFreeMemSize
+            setV0(m_memory.totalFreeMemory());
             return true;
         case 9: // QueryBlockTopAddress
             if (const auto block = m_memory.allocationContaining(a0))

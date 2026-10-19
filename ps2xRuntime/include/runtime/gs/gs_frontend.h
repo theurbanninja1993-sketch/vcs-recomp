@@ -2,11 +2,13 @@
 #define PS2_GS_FRONTEND_H
 
 #include <atomic>
+#include "runtime/ps2_spinlock.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "runtime/gs/gs_backend.h"
@@ -44,9 +46,11 @@ struct GSDebugSnapshot
 
 // Show the game's two-circuit flicker-filter blend (true, as on a PS2) or
 // only one circuit (sharper). Set from the host settings.
+
 extern std::atomic<bool> g_gsFlickerFilter;
 
-enum class GSDebugEventKind : uint8_t
+enum
+class GSDebugEventKind : uint8_t
 {
     GifTag = 0,
     Register = 1,
@@ -135,12 +139,38 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    // The composed display as a GL texture, when the GPU renderer shares the
+    // host window's context: the host draws it directly instead of uploading
+    // pixels. Returns 0 when the frame is a CPU one (then use
+    // copyLatchedHostPresentationFrame). The texture belongs to the renderer
+    // and stays valid until it is reused a couple of frames later.
+    uint32_t latchedHostPresentationGlTexture(uint32_t &outWidth, uint32_t &outHeight) const;
+
+    // Frame interpolation: ask the renderer for a frame synthesized from the last
+    // composed one, warped forward by half the last camera motion, and hand back
+    // its GL texture (0 when it cannot make one). Blocking - the caller draws it
+    // immediately - and only meaningful when the renderer shares the host's
+    // context, since the texture is a plain GL id.
+    uint32_t synthesizeFrame(float phase, uint32_t &outWidth, uint32_t &outHeight);
+    // Non-blocking: request a frame for displayTime (steady_clock seconds);
+    // latestSynthesis returns the newest finished one (texture 0 = show the
+    // plain picture).
+    void requestSynthesis(double displayTime);
+    bool latestSynthesis(uint32_t &texture, uint32_t &width, uint32_t &height, uint64_t &seq);
+    // The same frame as pixels, when the platform cannot share GL contexts (see
+    // gs_gpu_renderer.h). False and an empty buffer when the texture route is used.
+    bool latestSynthesisPixels(std::vector<uint8_t> &pixels);
+
+    // Hands the latched frame to the caller (no copy when it is already packed
+    // at its width, which the upscaled GPU path always is), so this is not
+    // const: it takes the frame.
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
                                           uint32_t *outDisplayFbp = nullptr,
                                           uint32_t *outSourceFbp = nullptr,
-                                          bool *outUsedPreferred = nullptr) const;
+                                          bool *outUsedPreferred = nullptr,
+                                          uint64_t *outFrameId = nullptr);
     bool clearFramebufferContext(uint32_t contextIndex, uint32_t rgba);
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
@@ -185,7 +215,7 @@ private:
     uint8_t *m_localMemoryStorage = nullptr;
     uint32_t m_localMemorySize = 0u;
     struct GSRegisters *m_privRegs = nullptr;
-    mutable std::recursive_mutex m_stateMutex;
+    mutable Ps2SpinLock m_stateMutex;
     mutable std::mutex m_backendLifetimeMutex;
     mutable std::mutex m_presentationMutex;
 
@@ -227,6 +257,10 @@ private:
     GSFrameReg m_preferredDisplaySourceFrame{};
     uint32_t m_preferredDisplayDestFbp = 0;
     bool m_hasPreferredDisplaySource = false;
+    // The camera of the picture last copied to the display (frame interpolation).
+    Ps2CameraState m_displayCamera{};
+    bool m_hasDisplayCamera = false;
+    uint64_t m_sceneCameraPos = ~1ull; // stream position of the last scene-camera lookup
     std::vector<uint8_t> m_hostPresentationFrame;
     uint32_t m_hostPresentationWidth = 0;
     uint32_t m_hostPresentationRowPixels = 0; // 0: kHostFrameWidth
@@ -235,6 +269,16 @@ private:
     uint32_t m_hostPresentationSourceFbp = 0;
     bool m_hostPresentationUsedPreferred = false;
     bool m_hasHostPresentationFrame = false;
+    uint32_t m_hostPresentationGlTexture = 0; // non-zero: a GPU frame (no pixels)
+    uint32_t m_hostPresentationGlWidth = 0;
+    uint32_t m_hostPresentationGlHeight = 0;
+    // Every GS input (packet, register, image upload) bumps the sequence; the
+    // frame id only changes when a new picture is actually latched, so the
+    // host can skip recomposing and re-uploading a repeat present.
+    uint64_t m_gsInputSeq = 0;
+    // Sentinel: the first latch always presents.
+    uint64_t m_hostPresentationInputSeq = ~0ull;
+    uint64_t m_hostPresentationFrameId = 0;
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
 

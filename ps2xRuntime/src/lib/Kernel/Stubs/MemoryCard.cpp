@@ -790,12 +790,25 @@ namespace ps2_stubs
                             dirEntries.push_back(entry);
                         }
 
+                        // A real card lists a directory in the order its entries were
+                        // created: the game's fixed files first, numbered saves last.
+                        // The Stories games find saves by their position in that listing
+                        // (VCS scans entries 5..14 for the slot digit), so a plain
+                        // alphabetical order - which puts "1: ..." first - hides them
+                        // and the game starts a new one. Named files first, then
+                        // numbered ones, each group alphabetical (deterministic on any
+                        // host filesystem). Same fix as VCS 905abf2.
                         std::sort(dirEntries.begin(), dirEntries.end(),
                                   [](const std::filesystem::directory_entry &lhs,
                                      const std::filesystem::directory_entry &rhs)
                                   {
-                                      return toLowerAscii(lhs.path().filename().string()) <
-                                             toLowerAscii(rhs.path().filename().string());
+                                      const auto numbered = [](const std::string &name)
+                                      { return !name.empty() && name[0] >= '0' && name[0] <= '9'; };
+                                      const std::string l = toLowerAscii(lhs.path().filename().string());
+                                      const std::string r = toLowerAscii(rhs.path().filename().string());
+                                      if (numbered(l) != numbered(r))
+                                          return !numbered(l);
+                                      return l < r;
                                   });
 
                         for (const auto &entry : dirEntries)

@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <cstdint>
+#include <chrono>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -508,6 +509,7 @@ private:
     // IOP time follows the VBlank clock (real time), not the EE cycle count
     // (recompiled code over-counts busy stretches): see advanceIopEeCycles.
     uint64_t m_iopEeAllowed = 0; // EE cycles of IOP time real time allows so far
+    std::chrono::steady_clock::time_point m_iopLastReal{};
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
     PS2RomDevice m_romDevice;

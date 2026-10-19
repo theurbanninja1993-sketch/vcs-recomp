@@ -542,6 +542,8 @@ namespace GSMem
 
     // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
+    // Byte address in local memory of pixel (x, y) (P4: the byte holding its nibble).
+    u32 PixelByteAddress(u32 psm, u32 bp, u32 bw, u32 x, u32 y);
 
 	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
@@ -562,6 +564,31 @@ namespace GSMem
 	void WriteP4HL(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 
 	void WriteNull(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
+
+	// Writes count pixels of one row, (x, y) to (x + count - 1, y), in one
+	// call (the per-pixel writer inlined). Returns false for a psm without a
+	// row writer (use the per-pixel functions).
+	bool WriteRow(u32 psm, u8* data, u32 bp, u32 bw, u32 x, u32 y, const u32* values, u32 count);
+
+	// Writes one whole 32x16 4-bit tile - exactly the 256-byte GS block at
+	// (tileX, tileY), which must be a multiple of 32 / 16 - straight from
+	// row-major 4-bit source data (`src` is the tile's top-left pixel, `src`
+	// rows `srcRowBytes` apart). Used for upload mirroring: it is ~3x faster
+	// than per-pixel WriteRow because the block is written in one pass, with
+	// the (fixed) in-block nibble layout applied by a lookup instead of the
+	// page/block/column walk per pixel.
+	void WriteT4Tile(u8* data, u32 bp, u32 bw, u32 tileX, u32 tileY, const u8* src, u32 srcRowBytes);
+	// Source offset and shift for the two nibbles of each destination byte, so
+	// the T4 mirror's inner loop needs no (x, y) lookup or multiply.
+	struct T4TileTables
+	{
+		u32 loOffset[256];
+		u32 hiOffset[256];
+		u8 loShift[256];
+		u8 hiShift[256];
+	};
+	T4TileTables BuildT4TileTables(u32 srcRowBytes);
+	void WriteT4Tile(u8* data, u32 bp, u32 bw, u32 tileX, u32 tileY, const u8* src, const T4TileTables& tables);
 
 	u32 ReadCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y);
 	u32 ReadZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y);

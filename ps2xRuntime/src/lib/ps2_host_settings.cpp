@@ -1,3 +1,4 @@
+#include <cmath>
 #include "runtime/ps2_host_settings.h"
 
 #include "raylib.h"
@@ -63,6 +64,13 @@ namespace ps2controls
         car[PadLT] = Square;
         car[PadRB] = R1;
         car[PadLB] = L1;
+        // Menus keep the classic map in every layout: menu navigation must not
+        // depend on the gameplay bindings (and vice versa). One modern
+        // convention on top: B is the back button. The game's own menus read
+        // Triangle as back, so B sends Triangle; X and Y keep the base game's
+        // Square (target) and Triangle roles on the map.
+        int *menus = map[Menus];
+        menus[PadB] = Triangle;
     }
 
     const char *actionName(int action)
@@ -71,7 +79,7 @@ namespace ps2controls
             "Move forward / accelerate", "Move back / brake", "Move / steer left", "Move / steer right", "Sprint",
             "Jump", "Fire / attack", "Aim / lock on", "Action", "Next weapon", "Enter / exit vehicle", "Handbrake",
             "Horn", "Camera mode", "Look behind", "Pause", "Menu: accept", "Menu: back", "Menu: up", "Menu: down",
-            "Menu: left", "Menu: right"};
+            "Menu: left", "Menu: right", "Map: target", "Skip cutscene"};
         return action >= 0 && action < kActionCount ? kNames[action] : "?";
     }
 
@@ -102,10 +110,14 @@ namespace ps2controls
         set(Pause, KEY_ESCAPE, KEY_P);
         set(MenuAccept, KEY_ENTER, KEY_KP_ENTER);
         set(MenuBack, KEY_BACKSPACE);
-        set(MenuUp, KEY_UP);
-        set(MenuDown, KEY_DOWN);
-        set(MenuLeft, KEY_LEFT);
-        set(MenuRight, KEY_RIGHT);
+        // The menu keys: the arrows plus WASD (in the game's menus the gameplay
+        // bindings are ignored, so the movement keys need their own menu row).
+        set(MenuUp, KEY_UP, KEY_W);
+        set(MenuDown, KEY_DOWN, KEY_S);
+        set(MenuLeft, KEY_LEFT, KEY_A);
+        set(MenuRight, KEY_RIGHT, KEY_D);
+        set(MapTarget, KEY_SPACE); // Square on the map; Backspace is Triangle (back / legend)
+        set(SkipCutscene, KEY_ENTER, KEY_KP_ENTER); // Cross, like every GTA cutscene skip
     }
 
     std::string bindingName(int binding)
@@ -227,13 +239,52 @@ void ps2HostSettingsLoad()
         else if (key == "mouse_sensitivity")
             s.mouseSensitivity = std::clamp(std::strtof(v, nullptr), 0.05f, 20.0f);
         else if (key == "internal_scale")
-            s.internalScale = std::clamp(std::atoi(v), 1, 4);
+            s.internalScale = std::clamp(std::atoi(v), 0, 4); // 0 = Auto
+        else if (key == "vsync")
+            s.vsync = std::atoi(v) != 0;
+        else if (key == "pnach_cheats")
+            s.pnachCheats = std::atoi(v) != 0;
+        else if (key == "mods_disabled")
+        {
+            s.disabledMods.clear();
+            size_t start = 0;
+            while (start <= value.size())
+            {
+                const size_t bar = value.find('|', start);
+                const std::string name = value.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+                if (!name.empty())
+                    s.disabledMods.push_back(name);
+                if (bar == std::string::npos)
+                    break;
+                start = bar + 1;
+            }
+        }
         else if (key == "flicker_filter")
             s.flickerFilter = std::atoi(v) != 0;
+        else if (key == "motion_blur")
+            s.motionBlurOff = std::atoi(v) == 1; // 0 = PS2 (original), 1 = off (same values as VCS)
+        else if (key == "controller")
+            s.controllerName = value;
+        else if (key == "draw_distance")
+            s.drawDistance = std::clamp(std::strtof(v, nullptr), 0.5f, 4.0f);
+        else if (key == "music_station")
+            s.musicStation = std::atoi(v) != 0;
+        else if (key == "music_shuffle")
+            s.musicShuffle = std::atoi(v) != 0;
+        else if (key == "music_station_volume")
+            s.musicStationVolume = std::clamp(std::strtof(v, nullptr), 0.0f, 1.0f);
+        else if (key == "radio_off_enabled")
+            s.radioOffEnabled = std::atoi(v) != 0;
+        else if (key == "free_aim")
+            s.freeAim = std::atoi(v) != 0;
+        else if (key == "mouse_turns_player")
+            s.mouseTurnsPlayer = std::atoi(v) != 0;
         else if (key == "mouse_invert_y")
             s.mouseInvertY = std::atoi(v) != 0;
         else if (key == "show_at_launch")
             s.showAtLaunch = std::atoi(v) != 0;
+        else if (key == "show_fps")
+            s.showFps = std::atoi(v) != 0;
         else if (key == "gamepad_layout")
         {
             s.gamepadLayout = static_cast<ps2controls::GamepadLayout>(clampMode(std::atoi(v)));
@@ -273,15 +324,28 @@ void ps2HostSettingsLoad()
     ps2HostSettingsApplyRenderer();
 }
 
+// Auto: the smallest whole multiple of the PS2's 448 lines that roughly covers
+// the window (90% of its height), 1x-4x: 720p -> 2x, 1080p and 1440p -> 3x,
+// 4K -> 4x. The renderer only works in whole multiples.
+int ps2HostSettingsEffectiveScale()
+{
+    if (g_settings.internalScale >= 1)
+        return g_settings.internalScale;
+    const int height = IsWindowReady() ? GetScreenHeight() : 1080;
+    const int wanted = static_cast<int>(std::ceil(0.9 * static_cast<double>(std::max(height, 1)) / 448.0));
+    return std::clamp(wanted, 1, 4);
+}
+
 void ps2HostSettingsApplyRenderer()
 {
     // PS2X_GS_SCALE (tests) wins over the saved value at startup.
     static const char *s_envScale = std::getenv("PS2X_GS_SCALE");
     static bool s_first = true;
     if (!(s_first && s_envScale))
-        g_gsGpuScaleRequest.store(static_cast<uint32_t>(g_settings.internalScale), std::memory_order_relaxed);
+        g_gsGpuScaleRequest.store(static_cast<uint32_t>(ps2HostSettingsEffectiveScale()), std::memory_order_relaxed);
     s_first = false;
     g_gsFlickerFilter.store(g_settings.flickerFilter, std::memory_order_relaxed);
+    g_gsMotionBlurOff.store(g_settings.motionBlurOff, std::memory_order_relaxed);
 }
 
 bool ps2HostSettingsFirstLaunch()
@@ -309,16 +373,32 @@ void ps2HostSettingsSave()
     }
     out << "# PS2Recomp host settings (also editable in game: F2)\n"
         << "show_at_launch=" << (s.showAtLaunch ? 1 : 0) << "\n"
+        << "show_fps=" << (s.showFps ? 1 : 0) << "\n"
         << "display_mode=" << static_cast<int>(s.displayMode) << "\n"
         << "window_width=" << s.windowWidth << "\n"
         << "window_height=" << s.windowHeight << "\n"
         << "aspect=" << static_cast<int>(s.aspect) << "\n"
         << "smooth_filtering=" << (s.smoothFiltering ? 1 : 0) << "\n"
         << "internal_scale=" << s.internalScale << "\n"
+        << "vsync=" << (s.vsync ? 1 : 0) << "\n"
+        << "pnach_cheats=" << (s.pnachCheats ? 1 : 0) << "\n"
         << "flicker_filter=" << (s.flickerFilter ? 1 : 0) << "\n"
+        << "motion_blur=" << (s.motionBlurOff ? 1 : 0) << "\n"
+        << "controller=" << s.controllerName << "\n"
+        << "draw_distance=" << s.drawDistance << "\n"
+        << "music_station=" << (s.musicStation ? 1 : 0) << "\n"
+        << "music_shuffle=" << (s.musicShuffle ? 1 : 0) << "\n"
+        << "music_station_volume=" << s.musicStationVolume << "\n"
+        << "radio_off_enabled=" << (s.radioOffEnabled ? 1 : 0) << "\n"
+        << "free_aim=" << (s.freeAim ? 1 : 0) << "\n"
+        << "mouse_turns_player=" << (s.mouseTurnsPlayer ? 1 : 0) << "\n"
         << "mouse_sensitivity=" << s.mouseSensitivity << "\n"
         << "mouse_invert_y=" << (s.mouseInvertY ? 1 : 0) << "\n"
         << "gamepad_layout=" << static_cast<int>(s.gamepadLayout) << "\n";
+    out << "mods_disabled=";
+    for (size_t i = 0; i < s.disabledMods.size(); ++i)
+        out << (i ? "|" : "") << s.disabledMods[i];
+    out << "\n";
     // Load sees the layout before the per-button lines.
     if (s.gamepadLayout == ps2controls::GamepadLayout::Custom)
         for (int context = 0; context < ps2controls::kContextCount; ++context)
@@ -337,6 +417,28 @@ void ps2HostSettingsRequestWindowApply()
 void ps2HostSettingsApplyWindow()
 {
     PS2HostSettings &s = g_settings;
+    // VSync, applied when it changes (the host calls this every frame).
+    static int s_appliedVsync = -1;
+    if (s_appliedVsync != (s.vsync ? 1 : 0))
+    {
+        s_appliedVsync = s.vsync ? 1 : 0;
+        if (s.vsync)
+            SetWindowState(FLAG_VSYNC_HINT);
+        else
+            ClearWindowState(FLAG_VSYNC_HINT);
+    }
+    // Auto internal resolution follows the window size.
+    if (s.internalScale == 0)
+    {
+        static int s_lastAuto = 0;
+        const int scale = ps2HostSettingsEffectiveScale();
+        if (scale != s_lastAuto)
+        {
+            s_lastAuto = scale;
+            if (std::getenv("PS2X_GS_SCALE") == nullptr)
+                g_gsGpuScaleRequest.store(static_cast<uint32_t>(scale), std::memory_order_relaxed);
+        }
+    }
     if (!g_windowApplyPending)
     {
         // Remember a window resized by hand.

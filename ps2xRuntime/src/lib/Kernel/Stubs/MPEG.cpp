@@ -558,6 +558,10 @@ namespace ps2_stubs
             uint64_t pictureIntervalQ32 = kDefaultPictureIntervalQ32;
             uint64_t nextPictureTickQ32 = std::numeric_limits<uint64_t>::max();
             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
+            // Guest tick of the last served picture. Lets sceMpegIsEnd tell a
+            // skipped movie (the guest stops pulling; the decoded queue then
+            // never drains) from normal playback, which pulls every interval.
+            uint64_t lastPictureServedTickQ32 = 0u;
             int64_t firstPresentedPts90k = -1;
             uint64_t ptsPresentationBaseTickQ32 = 0u;
         };
@@ -1492,7 +1496,13 @@ namespace ps2_stubs
             constexpr size_t kMaxPendingVideoBytes = 512u * 1024u;
             if (!g_mpeg_stub_state.currentCdStreamEofSeen && playback.pendingEsBytes > kMaxPendingVideoBytes)
                 return true;
-            static const size_t s_maxQueuedAudio = std::getenv("PS2X_MPEG_AUDIO_THROTTLE") ? std::strtoul(std::getenv("PS2X_MPEG_AUDIO_THROTTLE"), nullptr, 10) : 0u;
+            // On by default (one refused packet): LCS's player leaves its main loop -
+            // the only place it refills the SPU's AutoDMA buffer - once the whole
+            // file is demuxed. Without the throttle the HLE demuxed a logo movie in
+            // ~1.3 s, the refills stopped and the SPU looped 128 ms of stale audio
+            // (the stuttering sirens). PS2X_MPEG_AUDIO_THROTTLE=<n> changes the
+            // limit, 0 disables it.
+            static const size_t s_maxQueuedAudio = std::getenv("PS2X_MPEG_AUDIO_THROTTLE") ? std::strtoul(std::getenv("PS2X_MPEG_AUDIO_THROTTLE"), nullptr, 10) : 1u;
             if (s_maxQueuedAudio != 0u && queuedAudioCallbacks() > s_maxQueuedAudio)
                 return true;
             // Let EOF finalization drain any tail that is already in the guest
@@ -2665,6 +2675,7 @@ namespace ps2_stubs
                 playback.picturesServed += 1u;
                 playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
+                playback.lastPictureServedTickQ32 = currentTickQ32;
                 haveFrame = true;
                 if (g_mpeg_stub_state.pictureTraceCount < 32u)
                 {
@@ -2768,6 +2779,30 @@ namespace ps2_stubs
             presentationEnd == std::numeric_limits<uint64_t>::max() ||
             currentTickQ32 >= presentationEnd;
 
+        // A skipped movie stops pulling pictures, so the decoded queue never
+        // drains and the game spins in its end-wait loop forever (observed hang
+        // when skipping the intro movies). Treat a stream the guest has stopped
+        // consuming for PS2X_MPEG_ABANDON_TICKS guest ticks (default 180 = 3 s)
+        // as drained: the app has abandoned it, and its own teardown clears the
+        // remaining frames. Normal playback pulls every picture interval, so it
+        // never trips this.
+        static const uint64_t s_abandonTicks = []()
+        {
+            const char *env = std::getenv("PS2X_MPEG_ABANDON_TICKS");
+            const unsigned long long value = env ? std::strtoull(env, nullptr, 10) : 0ull;
+            return value != 0ull ? value : 180ull;
+        }();
+        const bool abandoned =
+            !playback.decodedFrames.empty() && playback.lastPictureServedTickQ32 != 0u &&
+            currentTickQ32 > playback.lastPictureServedTickQ32 + (s_abandonTicks << 32u);
+        if (abandoned)
+        {
+            static uint32_t s_abandonLogs = 0u;
+            if (s_abandonLogs++ < 8u)
+                std::cerr << "[mpeg:is-end] treating abandoned stream as ended mpeg=0x" << std::hex << mpegAddr
+                          << std::dec << " queued=" << playback.decodedFrames.size() << "\n";
+        }
+
         if (g_mpeg_stub_state.isEndTraceCount < 16u)
         {
             PS2_IF_AGRESSIVE_LOGS({
@@ -2783,7 +2818,7 @@ namespace ps2_stubs
             ++g_mpeg_stub_state.isEndTraceCount;
         }
 
-        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && presentationComplete) ? 1 : 0);
+        setReturnS32(ctx, (ended && (playback.decodedFrames.empty() || abandoned) && presentationComplete) ? 1 : 0);
     }
 
     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

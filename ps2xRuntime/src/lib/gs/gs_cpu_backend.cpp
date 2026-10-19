@@ -1648,104 +1648,126 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     const uint32_t dbp = m_transfer.bitbltbuf.dbp;
     const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);
     const uint8_t dpsm = m_transfer.bitbltbuf.dpsm;
-    const uint32_t rrw = m_transfer.trxreg.rrw;
     const uint32_t dsax = m_transfer.trxpos.dsax;
-    uint32_t offset = 0u;
-    auto writeUpload = [this](uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+    const uint32_t xEnd = dsax + m_transfer.trxreg.rrw;
+    const uint32_t total = m_transferState.totalPixels;
+    const uint32_t rrw = m_transfer.trxreg.rrw;
+    const uint32_t rrh = m_transfer.trxreg.rrh;
+    const bool writes = m_uploadWrites;
+    // Whole-image 4-bit (T4) uploads that land on 32x16 tile boundaries - all
+    // of VCS's T4 texture uploads do - are mirrored tile by tile (256-byte GS
+    // blocks) instead of pixel by pixel: ~3x faster, and this is the mirror
+    // path that costs the most while a texture pack is active. The fallback
+    // below handles every other shape, unchanged.
+    if (writes && (dpsm & 0x3Fu) == GS_PSM_T4 && m_transferState.copiedPixels == 0u && sizeBytes >= (total + 1u) / 2u &&
+        (dsax & 31u) == 0u && (m_transfer.trxpos.dsay & 15u) == 0u && (rrw & 31u) == 0u && (rrh & 15u) == 0u)
     {
-        if (m_uploadWrites)
-            WriteVramUnlocked(psm, bp, bw, x, y, value);
+        const uint32_t srcRowBytes = rrw / 2u;
+        const GSMem::T4TileTables tables = GSMem::BuildT4TileTables(srcRowBytes);
+        for (uint32_t tileY = 0; tileY < rrh; tileY += 16u)
+            for (uint32_t tileX = 0; tileX < rrw; tileX += 32u)
+                GSMem::WriteT4Tile(m_vram, dbp, dbw, dsax + tileX, m_transfer.trxpos.dsay + tileY,
+                                   data + tileY * srcRowBytes + tileX / 2u, tables);
+        m_transferState.copiedPixels = total;
+        m_transferState.direction = 3u;
+        m_transferState.totalPixels = 0u;
+        return;
+    }
+    // Row-wise: x/y advance incrementally (no divide per pixel) and the
+    // format's writer is looked up once - this runs for every texture upload
+    // while a texture pack is active (the CPU copy that textures are hashed from).
+    const auto write = m_writeVramFuncs[dpsm & 0x3Fu];
+    uint32_t copied = m_transferState.copiedPixels;
+    uint32_t x = m_transferState.x, y = m_transferState.y;
+    // Pixels are gathered per row and written with GSMem::WriteRow.
+    uint32_t run[256];
+    uint32_t runLength = 0, runX = x, runY = y;
+    auto flush = [&]()
+    {
+        if (runLength != 0u && writes && !GSMem::WriteRow(dpsm, m_vram, dbp, dbw, runX, runY, run, runLength))
+            for (uint32_t i = 0; i < runLength; ++i)
+                write(m_vram, dbp, dbw, runX + i, runY, run[i]);
+        runLength = 0;
     };
-
-    auto advancePixel = [&](uint32_t count)
+    auto put = [&](uint32_t value)
     {
-        const uint32_t totalPixels = m_transferState.totalPixels;
-        m_transferState.copiedPixels =
-            std::min<uint32_t>(totalPixels, m_transferState.copiedPixels + count);
-
-        if (m_transferState.copiedPixels >= totalPixels)
+        if (runLength == 0u)
         {
-            m_transferState.direction = 3u;
-            m_transferState.totalPixels = 0u;
-            return;
+            runX = x;
+            runY = y;
         }
-
-        m_transferState.x = dsax + (m_transferState.copiedPixels % rrw);
-        m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
+        run[runLength++] = value;
+        if (++x == xEnd)
+        {
+            x = dsax;
+            ++y;
+            flush();
+        }
+        else if (runLength == 256u)
+            flush();
+        ++copied;
     };
 
-    while (offset < sizeBytes && m_transferState.direction == 0u)
+    uint32_t offset = 0u;
+    switch (dpsm)
     {
-        switch (dpsm)
+    case GS_PSM_CT32:
+    case GS_PSM_Z32:
+        for (; copied < total && sizeBytes - offset >= 4u; offset += 4u)
         {
-        case GS_PSM_CT32:
-        case GS_PSM_Z32:
-        {
-            if (sizeBytes - offset < 4u)
-                return;
             uint32_t value = 0u;
             std::memcpy(&value, data + offset, sizeof(value));
-            writeUpload(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
-            offset += 4u;
-            advancePixel(1u);
-            break;
+            put(value);
         }
-        case GS_PSM_CT24:
-        case GS_PSM_Z24:
+        break;
+    case GS_PSM_CT24:
+    case GS_PSM_Z24:
+        for (; copied < total && sizeBytes - offset >= 3u; offset += 3u)
+            put(static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
+                (static_cast<uint32_t>(data[offset + 2u]) << 16u));
+        break;
+    case GS_PSM_CT16:
+    case GS_PSM_CT16S:
+    case GS_PSM_Z16:
+    case GS_PSM_Z16S:
+        for (; copied < total && sizeBytes - offset >= 2u; offset += 2u)
         {
-            if (sizeBytes - offset < 3u)
-                return;
-            const uint32_t value = static_cast<uint32_t>(data[offset]) |
-                                   (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
-                                   (static_cast<uint32_t>(data[offset + 2u]) << 16u);
-            writeUpload(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
-            offset += 3u;
-            advancePixel(1u);
-            break;
-        }
-        case GS_PSM_CT16:
-        case GS_PSM_CT16S:
-        case GS_PSM_Z16:
-        case GS_PSM_Z16S:
-        {
-            if (sizeBytes - offset < 2u)
-                return;
             uint16_t value = 0u;
             std::memcpy(&value, data + offset, sizeof(value));
-            writeUpload(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
-            offset += 2u;
-            advancePixel(1u);
-            break;
+            put(value);
         }
-        case GS_PSM_T8:
-        case GS_PSM_T8H:
-            writeUpload(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, data[offset++]);
-            advancePixel(1u);
-            break;
-        case GS_PSM_T4:
-        case GS_PSM_T4HL:
-        case GS_PSM_T4HH:
+        break;
+    case GS_PSM_T8:
+    case GS_PSM_T8H:
+        for (; copied < total && offset < sizeBytes; ++offset)
+            put(data[offset]);
+        break;
+    case GS_PSM_T4:
+    case GS_PSM_T4HL:
+    case GS_PSM_T4HH:
+        for (; copied < total && offset < sizeBytes; ++offset)
         {
-            const uint8_t packed = data[offset++];
-            const uint32_t firstPixel = m_transferState.copiedPixels;
-            writeUpload(dpsm, dbp, dbw,
-                              dsax + (firstPixel % rrw),
-                              m_transfer.trxpos.dsay + (firstPixel / rrw),
-                              packed & 0x0Fu);
-            if (firstPixel + 1u < m_transferState.totalPixels)
-            {
-                const uint32_t secondPixel = firstPixel + 1u;
-                writeUpload(dpsm, dbp, dbw,
-                                  dsax + (secondPixel % rrw),
-                                  m_transfer.trxpos.dsay + (secondPixel / rrw),
-                                  (packed >> 4u) & 0x0Fu);
-            }
-            advancePixel(std::min<uint32_t>(2u, m_transferState.totalPixels - firstPixel));
-            break;
+            const uint8_t packed = data[offset];
+            put(packed & 0x0Fu);
+            if (copied < total)
+                put((packed >> 4u) & 0x0Fu);
         }
-        default:
-            return;
-        }
+        break;
+    default:
+        return;
+    }
+    flush();
+
+    m_transferState.copiedPixels = copied;
+    if (copied >= total)
+    {
+        m_transferState.direction = 3u;
+        m_transferState.totalPixels = 0u;
+    }
+    else
+    {
+        m_transferState.x = x;
+        m_transferState.y = y;
     }
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include "runtime/ps2_camera.h"
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -288,7 +289,24 @@ struct GSPresentationRequest
     GSFrameReg preferredSource{};
     uint32_t preferredDestFbp = 0;
     bool hasPreferredSource = false;
+    // The game's camera when this picture was latched (on the game's own
+    // thread, at the VBlank that hands the picture over), so the renderer pairs
+    // each composed picture with the camera that drew it. Frame interpolation
+    // needs that pairing exact: a camera sampled by the host loop arrives a
+    // compose early or late, and the warp then sweeps to a view and snaps back.
+    Ps2CameraState camera{};
+    bool hasCamera = false;
 };
+
+// Presentation pixel buffers are megabytes at a high internal scale; a fresh
+// one per frame meant an mmap and ~a thousand page faults on the render
+// thread and an munmap on the game thread. Spent buffers come back here and
+// are reused (any thread).
+void gsRecycleFrameBuffer(std::vector<uint8_t> &&buffer);
+std::vector<uint8_t> gsTakeFrameBuffer();
+
+// Set by the runtime: reads the game's current camera (game thread).
+extern bool (*g_gsCameraSampler)(Ps2CameraState &out);
 
 struct PresentationFrame
 {
@@ -299,10 +317,21 @@ struct PresentationFrame
     uint32_t displayFbp = 0;
     uint32_t sourceFbp = 0;
     bool usedPreferred = false;
+    // When the renderer shares the host window's GL context it hands the
+    // composed display over as a GL texture instead of CPU pixels, and the
+    // host draws that directly (no readback, no upload).
+    uint32_t glTexture = 0;
+    uint32_t glWidth = 0;
+    uint32_t glHeight = 0;
+    // Nothing newer than the frame the caller already has (an asynchronous
+    // backend hands each finished frame over once): keep showing that one.
+    bool unchanged = false;
 
     explicit operator bool() const
     {
-        return !pixels.empty() && width != 0u && height != 0u;
+        if (width == 0u || height == 0u)
+            return false;
+        return !pixels.empty() || glTexture != 0u;
     }
 };
 

@@ -39,6 +39,7 @@ uint64_t ps2Vu1ProgramKey(const uint8_t *code, uint32_t codeSize, uint32_t start
 
 // VU1 microprogram calls run compiled / interpreted (performance logging).
 extern std::atomic<uint64_t> g_ps2Vu1CompiledCalls, g_ps2Vu1InterpretedCalls;
+extern std::atomic<uint64_t> g_ps2Vu0CompiledCalls, g_ps2Vu0InterpretedCalls;
 // Compiled-program lookups after a code upload: cheap revalidations / full key recomputations.
 extern std::atomic<uint64_t> g_ps2Vu1LookupRevalidations, g_ps2Vu1LookupRecomputes;
 

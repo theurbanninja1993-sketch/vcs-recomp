@@ -114,11 +114,23 @@ namespace
     // The CPU rasterizer runs on its own thread unless PS2X_GS_SYNC is set.
     std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend()
     {
+        // PS2X_GS_SYNC=1: the single-threaded CPU rasterizer (debug / replay tools).
         if (std::getenv("PS2X_GS_SYNC"))
             return std::make_unique<GSCpuBackend>();
-        // PS2X_GS_GPU=1: GPU renderer (in development, docs/gpu-renderer.md).
-        if (std::getenv("PS2X_GS_GPU"))
+        // The GPU renderer is the default. It is the only renderer with texture
+        // replacement (button prompts, texture packs) and the internal-resolution
+        // upscale, and it keeps the main thread nearly idle; the CPU rasterizer
+        // has neither and burns a core. Losing it silently looks like a broken
+        // port, so make it explicit and opt out with PS2X_GS_GPU=0.
+        // PS2X_GS_GPU=1 still forces the GPU renderer. If the GL 4.5 context
+        // cannot be created, GSGpuBackend falls back to its own CPU path.
+        const char *gpuEnv = std::getenv("PS2X_GS_GPU");
+        const bool optOut = gpuEnv != nullptr && (std::string(gpuEnv) == "0" || std::string(gpuEnv) == "off");
+        if (!optOut)
             return std::make_unique<GSGpuBackend>();
+        std::cerr << "[gs] CPU rasterizer (PS2X_GS_GPU=0): texture replacement and the internal resolution "
+                     "setting are unavailable"
+                  << std::endl;
         // PS2X_GS_THREADS picks the number of banded rasterizer workers.
         // ~60% of hardware threads leaves room for the EE and VIF1/VU1 threads;
         // more workers oversubscribe and starve VU1 (20-thread i7: 12 best,
@@ -144,6 +156,12 @@ namespace
     struct GsCapture
     {
         FILE *file = nullptr;
+        // Records are collected here and written once at the end. Writing them
+        // out as they arrive stalls the game: a busy three-second capture is
+        // hundreds of megabytes (594 MB measured at the airport), which is far
+        // more than a USB stick can absorb while the emulation runs, and the
+        // writes happen on the game thread with the GS state mutex held.
+        std::vector<uint8_t> data;
         uint64_t startFrame = 0;
         uint64_t endFrame = 0;
         bool configured = false;
@@ -173,11 +191,13 @@ namespace
     {
         GsCapture &c = gsCapture();
         const uint32_t header[2] = {type, aSize + bSize};
-        std::fwrite(header, sizeof(header), 1, c.file);
+        const size_t at = c.data.size();
+        c.data.resize(at + sizeof(header) + aSize + bSize);
+        std::memcpy(c.data.data() + at, header, sizeof(header));
         if (aSize)
-            std::fwrite(a, 1, aSize, c.file);
+            std::memcpy(c.data.data() + at + sizeof(header), a, aSize);
         if (bSize)
-            std::fwrite(b, 1, bSize, c.file);
+            std::memcpy(c.data.data() + at + sizeof(header) + aSize, b, bSize);
     }
 }
 
@@ -226,8 +246,12 @@ static bool gsCaptureActive(GSRasterBackend *backend, bool hasLocalMemory)
     if (frame >= c.endFrame)
     {
         c.finished = true;
+        if (c.file != nullptr && !c.data.empty())
+            std::fwrite(c.data.data(), 1, c.data.size(), c.file);
         std::fclose(c.file);
         c.file = nullptr;
+        c.data.clear();
+        c.data.shrink_to_fit();
         std::cerr << "[gs:capture] done at frame " << frame << std::endl;
         return false;
     }
@@ -254,7 +278,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 
 void GS::reset()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
     m_primRegister = {};
@@ -289,7 +313,12 @@ void GS::reset()
     m_preferredDisplaySourceFrame = {};
     m_preferredDisplayDestFbp = 0;
     m_hasPreferredDisplaySource = false;
-    if (m_backend)
+    // Only once the GS has been initialised. The constructor calls reset() too,
+    // and touching the backend there brings the GPU renderer up before the
+    // window exists - which costs it the window's GL share group, and with
+    // it the ability to hand a synthesized frame over as a texture, since
+    // that one is drawn by the host rather than read back.
+    if (m_backend && m_localMemoryStorage != nullptr)
     {
         m_backend->Flush();
         m_backend->Sync(GSSyncReason::Reset);
@@ -355,7 +384,7 @@ const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
 
 GSDebugSnapshot GS::getDebugSnapshot() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
 
     GSDebugSnapshot snapshot{};
     snapshot.ctx[0] = m_ctx[0];
@@ -395,7 +424,7 @@ GSDebugSnapshot GS::getDebugSnapshot() const
 
 std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
 
     std::vector<GSDebugHistoryEntry> out;
     out.reserve(m_debugHistoryCount);
@@ -409,7 +438,7 @@ std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
 
 void GS::clearDebugHistory()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     m_debugHistoryWrite = 0;
     m_debugHistoryCount = 0;
     m_debugNextSeq = 1;
@@ -419,13 +448,13 @@ void GS::clearDebugHistory()
 
 bool GS::isDebugHistoryPaused() const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     return m_debugHistoryPaused;
 }
 
 void GS::setDebugHistoryPaused(bool paused)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     m_debugHistoryPaused = paused;
 }
 
@@ -605,7 +634,7 @@ void GS::recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp
 
 bool GS::getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     if (!m_hasPreferredDisplaySource)
     {
         outSource = {};
@@ -634,6 +663,72 @@ void GS::refreshDisplaySnapshot()
 }
 
 std::atomic<bool> g_gsFlickerFilter{true};
+bool (*g_gsCameraSampler)(Ps2CameraState &out) = nullptr;
+
+// PS2X_FLIP_SEQ=1: one character per event, in order - P camera processed,
+// F frame copied to the display buffer, L new picture latched - to see how the game orders
+// them (frame interpolation pairs pictures with cameras by this order).
+void ps2InterpEvent(char event)
+{
+    static const bool s_on = std::getenv("PS2X_FLIP_SEQ") != nullptr;
+    if (!s_on)
+        return;
+    static std::mutex s_mutex;
+    static std::string s_line;
+    std::lock_guard lock(s_mutex);
+    s_line += event;
+    if (s_line.size() >= 100u)
+    {
+        std::cerr << "[flipseq] " << s_line << std::endl;
+        s_line.clear();
+    }
+}
+
+uint64_t ps2Vif1StreamCommitted(); // ps2_memory.cpp
+uint64_t ps2Vif1StreamPosition();
+
+// Camera snapshots in game order, stamped with how many VIF1 batches the game
+// had committed when it took them (after its camera update for a frame). The
+// draws of that frame are committed later, so the camera a picture was drawn
+// with is the latest snapshot stamped at or before the picture's batch -
+// however far behind the VIF1 / GS worker threads are running.
+namespace
+{
+    struct CameraStamp
+    {
+        uint64_t stamp = 0;
+        Ps2CameraState camera;
+    };
+    std::mutex g_cameraStreamMutex;
+    CameraStamp g_cameraStream[32];
+    uint64_t g_cameraStreamCount = 0;
+}
+
+void ps2CameraStreamPush(const Ps2CameraState &camera)
+{
+    const uint64_t stamp = ps2Vif1StreamCommitted();
+    std::lock_guard lock(g_cameraStreamMutex);
+    g_cameraStream[g_cameraStreamCount % 32u] = {stamp, camera};
+    ++g_cameraStreamCount;
+}
+
+// The camera of the work at stream position pos (~0: the latest).
+static bool cameraStreamLookup(uint64_t pos, Ps2CameraState &out)
+{
+    std::lock_guard lock(g_cameraStreamMutex);
+    const uint64_t available = std::min<uint64_t>(g_cameraStreamCount, 32u);
+    for (uint64_t i = 0; i < available; ++i)
+    {
+        const CameraStamp &entry = g_cameraStream[(g_cameraStreamCount - 1u - i) % 32u];
+        if (pos == ~0ull || entry.stamp <= pos)
+        {
+            out = entry.camera;
+            return out.valid;
+        }
+    }
+    return false;
+}
+
 
 GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 {
@@ -666,36 +761,103 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
+namespace
+{
+    std::mutex g_frameBufferPoolMutex;
+    std::vector<std::vector<uint8_t>> g_frameBufferPool;
+}
+
+void gsRecycleFrameBuffer(std::vector<uint8_t> &&buffer)
+{
+    if (buffer.capacity() < (64u << 10))
+        return; // small ones are cheap to allocate
+    std::lock_guard<std::mutex> lock(g_frameBufferPoolMutex);
+    if (g_frameBufferPool.size() < 4u)
+    {
+        buffer.clear();
+        g_frameBufferPool.push_back(std::move(buffer));
+    }
+}
+
+std::vector<uint8_t> gsTakeFrameBuffer()
+{
+    std::lock_guard<std::mutex> lock(g_frameBufferPoolMutex);
+    if (g_frameBufferPool.empty())
+        return {};
+    std::vector<uint8_t> buffer = std::move(g_frameBufferPool.back());
+    g_frameBufferPool.pop_back();
+    return buffer;
+}
+
 void GS::latchHostPresentationFrame()
 {
     GSPresentationRequest request{};
+    const uint64_t inputSeq = m_gsInputSeq;
+    bool repeat = false;
     {
-        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
         if (m_privRegs && gsCaptureActive(m_backend.get(), m_localMemoryStorage != nullptr))
             gsCaptureRecord(3u, m_privRegs, sizeof(GSRegisters));
         if (!m_backend || !m_privRegs)
         {
             std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
             m_hostPresentationFrame.clear();
+            m_hostPresentationGlTexture = 0u;
             m_hasHostPresentationFrame = false;
             m_hostPresentationWidth = m_hostPresentationHeight = 0u;
             return;
         }
-        request = buildPresentationRequestUnlocked();
+        // Nothing has been fed to the GS since the last latch: this present is
+        // a repeat of the picture already latched (the game renders at ~30 Hz
+        // and presents at 60 Hz, so half of the presents are repeats). Skip
+        // the recompose; the host keeps drawing the texture it already has (or
+        // is handed no frame, which it treats the same way). The backend may
+        // still have a newer finished frame for it, though (below).
+        repeat = inputSeq == m_hostPresentationInputSeq;
+        if (!repeat)
+        {
+            request = buildPresentationRequestUnlocked();
+            ps2InterpEvent('L');
+            if (m_hasDisplayCamera)
+            {
+                // The camera paired with the picture at the display copy.
+                request.camera = m_displayCamera;
+                request.hasCamera = true;
+            }
+            else if (g_gsCameraSampler)
+                request.hasCamera = g_gsCameraSampler(request.camera);
+        }
     }
 
     PresentationFrame frame{};
     {
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
-        if (m_backend)
+        if (repeat)
+        {
+            // The queued present of the last picture (and its asynchronous
+            // readback) finish after the call that queued them returned; pick
+            // that frame up now rather than when the next picture arrives.
+            if (!m_backend || !m_backend->PollPresentation(frame))
+                return;
+        }
+        else if (m_backend)
         {
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Presentation);
             frame = m_backend->Present(request);
         }
     }
+    if (frame.unchanged)
+    {
+        // The backend has nothing newer than what was latched: keep it.
+        m_hostPresentationInputSeq = inputSeq;
+        return;
+    }
 
     const bool hasFrame = static_cast<bool>(frame);
+    m_hostPresentationInputSeq = inputSeq;
+    if (hasFrame)
+        ++m_hostPresentationFrameId;
     const uint32_t displayFbp = frame.displayFbp;
     const uint32_t sourceFbp = frame.sourceFbp;
     const uint32_t width = frame.width;
@@ -704,7 +866,11 @@ void GS::latchHostPresentationFrame()
     const bool usedPreferred = frame.usedPreferred;
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+        gsRecycleFrameBuffer(std::move(m_hostPresentationFrame));
         m_hostPresentationFrame = std::move(frame.pixels);
+        m_hostPresentationGlTexture = frame.glTexture;
+        m_hostPresentationGlWidth = frame.glWidth;
+        m_hostPresentationGlHeight = frame.glHeight;
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
         m_hostPresentationRowPixels = rowPixels;
@@ -716,19 +882,61 @@ void GS::latchHostPresentationFrame()
 
     if (hasFrame)
     {
-        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
         recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
     }
 }
+
+uint32_t GS::latchedHostPresentationGlTexture(uint32_t &outWidth, uint32_t &outHeight) const
+{
+    std::lock_guard<std::mutex> lock(m_presentationMutex);
+    if (!m_hasHostPresentationFrame || m_hostPresentationGlTexture == 0u)
+    {
+        outWidth = outHeight = 0u;
+        return 0u;
+    }
+    outWidth = m_hostPresentationGlWidth;
+    outHeight = m_hostPresentationGlHeight;
+    return m_hostPresentationGlTexture;
+}
+
+void GS::requestSynthesis(double displayTime)
+{
+    if (m_backend)
+        m_backend->RequestSynthesis(displayTime);
+}
+
+bool GS::latestSynthesis(uint32_t &texture, uint32_t &width, uint32_t &height, uint64_t &seq)
+{
+    return m_backend && m_backend->LatestSynthesis(texture, width, height, seq);
+}
+
+bool GS::latestSynthesisPixels(std::vector<uint8_t> &pixels)
+{
+    return m_backend && m_backend->LatestSynthesisPixels(pixels);
+}
+
+uint32_t GS::synthesizeFrame(float phase, uint32_t &outWidth, uint32_t &outHeight)
+{
+    outWidth = 0;
+    outHeight = 0;
+    if (!m_backend)
+        return 0u;
+    return m_backend->SynthesizeFrame(phase, outWidth, outHeight);
+}
+
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
                                           uint32_t *outDisplayFbp,
                                           uint32_t *outSourceFbp,
-                                          bool *outUsedPreferred) const
+                                          bool *outUsedPreferred,
+                                          uint64_t *outFrameId)
 {
     std::lock_guard<std::mutex> lock(m_presentationMutex);
+    if (outFrameId)
+        *outFrameId = m_hostPresentationFrameId;
     if (!m_hasHostPresentationFrame || m_hostPresentationFrame.empty())
     {
         outPixels.clear();
@@ -753,11 +961,23 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
         *outUsedPreferred = m_hostPresentationUsedPreferred;
 
     const size_t packedRowBytes = static_cast<size_t>(outWidth) * 4u;
+    const size_t latchRowBytes =
+        static_cast<size_t>(m_hostPresentationRowPixels != 0u ? m_hostPresentationRowPixels : kHostFrameWidth) * 4u;
+    // Already packed at the same width: hand the latch over instead of
+    // copying it. The presentation frame can be a full upscaled screen
+    // (several MB at internal_scale > 1) and is consumed once per VBlank.
+    if (latchRowBytes == packedRowBytes && m_hostPresentationFrame.size() == packedRowBytes * outHeight)
+    {
+        outPixels.swap(m_hostPresentationFrame);
+        m_hostPresentationFrame.clear();
+        m_hasHostPresentationFrame = false;
+        m_hostPresentationWidth = m_hostPresentationHeight = 0u;
+        return true;
+    }
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes =
-            static_cast<size_t>(m_hostPresentationRowPixels != 0u ? m_hostPresentationRowPixels : kHostFrameWidth) * 4u;
+        const size_t sourceRowBytes = latchRowBytes;
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
@@ -788,7 +1008,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
+    ++m_gsInputSeq;
     if (!data || sizeBytes < 16 || !m_backend)
         return;
     if (gsCaptureActive(m_backend.get(), m_localMemoryStorage != nullptr))
@@ -897,7 +1118,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_backend)
         return false;
 
@@ -942,7 +1163,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
 
@@ -1036,6 +1257,7 @@ bool GS::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeByt
 
 void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 {
+    ++m_gsInputSeq;
     switch (regDesc)
     {
     case 0x00:
@@ -1220,7 +1442,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
+    ++m_gsInputSeq;
     if (gsCaptureActive(m_backend.get(), m_localMemoryStorage != nullptr))
         gsCaptureRecord(2u, &regAddr, 1u, &value, 8u);
     writeRegisterUnlocked(regAddr, value);
@@ -1770,6 +1993,7 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    ++m_gsInputSeq;
     if (m_backend)
         m_backend->UploadImage(data, sizeBytes);
 }
@@ -1777,19 +2001,19 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }
 
@@ -1798,7 +2022,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
     if (!backend)
         backend = makeDefaultRasterBackend();
 
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
     if (m_backend)
     {
@@ -1824,13 +2048,13 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
 }
 
 void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<Ps2SpinLock> lock(m_stateMutex);
     if (m_backend)
         m_backend->WriteVram(psm, base, bw, x, y, value);
 }
@@ -1873,6 +2097,24 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const GSContext &ctx = state.context;
+    // The compose reads the scene buffer directly, so a picture's camera is the
+    // camera of the latest draw into that buffer: the one the game had when it
+    // committed that draw (see cameraStreamLookup). Looked up only when the
+    // stream position moves - draws of one batch share it.
+    if (m_hasPreferredDisplaySource && ctx.frame.fbp * 32u == m_preferredDisplaySourceFrame.fbp)
+    {
+        const uint64_t pos = ps2Vif1StreamPosition();
+        if (pos != m_sceneCameraPos || pos == ~0ull)
+        {
+            m_sceneCameraPos = pos;
+            Ps2CameraState camera;
+            if (cameraStreamLookup(pos, camera))
+            {
+                m_displayCamera = camera;
+                m_hasDisplayCamera = true;
+            }
+        }
+    }
     if (m_hasPreferredDisplaySource && ctx.frame.fbp == m_preferredDisplayDestFbp)
         m_hasPreferredDisplaySource = false;
     if (state.prim.type != GS_PRIM_SPRITE || batch.vertexCount < 2u)
@@ -1896,6 +2138,9 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
                              x0 <= 0 && y0 <= 0 && xEnd >= 639 && yEnd >= 447;
     if (displayCopy)
     {
+        // The finished frame being copied to the display: its camera is the one
+        // the game had when it committed this frame's work.
+        ps2InterpEvent('F');
         m_preferredDisplaySourceFrame = {ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0u};
         m_preferredDisplayDestFbp = ctx.frame.fbp;
         m_hasPreferredDisplaySource = true;

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "runtime/ps2_spinlock.h"
 #include <array>
 #include <functional>
 #include <vector>
@@ -356,6 +357,7 @@ public:
     // EE side: blocks until the worker is idle, then applies completions.
     // `why` labels the call site for PS2X_SYNC_STATS.
     void waitForAsyncVif1(const char *why = "other");
+    void waitForVif1KickSlot(const char *why);
     // EE side: applies finished batches (CHCR/D_STAT/DMAC cause); returns true
     // if any completed (the caller should dispatch DMAC handlers).
     bool pollAsyncVif1();
@@ -442,7 +444,7 @@ public:
     std::vector<PendingTransfer> m_pendingVif1Transfers;
 
     void asyncVif1WorkerLoop();
-    void completeVif1Dma();
+    void completeVif1Dma(bool latestKick);
 
     // GIF work produced on the VIF1 worker (PATH1 XGKICKs, PATH2 DIRECT,
     // PATH3 unmask flushes) runs in order on a separate GS frontend thread so
@@ -486,10 +488,11 @@ public:
     bool m_vif1Stop = false;          // guarded by m_vif1QueueMutex
     std::atomic<uint32_t> m_vif1Finished{0};
     uint32_t m_vif1Applied = 0; // EE thread only
+    uint32_t m_vif1Kicked = 0; // batches queued; EE thread only
     std::function<void()> m_vif1CompletionHook;
     // The GIF arbiter (and masked-PATH3 FIFO) is fed by both the EE and the
     // VIF1 worker.
-    std::recursive_mutex m_gifArbiterMutex;
+    Ps2SpinLock m_gifArbiterMutex;
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
 

@@ -1,4 +1,5 @@
 #include <atomic>
+#include "ThreadNaming.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
@@ -85,36 +86,103 @@ struct PS2AudioBackend::Impl
     bool streamLoaded = false;
 };
 
+// Frames the audio device asked for and the ring could not supply. They are
+// filled with silence, so a choppy stream is otherwise invisible: the dropped
+// counter only sees the ring overflowing, never running dry.
+std::atomic<uint64_t> g_ps2AudioFramesUnderrun{0};
+// Ring fill level at the last callback (48 kHz frames; 48000 is one second).
+std::atomic<uint32_t> g_ps2AudioRingDepth{0};
+
 namespace
 {
     // SPU2 output ring, filled by the IOP (emulation thread) and drained by the
     // audio device callback. raylib callbacks carry no user pointer, hence the
-    // single global stream.
+    // single global stream. Ported from the VCS port's validated audio path:
+    // lock-free (a mutex here was a dropout hazard - the callback could block
+    // behind a submit and miss its deadline, heard as a dropout) with
+    // free-running counters so producer and consumer never touch each other's
+    // fields.
     struct StreamRing
     {
-        static constexpr size_t kFrames = 48000u; // one second
-        std::mutex mutex;
+        // Power of two, so indexing is a mask.
+        static constexpr size_t kFrames = 32768u; // ~0.68 s at 48 kHz
+        static constexpr size_t kMask = kFrames - 1u;
         std::vector<int16_t> samples = std::vector<int16_t>(kFrames * 2u, 0);
-        size_t readFrame = 0;
-        size_t queuedFrames = 0;
+        std::atomic<size_t> writeFrame{0}; // published by the producer
+        std::atomic<size_t> readFrame{0};  // published by the consumer
     };
 
     StreamRing g_streamRing;
 
+    // The emulator produces audio per emulated frame, so a game running a few
+    // percent off real time feeds the ring slightly slower than the device
+    // drains it: the ring runs dry and refills in bursts, and the silence
+    // between bursts is heard as crackling. Reading the ring at a slightly
+    // adjusted rate absorbs that: a bounded, inaudible drift correction that
+    // holds the fill level near a target. With no deficit the ratio is exactly
+    // 1 and the samples pass through untouched.
+    constexpr double kDriftLimit = 0.02; // never stretch or squeeze more than 2%
     void streamCallback(void *bufferData, unsigned int frames)
     {
-        int16_t *out = static_cast<int16_t *>(bufferData);
-        std::lock_guard<std::mutex> lock(g_streamRing.mutex);
-        const size_t available = std::min<size_t>(frames, g_streamRing.queuedFrames);
-        for (size_t i = 0; i < available; ++i)
+        // This runs on the audio device's thread, which is not ours; name it
+        // once so the per-thread CPU report can tell it apart from the rest.
+        static const bool s_named = []()
         {
-            const size_t frame = (g_streamRing.readFrame + i) % StreamRing::kFrames;
-            out[i * 2u] = g_streamRing.samples[frame * 2u];
-            out[i * 2u + 1u] = g_streamRing.samples[frame * 2u + 1u];
+            ThreadNaming::SetCurrentThreadName("AudioCallback");
+            return true;
+        }();
+        (void)s_named;
+        static double s_readPos = 0.0; // fractional position, device thread only
+        int16_t *out = static_cast<int16_t *>(bufferData);
+        const size_t write = g_streamRing.writeFrame.load(std::memory_order_acquire);
+        const size_t read = g_streamRing.readFrame.load(std::memory_order_relaxed);
+        const size_t available = write - read;
+
+        // How much to hold back before the next gap. The emulated sound engine
+        // does not submit smoothly: it delivers ~0.2 s of audio at once, then a
+        // gap, so a shallow ring runs dry between bursts and the silence is
+        // heard as crackling. Start shallow (low latency) and grow on every dry
+        // callback, decaying back when it has been steady - a fast machine keeps
+        // low latency, a jittery one buffers enough to bridge its bursts.
+        constexpr size_t kTargetStep = StreamRing::kFrames / 64u; // ~10.7 ms
+        static size_t s_target = StreamRing::kFrames / 8u;        // ~85 ms
+        static int s_cleanCallbacks = 0;
+        const double error = static_cast<double>(available) - static_cast<double>(s_target);
+        const double ratio = std::clamp(1.0 + error / static_cast<double>(s_target) * kDriftLimit,
+                                        1.0 - kDriftLimit, 1.0 + kDriftLimit);
+
+        size_t produced = 0;
+        for (; produced < frames; ++produced)
+        {
+            const size_t i0 = static_cast<size_t>(s_readPos);
+            if (i0 + 1u >= available)
+                break; // nothing left to interpolate between
+            const double frac = s_readPos - static_cast<double>(i0);
+            const size_t f0 = (read + i0) & StreamRing::kMask;
+            const size_t f1 = (read + i0 + 1u) & StreamRing::kMask;
+            out[produced * 2u] = static_cast<int16_t>(g_streamRing.samples[f0 * 2u] * (1.0 - frac) +
+                                                      g_streamRing.samples[f1 * 2u] * frac);
+            out[produced * 2u + 1u] = static_cast<int16_t>(g_streamRing.samples[f0 * 2u + 1u] * (1.0 - frac) +
+                                                           g_streamRing.samples[f1 * 2u + 1u] * frac);
+            s_readPos += ratio;
         }
-        std::memset(out + available * 2u, 0, (frames - available) * 2u * sizeof(int16_t));
-        g_streamRing.readFrame = (g_streamRing.readFrame + available) % StreamRing::kFrames;
-        g_streamRing.queuedFrames -= available;
+        if (produced < frames)
+        {
+            g_ps2AudioFramesUnderrun.fetch_add(frames - produced, std::memory_order_relaxed);
+            s_target = std::min(StreamRing::kFrames / 2u, s_target + kTargetStep);
+            s_cleanCallbacks = 0;
+        }
+        else if (++s_cleanCallbacks > 200) // ~a few seconds without a dry callback
+        {
+            s_cleanCallbacks = 0;
+            s_target = std::max(StreamRing::kFrames / 8u, s_target - kTargetStep);
+        }
+        std::memset(out + produced * 2u, 0, (frames - produced) * 2u * sizeof(int16_t));
+
+        const size_t consumed = static_cast<size_t>(s_readPos);
+        s_readPos -= static_cast<double>(consumed);
+        g_streamRing.readFrame.store(read + consumed, std::memory_order_release);
+        g_ps2AudioRingDepth.store(static_cast<uint32_t>(write - (read + consumed)), std::memory_order_relaxed);
     }
 }
 
@@ -166,21 +234,25 @@ void PS2AudioBackend::submitStream(const int16_t *stereoFrames, uint32_t frameCo
         std::fflush(s_dump);
     }
     g_ps2AudioFramesSubmitted.fetch_add(frameCount, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(g_streamRing.mutex);
+    size_t write = g_streamRing.writeFrame.load(std::memory_order_relaxed);
+    const size_t read = g_streamRing.readFrame.load(std::memory_order_acquire);
+    size_t used = write - read;
     for (uint32_t i = 0; i < frameCount; ++i)
     {
-        if (g_streamRing.queuedFrames == StreamRing::kFrames)
+        if (used >= StreamRing::kFrames)
         {
+            // Full: drop this frame rather than stall the emulator. The newest
+            // one, not the oldest - the read pointer belongs to the consumer.
             g_ps2AudioFramesDropped.fetch_add(1u, std::memory_order_relaxed);
-            // Full: drop the oldest frame rather than stall the emulator.
-            g_streamRing.readFrame = (g_streamRing.readFrame + 1u) % StreamRing::kFrames;
-            --g_streamRing.queuedFrames;
+            continue;
         }
-        const size_t frame = (g_streamRing.readFrame + g_streamRing.queuedFrames) % StreamRing::kFrames;
+        const size_t frame = write & StreamRing::kMask;
         g_streamRing.samples[frame * 2u] = stereoFrames[i * 2u];
         g_streamRing.samples[frame * 2u + 1u] = stereoFrames[i * 2u + 1u];
-        ++g_streamRing.queuedFrames;
+        ++write;
+        ++used;
     }
+    g_streamRing.writeFrame.store(write, std::memory_order_release);
 }
 
 void PS2AudioBackend::onVagTransfer(const uint8_t *rdram, uint32_t srcAddr, uint32_t sizeBytes)

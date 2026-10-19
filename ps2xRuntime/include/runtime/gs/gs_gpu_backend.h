@@ -22,6 +22,44 @@ namespace gsgpu
 // times the GS size; 0 = no request). Set from the host settings; applied
 // between frames. PS2X_GS_SCALE sets the starting value.
 extern std::atomic<uint32_t> g_gsGpuScaleRequest;
+// Settings > Display > Motion blur. When true the renderer skips the draws
+// that read the game's blur accumulation buffers, so the picture stays sharp.
+// Both "Off" and "Modern" set it: Modern replaces the game's smear with its own.
+extern std::atomic<bool> g_gsMotionBlurOff;
+// Settings > Display > Frame rate. 60 shows only the game's own frames; above
+// that the host presents faster and the frames in between are synthesized.
+extern std::atomic<uint32_t> g_gsFrameRate;
+// True while the host is presenting faster than the game and synthesizing the
+// frames in between. The overlay mask is needed then as much as for the blur: a
+// synthesized frame must not move the HUD.
+extern std::atomic<bool> g_gsFrameInterp;
+// "Modern": blur the composed frame along the camera's motion, leaving the
+// screen-space overlays (the HUD, the minimap) sharp. Strength is how far the
+// smear reaches, in frames of camera motion.
+extern std::atomic<bool> g_gsModernBlur;
+extern std::atomic<float> g_gsModernBlurStrength;
+
+namespace gsgpu
+{
+    // Publishes the host window's native GL context (see gl_context.h); call
+    // from the main thread once the window exists.
+    void publishHostGlContext();
+}
+// Host window size in pixels, published by the main thread (0 = unknown).
+// The upscaled display readback is capped to it.
+extern std::atomic<uint32_t> g_gsGpuPresentWidth;
+extern std::atomic<uint32_t> g_gsGpuPresentHeight;
+
+// True once the GPU renderer is actually rasterizing. The GPU backend falls
+// back to its own CPU path when the GL 4.5 context cannot be created, and that
+// fallback has neither texture replacement nor the internal-resolution scale,
+// so the settings UI must not claim the features are available.
+extern std::atomic<bool> g_gsGpuActive;
+
+// The GL version and renderer the GPU path got ("OpenGL 4.6 (Core Profile) Mesa
+// ..."), empty until it starts. Written once at start-up; the settings UI shows
+// it, which is the only way to see it on Windows (no console there).
+extern char g_gsGpuInfo[160];
 
 class GSGpuBackend final : public GSRasterBackend
 {
@@ -41,6 +79,13 @@ public:
     void TextureFlush() override;
     void Sync(GSSyncReason reason) override;
     PresentationFrame Present(const GSPresentationRequest &request) override;
+    bool PollPresentation(PresentationFrame &out) override;
+
+    // Blocking round trip to the render thread (see GSRasterBackend).
+    uint32_t SynthesizeFrame(float phase, uint32_t &width, uint32_t &height) override;
+    void RequestSynthesis(double displayTime) override;
+    bool LatestSynthesis(uint32_t &texture, uint32_t &width, uint32_t &height, uint64_t &seq) override;
+    bool LatestSynthesisPixels(std::vector<uint8_t> &pixels) override;
 
     bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
     uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
@@ -51,6 +96,13 @@ public:
     GSTransferSnapshot GetTransferSnapshot() const override;
 
 private:
+    // RequestSynthesis / LatestSynthesis: one request in flight at a time.
+    std::atomic<bool> m_synthInFlight{false};
+    std::mutex m_synthResultMutex;
+    uint32_t m_synthResultTexture = 0, m_synthResultWidth = 0, m_synthResultHeight = 0;
+    std::vector<uint8_t> m_synthResultPixels; // non-empty when the host gets pixels, not a texture
+    bool m_synthResultPixelsValid = false;
+    uint64_t m_synthResultSeq = 0;
     enum class CommandType : uint8_t
     {
         State, // draw state for the following Submits
@@ -110,6 +162,9 @@ private:
     // waiting; PS2X_GS_GPU_SYNC_PRESENT=1 presents synchronously).
     std::mutex m_frameMutex;
     PresentationFrame m_lastFrame;
+    // Bumped whenever m_lastFrame is replaced; m_lastHandedSeq is the one the
+    // caller was last given, so PollPresentation knows if it has a newer one.
+    uint64_t m_lastFrameSeq = 0, m_lastHandedSeq = 0;
 
     mutable std::mutex m_mutex;
     mutable std::condition_variable m_workAvailable;

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <string>
+#include <vector>
 
 // Controls. PS2 buttons are indices into the pad's button word (bit i,
 // active low): 0 Select, 1 L3, 2 R3, 3 Start, 4 Up, 5 Right, 6 Down, 7 Left,
@@ -25,6 +26,7 @@ namespace ps2controls
     {
         OnFoot = 0,
         InVehicle = 1,
+        Menus = 2, // the game's menus (and the title / loading screens): its own map
         kContextCount
     };
 
@@ -44,7 +46,7 @@ namespace ps2controls
     {
         MoveForward, MoveBackward, MoveLeft, MoveRight, Sprint, Jump, Fire, Aim, Interact, NextWeapon,
         EnterVehicle, Handbrake, Horn, CameraMode, LookBehind, Pause, MenuAccept, MenuBack, MenuUp,
-        MenuDown, MenuLeft, MenuRight, kActionCount
+        MenuDown, MenuLeft, MenuRight, MapTarget, SkipCutscene, kActionCount
     };
     const char *actionName(int action);
     void defaultKeys(int keys[kActionCount][2]);
@@ -75,12 +77,33 @@ struct PS2HostSettings
     int windowHeight = 720;
     Aspect aspect = Aspect::Standard;
     bool smoothFiltering = true; // bilinear scaling of the picture (off: sharp pixels)
-    int internalScale = 1;       // GPU renderer resolution multiplier (1 = native 640x448)
+    int internalScale = 1;       // GPU renderer resolution multiplier (1 = native 640x448; 0 = Auto, from the window height)
+    bool vsync = true;           // swap synchronised to the display (tear-free)
+    bool pnachCheats = true;     // apply .pnach memory patches from enabled mods
+    std::vector<std::string> disabledMods; // mod folder names switched off
     bool flickerFilter = false;  // the game's interlace flicker filter (a vertical blur)
+    // The game's motion trail: every frame it copies the picture to a 512x512
+    // buffer (TEX0 12288) and blends it back over the display, so moving things
+    // smear. Off skips those draws (sharp picture, less work).
+    bool motionBlurOff = false;
+    float drawDistance = 1.0f; // multiplier on view / detail distances (1 = original)
+    // Custom Soundtracks: the music folder plays on the game's silent radio slot
+    // (past the ten real stations) while in a vehicle.
+    bool musicStation = true;
+    bool musicShuffle = false;
+    float musicStationVolume = 0.8f;
+    bool radioOffEnabled = true; // hold D-pad Down / M toggles "Radio Off"
+    // Modern free aim: on foot with a gun, the aim button (right mouse; the
+    // aim trigger on the Modern/Custom pad layouts) aims where the camera looks
+    // (crosshair) instead of locking on. The Classic pad layout keeps lock-on.
+    bool freeAim = true;
+    bool mouseTurnsPlayer = true; // on foot, mouse turns also turn a moving player (no skid stops)
+    std::string controllerName; // controller to use when several are connected ("" = automatic)
     float mouseSensitivity = 1.0f;
     bool mouseInvertY = false;
 
     bool showAtLaunch = false; // open the settings before the game starts, every launch (always on the first)
+    bool showFps = false;      // draw the frame rate over the picture (Display options)
 
     ps2controls::GamepadLayout gamepadLayout = ps2controls::GamepadLayout::Classic;
     int gamepadMap[ps2controls::kContextCount][ps2controls::kHostButtonCount]{};
@@ -104,6 +127,9 @@ void ps2HostSettingsRequestWindowApply();
 void ps2HostSettingsApplyRenderer();
 // The GPU renderer is in use (internal resolution only applies to it).
 bool ps2HostSettingsGpuRenderer();
+// The internal resolution actually used: the setting, or for Auto (0) the
+// multiple picked from the window height.
+int ps2HostSettingsEffectiveScale();
 
 // The settings menu is open: the game gets neutral input and the mouse is free.
 extern std::atomic<bool> g_ps2SettingsMenuOpen;

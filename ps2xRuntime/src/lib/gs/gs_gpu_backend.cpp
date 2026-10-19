@@ -6,12 +6,64 @@
 #include <optional>
 #include <string>
 #include "runtime/gs/gs_gpu_backend.h"
+#if defined(__linux__)
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+// The GPU worker's thread id and CPU clock, for PS2X_PC_SAMPLE_GPU (LCS).
+std::atomic<int> g_ps2GsGpuWorkerTid{0}, g_ps2GsGpuWorkerClock{0};
 
 #include "runtime/gs/gpu/gs_gpu_renderer.h"
 
 #include <future>
 #include <iostream>
 #include <utility>
+
+// The window's GL context (raylib's, via GLFW) so the renderer can join its
+// share group and hand the composed display texture straight to the host.
+#if defined(__linux__) && !defined(PS2X_IS_ANDROID)
+#define GLFW_EXPOSE_NATIVE_X11
+#define GLFW_EXPOSE_NATIVE_GLX
+#include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
+#elif defined(_WIN32)
+#define GLFW_EXPOSE_NATIVE_WIN32
+#define GLFW_EXPOSE_NATIVE_WGL
+#include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
+#endif
+
+#include "runtime/gs/gpu/gl_context.h"
+
+namespace gsgpu
+{
+    // Called on the host (main) thread once the window exists and its context
+    // is current. Safe to call again on a resize/recreate.
+    void publishHostGlContext()
+    {
+#if defined(__linux__) && !defined(PS2X_IS_ANDROID)
+        GLFWwindow *window = glfwGetCurrentContext();
+        if (window == nullptr)
+            return;
+        g_hostSharedGlContext.store(reinterpret_cast<uintptr_t>(glfwGetGLXContext(window)), std::memory_order_relaxed);
+        g_hostSharedGlDisplay.store(reinterpret_cast<uintptr_t>(glfwGetX11Display()), std::memory_order_relaxed);
+#elif defined(_WIN32)
+        GLFWwindow *window = glfwGetCurrentContext();
+        if (window == nullptr)
+            return;
+        g_hostSharedGlContext.store(reinterpret_cast<uintptr_t>(glfwGetWGLContext(window)), std::memory_order_relaxed);
+        // The window's DC, so the renderer can create its context on the same
+        // DC as raylib's. WGL shares reliably only between contexts with
+        // compatible pixel formats, and a private window picks its own.
+        HWND hwnd = glfwGetWin32Window(window);
+        g_hostSharedGlDisplay.store(reinterpret_cast<uintptr_t>(hwnd ? GetDC(hwnd) : nullptr), std::memory_order_relaxed);
+#else
+        (void)0;
+#endif
+    }
+}
 
 namespace
 {
@@ -88,12 +140,32 @@ void GSGpuBackend::runSync(const std::function<void()> &fn, const char *why) con
             auto &site = s_sites[why];
             ++site.first;
             site.second += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-            if (++s_calls % 20000u == 0u)
+            if (++s_calls % 5000u == 0u || s_calls == 1u) // the first one creates the file
             {
-                std::cerr << "[sync:gs]";
+                // Written to sync.log next to the executable as well as stderr:
+                // the Windows build has no console, so stderr alone means these
+                // numbers are never actually seen there.
+                static FILE *s_file = std::fopen("sync.log", "a");
+                char line[1024];
+                int written = std::snprintf(line, sizeof(line), "[sync:gs]");
                 for (auto &[name, entry] : s_sites)
-                    std::cerr << " " << name << "=" << entry.first << "/" << static_cast<int>(entry.second * 1000.0) << "ms";
-                std::cerr << std::endl;
+                {
+                    if (written < 0 || static_cast<size_t>(written) >= sizeof(line))
+                        break;
+                    written += std::snprintf(line + written, sizeof(line) - static_cast<size_t>(written),
+                                             " %s=%llu/%dms", name.c_str(),
+                                             static_cast<unsigned long long>(entry.first),
+                                             static_cast<int>(entry.second * 1000.0));
+                }
+                if (written > 0 && static_cast<size_t>(written) < sizeof(line) - 1)
+                    line[written++] = '\n';
+                line[written < 0 ? 0 : (static_cast<size_t>(written) < sizeof(line) ? written : sizeof(line) - 1)] = '\0';
+                if (s_file != nullptr)
+                {
+                    std::fputs(line, s_file);
+                    std::fflush(s_file);
+                }
+                std::fputs(line, stderr);
                 s_sites.clear();
             }
         }
@@ -115,7 +187,14 @@ void GSGpuBackend::runSync(const std::function<void()> &fn, const char *why) con
 void GSGpuBackend::renderLoop()
 {
     ThreadNaming::SetCurrentThreadName("GsGpu");
-    m_renderer = std::make_unique<gsgpu::Renderer>();
+#if defined(__linux__)
+    clockid_t cpuClock{};
+    if (pthread_getcpuclockid(pthread_self(), &cpuClock) == 0)
+    {
+        g_ps2GsGpuWorkerClock.store(static_cast<int>(cpuClock));
+        g_ps2GsGpuWorkerTid.store(static_cast<int>(syscall(SYS_gettid)));
+    }
+#endif
     std::vector<Command> batch;
     for (;;)
     {
@@ -138,6 +217,14 @@ void GSGpuBackend::renderLoop()
 
 void GSGpuBackend::execute(Command &command)
 {
+    // Created on the first command rather than when the thread starts. The
+    // Renderer's constructor creates its GL context, and that context can only
+    // join the window's share group if the window exists and its context has
+    // been published. This thread is started by the GS constructor, which runs
+    // long before the window, so deferring it here means the first command -
+    // the GS init, itself now ordered after the window - brings it up.
+    if (!m_renderer)
+        m_renderer = std::make_unique<gsgpu::Renderer>();
     switch (command.type)
     {
     case CommandType::State:
@@ -258,17 +345,137 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
         command.payload->call = [this, request]()
         {
             PresentationFrame frame = m_renderer->present(request);
+            if (frame.unchanged)
+                return; // nothing finished yet: a later poll collects it
             std::lock_guard<std::mutex> lock(m_frameMutex);
             m_lastFrame = std::move(frame);
+            ++m_lastFrameSeq;
         };
         enqueue(std::move(command), true);
+        // Each finished frame is handed over once, by move: copying it here
+        // (megabytes at a high internal scale) cost the game thread - which
+        // calls this every VBlank - milliseconds per frame on a slow CPU.
         std::lock_guard<std::mutex> lock(m_frameMutex);
-        return m_lastFrame;
+        if (m_lastHandedSeq == m_lastFrameSeq)
+        {
+            PresentationFrame none;
+            none.unchanged = true;
+            return none;
+        }
+        m_lastHandedSeq = m_lastFrameSeq;
+        return std::move(m_lastFrame);
     }
     PresentationFrame frame;
     runSync([&]()
             { frame = m_renderer->present(request); }, "present");
     return frame;
+}
+
+bool GSGpuBackend::PollPresentation(PresentationFrame &out)
+{
+    static const bool s_sync = std::getenv("PS2X_GS_GPU_SYNC_PRESENT") != nullptr;
+    if (s_sync)
+        return false;
+    // Collect a readback still in flight (the renderer hands each present the
+    // copy made one present earlier, so the newest picture is waiting there
+    // when the game repeats it), for the next VBlank to pick up.
+    Command command = Command::make(CommandType::Call);
+    command.payload->call = [this]()
+    {
+        PresentationFrame frame;
+        if (!m_renderer->collectPendingReadback(frame))
+            return;
+        std::lock_guard<std::mutex> lock(m_frameMutex);
+        m_lastFrame = std::move(frame);
+        ++m_lastFrameSeq;
+    };
+    enqueue(std::move(command), true);
+    // Hand over a frame finished since the caller last had one - the queued
+    // present's own result included, which used to wait for the next new picture.
+    std::lock_guard<std::mutex> lock(m_frameMutex);
+    if (m_lastHandedSeq == m_lastFrameSeq || !m_lastFrame)
+        return false;
+    m_lastHandedSeq = m_lastFrameSeq;
+    out = std::move(m_lastFrame);
+    return true;
+}
+
+uint32_t GSGpuBackend::SynthesizeFrame(float phase, uint32_t &width, uint32_t &height)
+{
+    // Blocking, unlike Present: the caller needs the texture before it draws.
+    // Same shape as ReadVram - enqueue an urgent command and wait for the render
+    // thread to run it. The locals are captured by reference and the wait
+    // guarantees they outlive the lambda.
+    uint32_t texture = 0, w = 0, h = 0;
+    std::promise<void> done;
+    Command command = Command::make(CommandType::Call);
+    command.payload->call = [&]()
+    {
+        texture = m_renderer ? m_renderer->synthesizeHostFrame(phase, w, h) : 0u;
+        done.set_value();
+    };
+    enqueue(std::move(command), true);
+    done.get_future().wait();
+    width = w;
+    height = h;
+    return texture;
+}
+
+void GSGpuBackend::RequestSynthesis(double displayTime)
+{
+    if (m_synthInFlight.exchange(true))
+        return; // the previous request is still queued: it will serve
+    Command command = Command::make(CommandType::Call);
+    command.payload->call = [this, displayTime]()
+    {
+        uint32_t w = 0, h = 0;
+        const uint32_t texture = m_renderer ? m_renderer->synthesizeHostFrameAt(displayTime, w, h) : 0u;
+        {
+            std::lock_guard<std::mutex> lock(m_synthResultMutex);
+            m_synthResultTexture = texture;
+            m_synthResultWidth = w;
+            m_synthResultHeight = h;
+            ++m_synthResultSeq;
+            // Swapped, not copied: the renderer ends up holding the buffer this one
+            // had, and fills it again next round.
+            m_synthResultPixelsValid = false;
+            if (m_renderer != nullptr)
+            {
+                uint32_t pw = 0, ph = 0;
+                bool pvalid = false;
+                std::vector<uint8_t> &pixels = m_renderer->synthPixels(pw, ph, pvalid);
+                if (pvalid && pw == w && ph == h)
+                {
+                    m_synthResultPixels.swap(pixels);
+                    m_synthResultPixelsValid = true;
+                }
+            }
+        }
+        m_synthInFlight.store(false);
+    };
+    enqueue(std::move(command), true);
+}
+
+bool GSGpuBackend::LatestSynthesisPixels(std::vector<uint8_t> &pixels)
+{
+    std::lock_guard<std::mutex> lock(m_synthResultMutex);
+    if (!m_synthResultPixelsValid)
+    {
+        pixels.clear();
+        return false;
+    }
+    pixels = m_synthResultPixels; // the host uploads it straight away
+    return true;
+}
+
+bool GSGpuBackend::LatestSynthesis(uint32_t &texture, uint32_t &width, uint32_t &height, uint64_t &seq)
+{
+    std::lock_guard<std::mutex> lock(m_synthResultMutex);
+    texture = m_synthResultTexture;
+    width = m_synthResultWidth;
+    height = m_synthResultHeight;
+    seq = m_synthResultSeq;
+    return m_synthResultSeq != 0;
 }
 
 bool GSGpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)

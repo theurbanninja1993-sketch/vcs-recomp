@@ -14,11 +14,125 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <ps2_log.h>
 
+extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
+
 namespace
 {
+    // Opt-in first-failure inputs. Normal runs neither copy VU memory nor
+    // allocate these buffers. Each worker owns its capture and VU instances.
+    struct VuFailureInput
+    {
+        bool captured = false;
+        VU1State state{};
+        std::vector<uint8_t> code, data;
+    };
+    thread_local bool s_vuRunIsResume = false;
+
+    // Always-live, timing-neutral ring of the most recent VU runs. It records
+    // only the entry state (a small memcpy, no allocation) so it does not
+    // perturb timing the way the full failure capture does - that copies 32 KiB+
+    // of code and data per run, which suppresses the intermittent VU
+    // budget-exhaustion cascade. Enabled by PS2X_VU_RING=1; on a failure the
+    // ring is dumped (PS2X_VU_RING_DIR) to show the data-driven loop bounds.
+    struct VuRunRecord
+    {
+        VU1State state{};
+        uint64_t enteredCycle = 0;
+        uint64_t exitCycle = 0;
+        uint32_t exitKind = 0; // 0 = ended/unknown, 1 = cycle budget, 2 = stop request
+    };
+    constexpr uint32_t kVuRunRing = 32;
+    thread_local std::array<VuRunRecord, kVuRunRing> s_vuRunRing;
+    thread_local uint32_t s_vuRunRingNext = 0;
+    thread_local bool s_vuRunRingDumped = false;
+
+    const std::string &vuRunRingDirectory()
+    {
+        static const std::string directory = []
+        {
+            const char *value = std::getenv("PS2X_VU_RING_DIR");
+            return value ? std::string(value) : std::string();
+        }();
+        return directory;
+    }
+
+    // Per-entry-PC cycle usage (PS2X_VU_PC_STATS=1): shows which compiled
+    // microprograms run near the 65,536-cycle budget, i.e. the cascade's
+    // candidates, without needing the rare failure itself. Cheap: two array
+    // updates per run, no allocation.
+    constexpr uint32_t kVuPcSlots = 2048; // 16 KiB VU1 code, one slot per 8 bytes
+    thread_local uint32_t s_vuPcMax[kVuPcSlots];
+    thread_local uint32_t s_vuPcCount[kVuPcSlots];
+    thread_local uint64_t s_vuPcRuns = 0;
+
+    void reportVuPcStats()
+    {
+        struct Entry
+        {
+            uint32_t pc, maxCycles, count;
+        };
+        std::vector<Entry> entries;
+        for (uint32_t slot = 0; slot < kVuPcSlots; ++slot)
+            if (s_vuPcCount[slot] != 0u)
+                entries.push_back({slot << 3, s_vuPcMax[slot], s_vuPcCount[slot]});
+        std::sort(entries.begin(), entries.end(),
+                  [](const Entry &a, const Entry &b) { return a.maxCycles > b.maxCycles; });
+        std::cerr << "[vu:pcstats] runs=" << s_vuPcRuns << " top entry PCs by max cycles:";
+        for (size_t i = 0; i < entries.size() && i < 8u; ++i)
+            std::cerr << " 0x" << std::hex << entries[i].pc << std::dec << ":" << entries[i].maxCycles << "/"
+                      << entries[i].count;
+        std::cerr << std::endl;
+    }
+
+    void dumpVuRunRing(const std::string &directory, bool vu1, const VU1State &finalState, uint64_t finalCycle,
+                       uint32_t maxCycles, bool compiled, bool resumed)
+    {
+        if (directory.empty() || s_vuRunRingDumped)
+            return;
+        s_vuRunRingDumped = true; // one dump per session: the first failure
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        std::ofstream out(std::filesystem::path(directory) / (vu1 ? "vu1-ring.txt" : "vu0-ring.txt"));
+        if (!out)
+            return;
+        out << "# recent VU runs, oldest first; entry state per run\n";
+        out << "# reason=" << (finalCycle >= maxCycles ? "cycle-budget" : "stop")
+            << " compiled=" << compiled << " resumed=" << resumed << " finalCycle=" << finalCycle
+            << " maxCycles=" << maxCycles << " frame=" << g_ps2PresentedFrameCounter.load(std::memory_order_relaxed)
+            << "\n";
+        out << "# final pc=0x" << std::hex << finalState.pc << std::dec << " top=" << finalState.top
+            << " itop=" << finalState.itop << " cycles=" << finalState.cycles << "\n";
+        out << "# final vi:";
+        for (int v = 0; v < 16; ++v)
+            out << " " << finalState.vi[v];
+        out << "\n";
+        for (uint32_t i = 0; i < kVuRunRing; ++i)
+        {
+            const VuRunRecord &r = s_vuRunRing[(s_vuRunRingNext + i) % kVuRunRing];
+            if (r.enteredCycle == 0u && r.state.pc == 0u)
+                continue;
+            out << "run " << i << " pc=0x" << std::hex << r.state.pc << std::dec << " top=" << r.state.top
+                << " itop=" << r.state.itop << " enter=" << r.enteredCycle << " exit=" << r.exitCycle
+                << " exitKind=" << r.exitKind << "\n";
+            out << "  vi:";
+            for (int v = 0; v < 16; ++v)
+                out << " " << r.state.vi[v];
+            out << "\n";
+        }
+    }
+
+    bool writeVuFailureFile(const std::filesystem::path &path, const void *data, size_t size)
+    {
+        std::ofstream file(path, std::ios::binary);
+        file.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
+        file.close();
+        return !file.fail();
+    }
+
     constexpr uint8_t laneForComponent(uint32_t component)
     {
         return static_cast<uint8_t>(1u << (3u - component));
@@ -1630,13 +1744,29 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
 
 void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
 {
-    RUNTIME_ERROR(
-        "[VU" << (m_unit == Unit::VU1 ? "1" : "0")
-              << " reserved " << (upper ? "upper" : "lower")
-              << "] cycle=" << m_cycle
-              << " pc=0x" << std::hex << m_state.pc
-              << " instruction=0x" << instruction
-              << std::dec << '\n');
+    // Rate-limited: a corrupted microprogram can raise this tens of thousands of
+    // times per second, and each message costs an allocation plus a synchronous
+    // stderr write - enough to collapse the frame rate on its own (the logged
+    // cascade went from 68 % to 31 %). The stop still happens every time; only
+    // the reporting is throttled.
+    static std::atomic<uint32_t> s_reports{0};
+    const uint32_t report = s_reports.fetch_add(1u, std::memory_order_relaxed);
+    if (report < 32u)
+    {
+        RUNTIME_ERROR(
+            "[VU" << (m_unit == Unit::VU1 ? "1" : "0")
+                  << " reserved " << (upper ? "upper" : "lower")
+                  << "] cycle=" << m_cycle
+                  << " pc=0x" << std::hex << m_state.pc
+                  << " instruction=0x" << instruction
+                  << std::dec << '\n');
+    }
+    else if (report == 32u || (report % 65536u) == 0u)
+    {
+        RUNTIME_ERROR("[VU" << (m_unit == Unit::VU1 ? "1" : "0") << "] reserved-instruction reports suppressed ("
+                            << report << " so far, last pc=0x" << std::hex << m_state.pc << " instruction=0x"
+                            << instruction << std::dec << ")\n");
+    }
     m_stopRequested = true;
 }
 
@@ -1665,6 +1795,9 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_compiledEntry = fastCommitEnabled() ? lookupCompiled(vuCode, codeSize, memory, m_state.pc) : nullptr;
     if (m_unit == Unit::VU1)
         (m_compiledEntry ? g_ps2Vu1CompiledCalls : g_ps2Vu1InterpretedCalls).fetch_add(1, std::memory_order_relaxed);
+    else
+        (m_compiledEntry ? g_ps2Vu0CompiledCalls : g_ps2Vu0InterpretedCalls).fetch_add(1, std::memory_order_relaxed);
+    s_vuRunIsResume = false;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -1677,6 +1810,7 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.itop = itop;
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
+    s_vuRunIsResume = true;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -1689,9 +1823,42 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeGs = &gs;
     m_activeMemory = memory;
 
+    static const std::string failureDirectory = []
+    {
+        const char *value = std::getenv("PS2X_VU_FAILURE_DIR");
+        return value ? std::string(value) : std::string();
+    }();
+    thread_local std::array<VuFailureInput, 2> failureInputs;
+    VuFailureInput &failureInput = failureInputs[m_unit == Unit::VU1 ? 1 : 0];
+    const bool captureFailure = !failureDirectory.empty() && !failureInput.captured;
+    const bool resumed = s_vuRunIsResume;
+    const bool compiledInput = m_compiledEntry != nullptr;
+    const uint64_t inputCycle = m_cycle;
+    if (captureFailure)
+    {
+        failureInput.state = m_state;
+        failureInput.code.assign(vuCode, vuCode + codeSize);
+        failureInput.data.assign(vuData, vuData + dataSize);
+    }
+
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
+    // Timing-neutral first-failure ring (PS2X_VU_RING): one state memcpy per
+    // run, no allocation, so it does not suppress the intermittent cascade.
+    static const bool s_vuRing = std::getenv("PS2X_VU_RING") != nullptr;
+    const bool ringEnabled = s_vuRing && !s_vuRunRingDumped;
+    const uint32_t entryPc = m_state.pc;
+    VuRunRecord *ringSlot = nullptr;
+    if (ringEnabled)
+    {
+        ringSlot = &s_vuRunRing[s_vuRunRingNext];
+        s_vuRunRingNext = (s_vuRunRingNext + 1u) % kVuRunRing;
+        ringSlot->state = m_state;
+        ringSlot->enteredCycle = inputCycle;
+        ringSlot->exitCycle = 0u;
+        ringSlot->exitKind = 0u;
+    }
     bool programEnded = false;
     // Microcode cannot change while a program runs (MPG needs the VIF, which
     // waits for us), so validate the decode cache once instead of per pair.
@@ -1978,6 +2145,89 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
+    if (ringEnabled && (m_stopRequested || (!programEnded && m_cycle >= budgetEnd)))
+    {
+        // First failure: record how this run left and dump the recent runs.
+        if (ringSlot)
+        {
+            ringSlot->exitCycle = m_cycle;
+            ringSlot->exitKind = m_stopRequested ? 2u : 1u;
+        }
+        dumpVuRunRing(vuRunRingDirectory(), m_unit == Unit::VU1, m_state, m_cycle, maxCycles, compiledInput, resumed);
+        std::cerr << "[vu:ring] dumped " << (m_unit == Unit::VU1 ? "vu1" : "vu0") << " ring, pc=0x" << std::hex
+                  << m_state.pc << std::dec << " cycle=" << m_cycle << std::endl;
+    }
+
+    if (captureFailure && (m_stopRequested || (!programEnded && m_cycle >= budgetEnd)))
+    {
+        // Capture the earliest budget exhaustion too: later malformed GIFtags
+        // can be consequences of an already interrupted microprogram.
+        failureInput.captured = true;
+        const auto directory = std::filesystem::path(failureDirectory) /
+            (m_unit == Unit::VU1 ? "vu1" : "vu0");
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        bool saved = !error;
+        if (saved)
+        {
+            saved &= writeVuFailureFile(directory / "state-before.bin", &failureInput.state, sizeof(VU1State));
+            saved &= writeVuFailureFile(directory / "code.bin", failureInput.code.data(), codeSize);
+            saved &= writeVuFailureFile(directory / "data-before.bin", failureInput.data.data(), dataSize);
+            saved &= writeVuFailureFile(directory / "state-after.bin", &m_state, sizeof(VU1State));
+            saved &= writeVuFailureFile(directory / "data-after.bin", vuData, dataSize);
+            saved &= writeVuFailureFile(directory / "xgkick.bin", m_xgkick.packet.data(), m_xgkick.copiedBytes);
+            if (!resumed && codeSize == PS2_VU1_CODE_SIZE && dataSize == PS2_VU1_DATA_SIZE)
+            {
+                // Same native ABI as PS2X_VU1_CAPTURE; usable by vu1_replay.
+                // Matching a failed capture is reproduction, not correctness.
+                std::ofstream replay(directory / "replay.bin", std::ios::binary);
+                const uint32_t header[4] = {0x31555643u, failureInput.state.pc,
+                                           failureInput.state.top, failureInput.state.itop};
+                replay.write(reinterpret_cast<const char *>(header), sizeof(header));
+                replay.write(reinterpret_cast<const char *>(&failureInput.state), sizeof(VU1State));
+                replay.write(reinterpret_cast<const char *>(failureInput.code.data()), codeSize);
+                replay.write(reinterpret_cast<const char *>(failureInput.data.data()), dataSize);
+                replay.write(reinterpret_cast<const char *>(&m_state), sizeof(VU1State));
+                replay.write(reinterpret_cast<const char *>(vuData), dataSize);
+                replay.close();
+                saved &= !replay.fail();
+            }
+            if (memory && memory->getRDRAM())
+                saved &= writeVuFailureFile(directory / "ram.bin", memory->getRDRAM(), PS2_RAM_SIZE);
+            std::ofstream metadata(directory / "failure.txt");
+            metadata << "reason=" << (m_stopRequested ? "reserved-or-pipeline" : "cycle-budget")
+                     << " unit=" << (m_unit == Unit::VU1 ? 1 : 0)
+                     << " resumed=" << resumed << " compiled=" << compiledInput
+                     << " frame=" << g_ps2PresentedFrameCounter.load(std::memory_order_relaxed)
+                     << " inputCycle=" << inputCycle << " outputCycle=" << m_cycle
+                     << " maxCycles=" << maxCycles << " stateBytes=" << sizeof(VU1State)
+                     << " codeBytes=" << codeSize << " dataBytes=" << dataSize << '\n'
+                     << std::hex << "inputPc=0x" << failureInput.state.pc << " outputPc=0x" << m_state.pc
+                     << " xgkickSource=0x" << m_xgkick.sourceAddress
+                     << " xgkickCopied=0x" << m_xgkick.copiedBytes
+                     << " xgkickTagEnd=0x" << m_xgkick.currentTagEnd << std::dec
+                     << " xgkickActive=" << m_xgkick.active << " xgkickEop=" << m_xgkick.currentTagEop << '\n';
+            metadata.close();
+            saved &= !metadata.fail();
+        }
+        std::cerr << "[vu:failure-capture] saved=" << saved << " directory=" << directory << std::endl;
+        // This is diagnostic input, not a hardware savestate: a resumed run's
+        // pending pipelines and concurrent EE/device state are not serialized.
+        failureInput.code.clear();
+        failureInput.data.clear();
+    }
+    static const bool s_vuPcStats = std::getenv("PS2X_VU_PC_STATS") != nullptr;
+    if (s_vuPcStats)
+    {
+        const uint32_t slot = (entryPc >> 3) & (kVuPcSlots - 1u);
+        const uint64_t used64 = m_cycle > inputCycle ? m_cycle - inputCycle : 0u;
+        const uint32_t used = static_cast<uint32_t>(std::min<uint64_t>(used64, 0xFFFFFFFFull));
+        if (used > s_vuPcMax[slot])
+            s_vuPcMax[slot] = used;
+        ++s_vuPcCount[slot];
+        if (++s_vuPcRuns % 200000u == 0u)
+            reportVuPcStats();
+    }
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
 }

@@ -122,8 +122,29 @@ else()
 
         set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
 
+        # rlImGui's gamepad mapping swaps Square/Circle (B and X) and Start/Back;
+        # build a corrected copy so menu navigation uses Circle to go back.
+        file(READ "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp" PS2X_RLIMGUI_CPP)
+        string(REPLACE "GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, ImGuiKey_GamepadFaceLeft" "GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, ImGuiKey_GamepadFaceRight"
+               PS2X_RLIMGUI_CPP "${PS2X_RLIMGUI_CPP}")
+        string(REPLACE "GAMEPAD_BUTTON_RIGHT_FACE_LEFT, ImGuiKey_GamepadFaceRight" "GAMEPAD_BUTTON_RIGHT_FACE_LEFT, ImGuiKey_GamepadFaceLeft"
+               PS2X_RLIMGUI_CPP "${PS2X_RLIMGUI_CPP}")
+        string(REPLACE "GAMEPAD_BUTTON_MIDDLE_LEFT, ImGuiKey_GamepadStart" "GAMEPAD_BUTTON_MIDDLE_LEFT, ImGuiKey_GamepadBack"
+               PS2X_RLIMGUI_CPP "${PS2X_RLIMGUI_CPP}")
+        string(REPLACE "GAMEPAD_BUTTON_MIDDLE_RIGHT, ImGuiKey_GamepadBack" "GAMEPAD_BUTTON_MIDDLE_RIGHT, ImGuiKey_GamepadStart"
+               PS2X_RLIMGUI_CPP "${PS2X_RLIMGUI_CPP}")
+        # ...and read the controller the game uses, not always slot 0.
+        string(REPLACE "IsGamepadAvailable(0)" "IsGamepadAvailable(ps2xImGuiPad())" PS2X_RLIMGUI_CPP "${PS2X_RLIMGUI_CPP}")
+        string(REPLACE "IsGamepadButtonPressed(0, " "IsGamepadButtonPressed(ps2xImGuiPad(), " PS2X_RLIMGUI_CPP "${PS2X_RLIMGUI_CPP}")
+        string(REPLACE "IsGamepadButtonReleased(0, " "IsGamepadButtonReleased(ps2xImGuiPad(), " PS2X_RLIMGUI_CPP "${PS2X_RLIMGUI_CPP}")
+        string(REPLACE "GetGamepadAxisMovement(0, " "GetGamepadAxisMovement(ps2xImGuiPad(), " PS2X_RLIMGUI_CPP "${PS2X_RLIMGUI_CPP}")
+        string(REPLACE "#include \"rlImGui.h\"" "#include \"rlImGui.h\"\nint (*g_ps2xImGuiPadSelector)() = nullptr;\nstatic int ps2xImGuiPad() { if (g_ps2xImGuiPadSelector) { const int pad = g_ps2xImGuiPadSelector(); return pad < 0 ? 0 : pad; } for (int i = 0; i < 4; ++i) if (IsGamepadAvailable(i)) return i; return 0; }"
+               PS2X_RLIMGUI_CPP "${PS2X_RLIMGUI_CPP}")
+        set(PS2X_RLIMGUI_PATCHED "${CMAKE_CURRENT_BINARY_DIR}/rlImGui_patched.cpp")
+        file(CONFIGURE OUTPUT "${PS2X_RLIMGUI_PATCHED}" CONTENT "${PS2X_RLIMGUI_CPP}" @ONLY)
+
         add_library(rlImGui STATIC
-            "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
+            "${PS2X_RLIMGUI_PATCHED}"
         )
         target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
         target_link_libraries(rlImGui PUBLIC raylib imgui)
@@ -388,10 +409,15 @@ add_library(ps2_runtime STATIC
     src/lib/gs/gs_gpu_backend.cpp
     src/lib/gs/gpu/gl_context.cpp
     src/lib/gs/gpu/gs_gpu_renderer.cpp
+    src/lib/gs/gs_texture_replacements.cpp
+    src/lib/ps2_camera.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_host_settings.cpp
+    src/lib/ps2_mods.cpp
     src/lib/ps2_pad.cpp
+    src/lib/ps2_pad_rumble.cpp
+    src/lib/ps2_music_station.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
@@ -402,6 +428,22 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_programs.cpp
     src/lib/games_database.cpp
 )
+
+# xxHash (header-only, XXH_INLINE_ALL): XXH3-64 texture hashes as PCSX2
+# computes them (texture-pack replacement names). The root project points
+# FetchContent at vendor/deps/xxhash.
+include(FetchContent)
+FetchContent_Declare(
+    xxhash
+    GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
+    GIT_TAG v0.8.3
+    GIT_SHALLOW TRUE
+)
+FetchContent_GetProperties(xxhash)
+if(NOT xxhash_POPULATED)
+    FetchContent_Populate(xxhash)
+endif()
+target_include_directories(ps2_runtime PRIVATE "${xxhash_SOURCE_DIR}")
 
 # Host-CPU code generation for the runtime/IOP libraries (VU1 interpreter, GS
 # rasterizer, SPU2). FP contraction stays off so FMA can't change emulated
@@ -428,6 +470,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT PS2X_PGO STREQUAL "off")
             if(PS2X_PGO STREQUAL "generate")
                 target_compile_options(${PS2X_PGO_TARGET} PRIVATE -fprofile-generate=${PS2X_PGO_DIR} -fprofile-update=single)
                 target_link_options(${PS2X_PGO_TARGET} INTERFACE -fprofile-generate=${PS2X_PGO_DIR})
+                # The runtime writes the profile by calling __gcov_dump() through a
+                # weak reference (ps2_runtime.cpp, the PS2X_EXIT_AFTER_FRAME exit).
+                # Nothing strong references it, so the static libgcov member that
+                # defines it is never pulled in and the weak call is null: the
+                # profile would silently never be written. Force the symbol in.
+                target_link_options(${PS2X_PGO_TARGET} INTERFACE -Wl,--undefined=__gcov_dump)
             elseif(PS2X_PGO STREQUAL "use")
                 target_compile_options(${PS2X_PGO_TARGET} PRIVATE -fprofile-use=${PS2X_PGO_DIR} -fprofile-correction -fprofile-partial-training -Wno-missing-profile -Wno-coverage-mismatch)
             endif()
@@ -473,7 +521,6 @@ endif()
 # Set to 0 (or remove) for release builds.
 target_compile_definitions(ps2_runtime PRIVATE
     PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
-    AGRESSIVE_LOGS=1
 )
 
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
@@ -484,9 +531,8 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
-file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
-)
+set(PS2X_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/runner" CACHE PATH "Generated game sources")
+file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS "${PS2X_GENERATED_DIR}/*.cpp")
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
@@ -523,8 +569,8 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        "${PS2X_GENERATED_DIR}/ps2_recompiled_functions.h"
+        "${PS2X_GENERATED_DIR}/ps2_recompiled_stubs.h")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()
@@ -563,8 +609,9 @@ target_include_directories(ps2_runtime PUBLIC
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
 # GPU GS renderer: headless GL 4.6 via EGL (Linux).
 if(UNIX AND NOT APPLE AND NOT PS2X_IS_ANDROID)
-    target_link_libraries(ps2_runtime PUBLIC EGL)
+    target_link_libraries(ps2_runtime PUBLIC EGL X11 GLX)
 endif()
+target_include_directories(ps2_runtime PUBLIC "${PS2X_GENERATED_DIR}")
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
@@ -677,6 +724,24 @@ if(NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
     # file to link into the runner and vu1_replay.
     add_executable(vu1_recomp EXCLUDE_FROM_ALL tools/vu1_recomp.cpp)
     target_link_libraries(vu1_recomp PRIVATE ps2_runtime)
+    add_executable(vu0_replay EXCLUDE_FROM_ALL tools/vu1_replay.cpp)
+    target_compile_definitions(vu0_replay PRIVATE PS2X_VU_UNIT=0)
+    target_link_libraries(vu0_replay PRIVATE ps2_runtime)
+    add_executable(vu0_recomp EXCLUDE_FROM_ALL tools/vu1_recomp.cpp)
+    target_compile_definitions(vu0_recomp PRIVATE PS2X_VU_UNIT=0)
+    target_link_libraries(vu0_recomp PRIVATE ps2_runtime)
+    set(PS2X_VU0_PROGRAMS "" CACHE PATH "Directory of generated VU0 programs")
+    if(PS2X_VU0_PROGRAMS AND EXISTS "${PS2X_VU0_PROGRAMS}/vu0_programs.cpp")
+        file(GLOB PS2X_VU0_PROGRAM_SOURCES CONFIGURE_DEPENDS "${PS2X_VU0_PROGRAMS}/*.cpp")
+        add_library(ps2_vu0_programs OBJECT ${PS2X_VU0_PROGRAM_SOURCES})
+        target_include_directories(ps2_vu0_programs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu)
+        target_link_libraries(ps2_vu0_programs PRIVATE ps2_runtime)
+        target_compile_options(ps2_vu0_programs PRIVATE -ffp-contract=off -frounding-math -O2)
+        target_link_libraries(vu0_replay PRIVATE ps2_vu0_programs)
+        if(TARGET ps2EntryRunner)
+            target_link_libraries(ps2EntryRunner PRIVATE ps2_vu0_programs)
+        endif()
+    endif()
     set(PS2X_VU1_PROGRAMS "" CACHE PATH "Directory of generated VU1 programs (vu1_recomp output)")
     if(PS2X_VU1_PROGRAMS AND EXISTS "${PS2X_VU1_PROGRAMS}/vu1_programs.cpp")
         file(GLOB PS2X_VU1_PROGRAM_SOURCES CONFIGURE_DEPENDS "${PS2X_VU1_PROGRAMS}/*.cpp")
@@ -689,6 +754,22 @@ if(NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
         if(TARGET ps2EntryRunner)
             target_link_libraries(ps2EntryRunner PRIVATE ps2_vu1_programs)
         endif()
+    endif()
+
+    # PGO for the hot VU program objects too (the VU1 worker is the throughput
+    # wall). Collected alongside the runtime profile:
+    #   PS2X_PGO=generate -> run the game and tools/vu1_replay -> PS2X_PGO=use.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT PS2X_PGO STREQUAL "off")
+        foreach(PS2X_PGO_VU ps2_vu1_programs ps2_vu0_programs)
+            if(TARGET ${PS2X_PGO_VU})
+                set_target_properties(${PS2X_PGO_VU} PROPERTIES CXX_COMPILER_LAUNCHER "" C_COMPILER_LAUNCHER "")
+                if(PS2X_PGO STREQUAL "generate")
+                    target_compile_options(${PS2X_PGO_VU} PRIVATE -fprofile-generate=${PS2X_PGO_DIR} -fprofile-update=single)
+                elseif(PS2X_PGO STREQUAL "use")
+                    target_compile_options(${PS2X_PGO_VU} PRIVATE -fprofile-use=${PS2X_PGO_DIR} -fprofile-correction -fprofile-partial-training -Wno-missing-profile -Wno-coverage-mismatch)
+                endif()
+            endif()
+        endforeach()
     endif()
 endif()
 

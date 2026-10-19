@@ -6,6 +6,7 @@
 //
 // usage: gs_replay <capture.bin> [passes]
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_gpu_backend.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_runtime.h"
 
@@ -69,6 +70,30 @@ int main(int argc, char **argv)
     }
     const int passes = argc > 2 ? std::atoi(argv[2]) : 1;
 
+    // Optional stress of binding invalidation when targets are recreated.
+    // No effect on normal replay. Each present selects the next scale.
+    std::vector<uint32_t> scaleSequence;
+    if (const char *value = std::getenv("GS_REPLAY_SCALE_SEQUENCE"))
+    {
+        const char *cursor = value;
+        for (;;)
+        {
+            char *end = nullptr;
+            const unsigned long scale = std::strtoul(cursor, &end, 10);
+            if (end == cursor || scale < 1u || scale > 8u || (*end != ',' && *end != '\0'))
+            {
+                std::fprintf(stderr, "GS_REPLAY_SCALE_SEQUENCE requires comma-separated scales 1..8\n");
+                return 2;
+            }
+            scaleSequence.push_back(static_cast<uint32_t>(scale));
+            if (*end == '\0')
+                break;
+            cursor = end + 1;
+        }
+    }
+    const char *resetAt = std::getenv("GS_REPLAY_RESET_AT_PRESENT");
+    const uint64_t resetPresent = resetAt ? std::strtoull(resetAt, nullptr, 10) : ~0ull;
+
     std::vector<Record> records;
     std::vector<uint8_t> initialVram;
     if (FILE *f = std::fopen(argv[1], "rb"))
@@ -126,6 +151,7 @@ int main(int argc, char **argv)
         // GS_REPLAY_LIMIT=<n>: replay only the first n records (divergence bisection).
         static const size_t s_limit = std::getenv("GS_REPLAY_LIMIT") ? std::strtoull(std::getenv("GS_REPLAY_LIMIT"), nullptr, 10) : records.size();
         size_t replayed = 0;
+        uint64_t presentIndex = 0;
         for (const Record &r : records)
         {
             if (replayed++ >= s_limit)
@@ -147,6 +173,11 @@ int main(int argc, char **argv)
                 }
                 break;
             case 3u:
+                if (!scaleSequence.empty())
+                    g_gsGpuScaleRequest.store(scaleSequence[presentIndex % scaleSequence.size()], std::memory_order_relaxed);
+                if (presentIndex == resetPresent)
+                    gs->reset();
+                ++presentIndex;
                 if (r.data.size() == sizeof(GSRegisters))
                     std::memcpy(static_cast<void *>(&regs), r.data.data(), sizeof(GSRegisters));
                 gs->latchHostPresentationFrame();

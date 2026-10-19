@@ -1,4 +1,5 @@
 #include "ThreadNaming.h"
+#include "runtime/ps2_spinlock.h"
 #include <chrono>
 #include <map>
 #include <string>
@@ -18,6 +19,10 @@
 #include <vector>
 
 extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
+
+// Times the VU1 worker had to block because the bounded GS queue was full.
+// Distinguishes a VU1-compute-bound stall from a GS/GPU-bound stall.
+std::atomic<uint64_t> g_ps2GsSpaceBlocks{0};
 
 namespace
 {
@@ -1256,8 +1261,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
     if (m_asyncVif1 && !t_onAsyncVif1Worker)
     {
-        if ((address >= 0x10003C00u && address < 0x10004000u) || (address >= 0x10005000u && address < 0x10006000u) ||
-            (address >= 0x10009000u && address < 0x10009100u) || (address >= 0x1000A000u && address < 0x1000A100u))
+        // Setting up the next VIF1 DMA (D1 registers) need not wait for the
+        // previous one: a kick copies its data, queues behind the one in
+        // flight and completes in order (see pollAsyncVif1). The game kicks
+        // each frame's display list without checking CHCR, which the PS2's
+        // DMA always beats; waiting for the whole VU1+GS pipeline here blocked
+        // the EE, and with it VBlank delivery, for up to ~35 ms per frame.
+        // PS2X_VIF1_KICK_WAIT=1 restores the full wait.
+        static const bool s_kickWait = std::getenv("PS2X_VIF1_KICK_WAIT") != nullptr;
+        if (address >= 0x10009000u && address < 0x10009100u && !s_kickWait)
+            waitForVif1KickSlot(address == 0x10009000u ? "d1Chcr" : address == 0x10009010u ? "d1Madr"
+                                : address == 0x10009020u ? "d1Qwc" : address == 0x10009030u ? "d1Tadr" : "d1Other");
+        else if ((address >= 0x10003C00u && address < 0x10004000u) || (address >= 0x10005000u && address < 0x10006000u) ||
+                 (address >= 0x10009000u && address < 0x10009100u) || (address >= 0x1000A000u && address < 0x1000A100u))
             waitForAsyncVif1(address == 0x10009000u ? "d1Chcr" : address == 0x10009010u ? "d1Madr" : address == 0x10009020u ? "d1Qwc" : address == 0x10009030u ? "d1Tadr" : (address >= 0x10009000u && address < 0x10009100u) ? "d1Other"
                              : (address >= 0x1000A000u && address < 0x1000A100u) ? "d2Write"
                                                                                   : "vifWrite"); // VIF1 / D1 / GIF DMA state
@@ -1496,6 +1512,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     // Big frames (world sectors) easily exceed thousands of tags per chain;
                     // the cap only guards against looping chains.
                     const int kMaxChainTags = 1 << 20;
+                    // A corrupt/cyclic chain can otherwise copy without bound and spin
+                    // the EE here for minutes (the observed dormant-guest stall). Bound
+                    // the total copied bytes so a bad chain bails quickly instead.
+                    constexpr uint64_t kMaxChainBytes = 256ull * 1024ull * 1024ull;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1689,6 +1709,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         if (hasPayload)
                             appendData(dataAddr, tagQwc);
+                        if (chainBuf.size() > kMaxChainBytes)
+                        {
+                            static std::atomic<uint32_t> s_byteLogs{0};
+                            if (s_byteLogs.fetch_add(1, std::memory_order_relaxed) < 8u)
+                                std::cerr << "[dma:chain-bytes] ch=0x" << std::hex << channelBase
+                                          << " tadr=0x" << tagAddr << std::dec << " tags=" << tagsProcessed
+                                          << " bytes=" << chainBuf.size() << std::endl;
+                            break;
+                        }
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
@@ -1848,6 +1877,19 @@ bool PS2Memory::onAsyncVif1Worker()
 
 void ps2PcSampleCurrentThread();
 
+// Position of GS work in the game's VIF1 batch stream, which the VCS port's
+// frame interpolation uses to pair camera samples with pictures. LCS does not
+// track the stream (interpolation is not used): ~0 means "now".
+uint64_t ps2Vif1StreamCommitted()
+{
+    return 0u;
+}
+
+uint64_t ps2Vif1StreamPosition()
+{
+    return ~0ull;
+}
+
 void PS2Memory::asyncVif1WorkerLoop()
 {
     t_onAsyncVif1Worker = true;
@@ -1866,6 +1908,7 @@ void PS2Memory::asyncVif1WorkerLoop()
             m_vif1Batches.pop_front();
             m_vif1WorkerActive = true;
         }
+        m_vif1IdleCv.notify_all(); // a kick slot is free
         for (PendingTransfer &transfer : batch)
         {
             if (!transfer.chainData.empty())
@@ -1885,7 +1928,7 @@ void PS2Memory::asyncVif1WorkerLoop()
             continue;
         }
         {
-            std::lock_guard<std::recursive_mutex> gifLock(m_gifArbiterMutex);
+            std::lock_guard<Ps2SpinLock> gifLock(m_gifArbiterMutex);
             if (m_gifArbiter)
                 m_gifArbiter->drain();
         }
@@ -1909,6 +1952,8 @@ void PS2Memory::enqueueGsWork(GsWorkItem &&item)
         std::unique_lock<std::mutex> lock(m_gsQueueMutex);
         // Bounded so the VU1 worker cannot run far ahead of the GS.
         constexpr size_t kMaxQueued = 4096u;
+        if (m_gsQueue.size() >= kMaxQueued)
+            g_ps2GsSpaceBlocks.fetch_add(1u, std::memory_order_relaxed);
         m_gsSpaceCv.wait(lock, [this]()
                          { return m_gsQueue.size() < kMaxQueued || m_gsStop; });
         m_gsQueue.push_back(std::move(item));
@@ -1922,9 +1967,17 @@ void PS2Memory::enqueueGsWork(GsWorkItem &&item)
 void PS2Memory::gsFrontendLoop()
 {
     ThreadNaming::SetCurrentThreadName("GsFrontend");
+    // PS2X_GS_FRONTEND_STATS: wall time waiting for work vs processing it (by
+    // item kind), every ~5 s, to tell a busy frontend from a blocked one.
+    static const bool s_stats = std::getenv("PS2X_GS_FRONTEND_STATS") != nullptr;
+    using Clock = std::chrono::steady_clock;
+    double idleSeconds = 0.0, packetSeconds = 0.0, otherSeconds = 0.0;
+    uint64_t packets = 0, packetBytes = 0;
+    auto statStart = Clock::now();
     for (;;)
     {
         GsWorkItem item;
+        const auto waitStart = s_stats ? Clock::now() : Clock::time_point{};
         {
             std::unique_lock<std::mutex> lock(m_gsQueueMutex);
             m_gsQueueCv.wait(lock, [this]()
@@ -1935,6 +1988,9 @@ void PS2Memory::gsFrontendLoop()
             m_gsQueue.pop_front();
         }
         m_gsSpaceCv.notify_one();
+        const auto workStart = s_stats ? Clock::now() : Clock::time_point{};
+        if (s_stats)
+            idleSeconds += std::chrono::duration<double>(workStart - waitStart).count();
         switch (item.kind)
         {
         case GsWorkItem::Kind::Packet:
@@ -1943,14 +1999,14 @@ void PS2Memory::gsFrontendLoop()
             break;
         case GsWorkItem::Kind::FlushMaskedPath3:
         {
-            std::lock_guard<std::recursive_mutex> gifLock(m_gifArbiterMutex);
+            std::lock_guard<Ps2SpinLock> gifLock(m_gifArbiterMutex);
             flushMaskedPath3Packets();
             break;
         }
         case GsWorkItem::Kind::BatchEnd:
         {
             {
-                std::lock_guard<std::recursive_mutex> gifLock(m_gifArbiterMutex);
+                std::lock_guard<Ps2SpinLock> gifLock(m_gifArbiterMutex);
                 if (m_gifArbiter)
                     m_gifArbiter->drain();
             }
@@ -1962,6 +2018,32 @@ void PS2Memory::gsFrontendLoop()
             m_vif1IdleCv.notify_all();
             break;
         }
+        }
+        if (s_stats)
+        {
+            const auto now = Clock::now();
+            const double seconds = std::chrono::duration<double>(now - workStart).count();
+            if (item.kind == GsWorkItem::Kind::Packet)
+            {
+                packetSeconds += seconds;
+                ++packets;
+                packetBytes += item.data.size();
+            }
+            else
+            {
+                otherSeconds += seconds;
+            }
+            const double window = std::chrono::duration<double>(now - statStart).count();
+            if (window >= 5.0)
+            {
+                std::fprintf(stderr, "[gsfront] f=%llu window=%.2fs idle=%.2fs packets=%.2fs (%llu, %.1f MB) other=%.2fs\n",
+                             static_cast<unsigned long long>(g_ps2PresentedFrameCounter.load(std::memory_order_relaxed)),
+                             window, idleSeconds, packetSeconds, static_cast<unsigned long long>(packets),
+                             packetBytes / 1048576.0, otherSeconds);
+                idleSeconds = packetSeconds = otherSeconds = 0.0;
+                packets = packetBytes = 0;
+                statStart = now;
+            }
         }
         if (!item.data.empty() || item.data.capacity() != 0u)
         {
@@ -2002,21 +2084,12 @@ namespace
     }
 }
 
-void PS2Memory::waitForAsyncVif1(const char *why)
+namespace
 {
-    if (!m_asyncVif1 || t_onAsyncVif1Worker)
-        return;
-    static const bool s_stats = std::getenv("PS2X_SYNC_STATS") != nullptr;
-    const auto start = s_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // PS2X_SYNC_STATS: EE waits on the VIF1 / GS pipeline, per site, reported
+    // every 1200 presented frames.
+    void recordSyncWait(const char *why, double seconds)
     {
-        std::unique_lock<std::mutex> lock(m_vif1QueueMutex);
-        m_vif1IdleCv.wait(lock, [this]()
-                          { return m_vif1Batches.empty() && !m_vif1WorkerActive && m_gsPendingBatches == 0u; });
-    }
-    pollAsyncVif1();
-    if (s_stats)
-    {
-        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         SyncStats &stats = syncStats();
         std::lock_guard<std::mutex> lock(stats.mutex);
         auto &site = stats.sites[why];
@@ -2035,6 +2108,40 @@ void PS2Memory::waitForAsyncVif1(const char *why)
     }
 }
 
+void PS2Memory::waitForAsyncVif1(const char *why)
+{
+    if (!m_asyncVif1 || t_onAsyncVif1Worker)
+        return;
+    static const bool s_stats = std::getenv("PS2X_SYNC_STATS") != nullptr;
+    const auto start = s_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    {
+        std::unique_lock<std::mutex> lock(m_vif1QueueMutex);
+        m_vif1IdleCv.wait(lock, [this]()
+                          { return m_vif1Batches.empty() && !m_vif1WorkerActive && m_gsPendingBatches == 0u; });
+    }
+    pollAsyncVif1();
+    if (s_stats)
+        recordSyncWait(why, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+}
+
+// At most one VIF1 batch queued behind the one the worker is on, so the EE
+// stays no more than a frame ahead of VU1.
+void PS2Memory::waitForVif1KickSlot(const char *why)
+{
+    if (!m_asyncVif1 || t_onAsyncVif1Worker)
+        return;
+    static const bool s_stats = std::getenv("PS2X_SYNC_STATS") != nullptr;
+    const auto start = s_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    {
+        std::unique_lock<std::mutex> lock(m_vif1QueueMutex);
+        if (!m_vif1Batches.empty())
+            m_vif1IdleCv.wait(lock, [this]() { return m_vif1Batches.empty(); });
+    }
+    pollAsyncVif1();
+    if (s_stats)
+        recordSyncWait(why, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+}
+
 bool PS2Memory::pollAsyncVif1()
 {
     if (!m_asyncVif1 || t_onAsyncVif1Worker)
@@ -2044,8 +2151,8 @@ bool PS2Memory::pollAsyncVif1()
         return false;
     while (m_vif1Applied != finished)
     {
-        completeVif1Dma();
         ++m_vif1Applied;
+        completeVif1Dma(m_vif1Applied == m_vif1Kicked);
     }
     if (m_vif1CompletionHook)
         m_vif1CompletionHook();
@@ -2068,11 +2175,14 @@ void PS2Memory::raiseDStatChannelBit(uint32_t channelBit)
     m_ioRegisters[D_STAT] = dstat;
 }
 
-void PS2Memory::completeVif1Dma()
+void PS2Memory::completeVif1Dma(bool latestKick)
 {
     static constexpr uint32_t VIF1_CHANNEL = 0x10009000;
     raiseDStatChannelBit(1u);
     queueCompletedDmacCause(1u);
+    // An older transfer finishing must not end the one kicked after it.
+    if (!latestKick)
+        return;
     m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
     m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
 }
@@ -2097,7 +2207,7 @@ void PS2Memory::processPendingTransfers()
     // PATH3 must not overtake PATH1/PATH2 output still being produced.
     if (!m_pendingGifTransfers.empty())
         waitForAsyncVif1("path3");
-    std::unique_lock<std::recursive_mutex> gifLock(m_gifArbiterMutex);
+    std::unique_lock<Ps2SpinLock> gifLock(m_gifArbiterMutex);
     const bool hadGif = !m_pendingGifTransfers.empty();
     uint32_t observedGifQwc = 0u;
     for (const auto &transfer : m_pendingGifTransfers)
@@ -2281,6 +2391,7 @@ void PS2Memory::processPendingTransfers()
         {
             std::lock_guard<std::mutex> lock(m_vif1QueueMutex);
             m_vif1Batches.push_back(std::move(batch));
+            ++m_vif1Kicked;
             if (!m_vif1Worker.joinable())
                 m_vif1Worker = std::thread([this]()
                                            { asyncVif1WorkerLoop(); });
@@ -2459,7 +2570,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
 void PS2Memory::submitGifPacketNow(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
-    std::lock_guard<std::recursive_mutex> gifLock(m_gifArbiterMutex);
+    std::lock_guard<Ps2SpinLock> gifLock(m_gifArbiterMutex);
 
     if (pathId == GifPathId::Path3)
     {

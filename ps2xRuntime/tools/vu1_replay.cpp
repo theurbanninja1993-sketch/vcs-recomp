@@ -9,6 +9,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_vu1.h"
 #include "ps2_runtime.h"
+#include "vu_unit_config.h"
 
 #include <csignal>
 #include <sys/time.h>
@@ -54,7 +55,13 @@ namespace
         return std::memcmp(a.vf, b.vf, sizeof(a.vf)) == 0 && std::memcmp(a.vi, b.vi, sizeof(a.vi)) == 0 &&
                std::memcmp(a.acc, b.acc, sizeof(a.acc)) == 0 && std::memcmp(&a.q, &b.q, 4) == 0 &&
                std::memcmp(&a.p, &b.p, 4) == 0 && std::memcmp(&a.i, &b.i, 4) == 0 && a.r == b.r &&
-               (flagless || (a.mac == b.mac && a.status == b.status)) && a.clip == b.clip && a.pc == b.pc;
+               (flagless || (a.mac == b.mac && a.status == b.status)) && a.clip == b.clip && a.pc == b.pc &&
+               (!kVu0 || (a.cycles == b.cycles && a.ebit == b.ebit &&
+                          a.haltAfterDelaySlot == b.haltAfterDelaySlot && a.dBitEnabled == b.dBitEnabled &&
+                          a.tBitEnabled == b.tBitEnabled && a.stoppedByD == b.stoppedByD &&
+                          a.stoppedByT == b.stoppedByT && a.top == b.top && a.itop == b.itop &&
+                          a.branchPending == b.branchPending &&
+                          (!a.branchPending || (a.branchTarget == b.branchTarget && a.branchDelay == b.branchDelay))));
     }
 }
 
@@ -66,6 +73,11 @@ int main(int argc, char **argv)
         return 2;
     }
     const int passes = argc > 2 ? std::atoi(argv[2]) : 1;
+    if (passes <= 0)
+    {
+        std::fprintf(stderr, "passes must be positive\n");
+        return 2;
+    }
 
     std::vector<Record> records;
     if (FILE *f = std::fopen(argv[1], "rb"))
@@ -73,9 +85,16 @@ int main(int argc, char **argv)
         for (;;)
         {
             uint32_t header[4];
-            if (std::fread(header, sizeof(header), 1, f) != 1)
+            const size_t headerBytes = std::fread(header, 1, sizeof(header), f);
+            if (headerBytes == 0u && std::feof(f))
                 break;
-            if (header[0] != 0x31555643u)
+            if (headerBytes != sizeof(header))
+            {
+                std::fprintf(stderr, "truncated record header\n");
+                std::fclose(f);
+                return 1;
+            }
+            if (header[0] != kVuCaptureMagic)
             {
                 std::fprintf(stderr, "bad record magic\n");
                 return 1;
@@ -84,18 +103,32 @@ int main(int argc, char **argv)
             r.startPC = header[1];
             r.top = header[2];
             r.itop = header[3];
-            r.code.resize(PS2_VU1_CODE_SIZE);
-            r.dataBefore.resize(PS2_VU1_DATA_SIZE);
-            r.dataAfter.resize(PS2_VU1_DATA_SIZE);
+            r.code.resize(kVuCodeSize);
+            r.dataBefore.resize(kVuDataSize);
+            r.dataAfter.resize(kVuDataSize);
             if (std::fread(&r.before, sizeof(VU1State), 1, f) != 1 ||
                 std::fread(r.code.data(), 1, r.code.size(), f) != r.code.size() ||
                 std::fread(r.dataBefore.data(), 1, r.dataBefore.size(), f) != r.dataBefore.size() ||
                 std::fread(&r.after, sizeof(VU1State), 1, f) != 1 ||
                 std::fread(r.dataAfter.data(), 1, r.dataAfter.size(), f) != r.dataAfter.size())
-                break; // truncated tail
+            {
+                std::fprintf(stderr, "truncated record payload\n");
+                std::fclose(f);
+                return 1;
+            }
             records.push_back(std::move(r));
         }
         std::fclose(f);
+    }
+    else
+    {
+        std::perror(argv[1]);
+        return 1;
+    }
+    if (records.empty())
+    {
+        std::fprintf(stderr, "capture contains no records\n");
+        return 1;
     }
     std::printf("%zu records\n", records.size());
 
@@ -110,7 +143,7 @@ int main(int argc, char **argv)
                                     gifBytes += size;
                                     for (uint32_t i = 0; i < size; ++i)
                                         gifHash = (gifHash ^ data[i]) * 1099511628211ull; });
-    VU1Interpreter vu1(VU1Interpreter::Unit::VU1);
+    VU1Interpreter vu1(kVuUnit);
 
     const char *profilePath = std::getenv("VU1_PROFILE");
     if (profilePath)
@@ -131,25 +164,38 @@ int main(int argc, char **argv)
         for (size_t index = 0; index < records.size(); ++index)
         {
             const Record &r = records[index];
-            if (std::memcmp(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE) != 0)
+            if (std::memcmp(vuCode(memory), r.code.data(), kVuCodeSize) != 0)
             {
-                std::memcpy(memory.getVU1Code(), r.code.data(), PS2_VU1_CODE_SIZE);
-                memory.markVU1CodeModified();
+                std::memcpy(vuCode(memory), r.code.data(), kVuCodeSize);
+                markVuCodeModified(memory);
             }
-            std::memcpy(memory.getVU1Data(), r.dataBefore.data(), PS2_VU1_DATA_SIZE);
+            std::memcpy(vuData(memory), r.dataBefore.data(), kVuDataSize);
+            if constexpr (kVu0) vu1.reset();
             vu1.state() = r.before;
             vu1.clearRanFlagless();
 
             const auto t0 = std::chrono::steady_clock::now();
-            vu1.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                        gs, &memory, r.startPC, r.top, r.itop, 65536);
+            vu1.execute(vuCode(memory), kVuCodeSize, vuData(memory), kVuDataSize,
+                        gs, &memory, r.startPC, r.top, r.itop, kVuBudget);
             seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
-            if (pass == 0 && (!sameState(vu1.state(), r.after, vu1.ranFlaglessProgram()) ||
-                              std::memcmp(memory.getVU1Data(), r.dataAfter.data(), PS2_VU1_DATA_SIZE) != 0))
+            if (pass == 0 && (!sameState(vu1.state(), r.after, (!kVu0 && vu1.ranFlaglessProgram())) ||
+                              std::memcmp(vuData(memory), r.dataAfter.data(), kVuDataSize) != 0))
             {
                 if (mismatches < 10)
+                {
                     std::printf("mismatch: record %zu pc=0x%x\n", index, r.startPC);
+                    if constexpr (kVu0)
+                    {
+                        const auto &a = vu1.state();
+                        const auto &b = r.after;
+                        std::printf("  vf=%d vi=%d acc=%d data=%d cycles=%llu/%llu mac=%x/%x status=%x/%x clip=%x/%x pc=%x/%x\n",
+                                    std::memcmp(a.vf, b.vf, sizeof(a.vf)), std::memcmp(a.vi, b.vi, sizeof(a.vi)),
+                                    std::memcmp(a.acc, b.acc, sizeof(a.acc)), std::memcmp(vuData(memory), r.dataAfter.data(), kVuDataSize),
+                                    static_cast<unsigned long long>(a.cycles), static_cast<unsigned long long>(b.cycles),
+                                    a.mac, b.mac, a.status, b.status, a.clip, b.clip, a.pc, b.pc);
+                    }
+                }
                 ++mismatches;
             }
         }
@@ -157,6 +203,9 @@ int main(int argc, char **argv)
     std::printf("mismatches=%zu time=%.3fs (%.1f us/record) gifBytes=%llu gifHash=%016llx\n", mismatches, seconds,
                 seconds * 1e6 / static_cast<double>(records.size() * passes), static_cast<unsigned long long>(gifBytes / passes),
                 static_cast<unsigned long long>(gifHash));
+    std::printf("compiledCalls=%llu interpretedCalls=%llu\n",
+                static_cast<unsigned long long>((kVu0 ? g_ps2Vu0CompiledCalls : g_ps2Vu1CompiledCalls).load()),
+                static_cast<unsigned long long>((kVu0 ? g_ps2Vu0InterpretedCalls : g_ps2Vu1InterpretedCalls).load()));
     if (profilePath)
     {
         itimerval off{};

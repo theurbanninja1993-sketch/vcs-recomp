@@ -67,6 +67,7 @@ namespace ps2x::iop::detail
 
         void sleepCurrent(IopCpuState &cpu);
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
+        [[nodiscard]] bool hasCurrentThread() const noexcept { return m_currentThread != nullptr; }
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;

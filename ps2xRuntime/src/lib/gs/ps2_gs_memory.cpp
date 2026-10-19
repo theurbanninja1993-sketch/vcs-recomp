@@ -220,6 +220,34 @@ namespace GSMem
         PixelStorageTraits<P4>::InitPageLookupTable(PageTableP4, BlockTableP4, ColumnTable4);
     }
 
+    template <PixelStorageMode P, typename Table>
+    static u32 PixelByteAddressT(const Table& table, u32 bp, u32 bw, u32 x, u32 y)
+    {
+        const u32 pixel = PixelStorageTraits<P>::Address(table, bp, bw, x, y);
+        return static_cast<u32>((static_cast<u64>(pixel) * UnpackedBitWidth(P) / 8u) & (MEMORY_SIZE - 1u));
+    }
+
+    u32 PixelByteAddress(u32 psm, u32 bp, u32 bw, u32 x, u32 y)
+    {
+        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
+        {
+        case C32: return PixelByteAddressT<C32>(PageTableC32, bp, bw, x, y);
+        case C24: return PixelByteAddressT<C24>(PageTableC32, bp, bw, x, y);
+        case C16: return PixelByteAddressT<C16>(PageTableC16, bp, bw, x, y);
+        case C16S: return PixelByteAddressT<C16S>(PageTableC16S, bp, bw, x, y);
+        case P8: return PixelByteAddressT<P8>(PageTableP8, bp, bw, x, y);
+        case P4: return PixelByteAddressT<P4>(PageTableP4, bp, bw, x, y);
+        case P8H: return PixelByteAddressT<P8H>(PageTableC32, bp, bw, x, y);
+        case P4HL: return PixelByteAddressT<P4HL>(PageTableC32, bp, bw, x, y);
+        case P4HH: return PixelByteAddressT<P4HH>(PageTableC32, bp, bw, x, y);
+        case Z32: return PixelByteAddressT<Z32>(PageTableZ32, bp, bw, x, y);
+        case Z24: return PixelByteAddressT<Z24>(PageTableZ32, bp, bw, x, y);
+        case Z16: return PixelByteAddressT<Z16>(PageTableZ16, bp, bw, x, y);
+        case Z16S: return PixelByteAddressT<Z16S>(PageTableZ16S, bp, bw, x, y);
+        default: return 0u;
+        }
+    }
+
     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y)
     {
         switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
@@ -320,8 +348,92 @@ namespace GSMem
         PixelStorageTraits<P4HH>::Write(PageTableC32, data, bp, bw, x, y, value);
     }
 
+    template <PixelStorageMode P, typename Table>
+    static void WriteRowT(const Table& table, u8* data, u32 bp, u32 bw, u32 x, u32 y, const u32* values, u32 count)
+    {
+        for (u32 i = 0; i < count; ++i)
+            PixelStorageTraits<P>::Write(table, data, bp, bw, x + i, y,
+                                         static_cast<typename PixelStorageTraits<P>::PackedT>(values[i]));
+    }
+
+    bool WriteRow(u32 psm, u8* data, u32 bp, u32 bw, u32 x, u32 y, const u32* values, u32 count)
+    {
+        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
+        {
+        case C32: WriteRowT<C32>(PageTableC32, data, bp, bw, x, y, values, count); return true;
+        case C24: WriteRowT<C24>(PageTableC32, data, bp, bw, x, y, values, count); return true;
+        case C16: WriteRowT<C16>(PageTableC16, data, bp, bw, x, y, values, count); return true;
+        case C16S: WriteRowT<C16S>(PageTableC16S, data, bp, bw, x, y, values, count); return true;
+        case P8: WriteRowT<P8>(PageTableP8, data, bp, bw, x, y, values, count); return true;
+        case P4: WriteRowT<P4>(PageTableP4, data, bp, bw, x, y, values, count); return true;
+        case P8H: WriteRowT<P8H>(PageTableC32, data, bp, bw, x, y, values, count); return true;
+        case P4HL: WriteRowT<P4HL>(PageTableC32, data, bp, bw, x, y, values, count); return true;
+        case P4HH: WriteRowT<P4HH>(PageTableC32, data, bp, bw, x, y, values, count); return true;
+        default: return false;
+        }
+    }
+
     void WriteNull(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
+    }
+
+    // Inverse of the 4-bit in-block layout: destination nibble (0..511) ->
+    // source pixel (x, y) inside the 32x16 tile. ColumnTable4 maps (y, x) to
+    // the nibble, so this is that table inverted (a fixed permutation, one
+    // entry per nibble).
+    struct T4TileSource
+    {
+        u8 x, y;
+    };
+
+    constexpr std::array<T4TileSource, 512> BuildT4Inverse()
+    {
+        std::array<T4TileSource, 512> inverse{};
+        for (u32 y = 0; y < 16u; ++y)
+            for (u32 x = 0; x < 32u; ++x)
+                inverse[ColumnTable4[y][x]] = T4TileSource{static_cast<u8>(x), static_cast<u8>(y)};
+        return inverse;
+    }
+
+    constexpr std::array<T4TileSource, 512> T4Inverse = BuildT4Inverse();
+
+    // The destination byte's two nibbles come from fixed places in the source
+    // (the GS column interleave), so the source offset and shift of each can be
+    // precomputed once per upload - srcRowBytes is constant within one. The inner
+    // loop runs 512 times per 256-byte block and a busy capture mirrors hundreds
+    // of megabytes, so removing two multiplies and the (x, y) indirection from it
+    // is worth the 1 KB of tables.
+    T4TileTables BuildT4TileTables(u32 srcRowBytes)
+    {
+        T4TileTables t{};
+        for (u32 byte = 0; byte < 256u; ++byte)
+        {
+            const T4TileSource lo = T4Inverse[2u * byte], hi = T4Inverse[2u * byte + 1u];
+            t.loOffset[byte] = lo.y * srcRowBytes + (lo.x >> 1);
+            t.hiOffset[byte] = hi.y * srcRowBytes + (hi.x >> 1);
+            t.loShift[byte] = static_cast<u8>((lo.x & 1u) * 4u);
+            t.hiShift[byte] = static_cast<u8>((hi.x & 1u) * 4u);
+        }
+        return t;
+    }
+
+    void WriteT4Tile(u8* data, u32 bp, u32 bw, u32 tileX, u32 tileY, const u8* src, const T4TileTables& t)
+    {
+        u8 block[256];
+        for (u32 byte = 0; byte < 256u; ++byte)
+        {
+            const u8 v0 = static_cast<u8>((src[t.loOffset[byte]] >> t.loShift[byte]) & 0xFu);
+            const u8 v1 = static_cast<u8>((src[t.hiOffset[byte]] >> t.hiShift[byte]) & 0xFu);
+            block[byte] = static_cast<u8>(v0 | (v1 << 4));
+        }
+        const u32 blockBase = PixelByteAddress(static_cast<u32>(P4), bp, bw, tileX, tileY) & ~255u;
+        std::memcpy(&data[blockBase & (MEMORY_SIZE - 1u)], block, 256u);
+    }
+
+    // Kept for callers that mirror a single tile.
+    void WriteT4Tile(u8* data, u32 bp, u32 bw, u32 tileX, u32 tileY, const u8* src, u32 srcRowBytes)
+    {
+        WriteT4Tile(data, bp, bw, tileX, tileY, src, BuildT4TileTables(srcRowBytes));
     }
 
     u32 ReadCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y)
