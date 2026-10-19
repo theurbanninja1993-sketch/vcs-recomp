@@ -695,6 +695,17 @@ reaches the retry. Not verified on the laptop; compiled and reviewed.
 `build.sh` stage 5 still has the hidden-only pass. It is the development path, not what the
 owner's launcher runs, so it is left as it is for now.
 
+## 2026-10-19 (Claude, later): the learn pass failed again, and the visible-window retry did not help
+
+The owner's next log (`vcs-build.log`, 16:49) stopped at the same place. Both attempts failed
+with `GLXBadFBConfig`: the hidden window, then the visible retry. The learn pass also ran on
+`llvmpipe` (Mesa's software renderer), so the laptop's X display is not giving the game a GPU.
+
+**Launcher, local commit (not published):** a third attempt runs the learn pass under a private
+X server (`xvfb-run -a`) when the `xvfb` package is installed, and the WSL setup now installs it.
+Checked here: the VCS runner boots under `xvfb-run` with GL 4.6 (llvmpipe), no GLX error. Not
+verified on the laptop.
+
 ## If you are reviewing this
 
 Three things are waiting for a second pair of eyes, and they are the three worth
