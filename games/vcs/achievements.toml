@@ -260,11 +260,12 @@ points = 10
 # which is the wanted level itself. Three cheat entries reach six.
 # A wanted level is 0-6, so a value above that is not one: this byte read 53 on a
 # gameplay frame during the learn route. Hence the step, not `>=6`.
-# The wanted level is the byte at 0x00486752. Found from four dumps taken through the
+# The wanted level is the byte at 0x00486752, which is the stars plus two: 4 is two stars,
+# 6 four, 8 six (checked against the HUD at frames 3100, 3300 and 3600). Found from four dumps taken through the
 # raise-wanted cheat (0, 2, 4, 6 in order), and checked with a per-frame trace: it
 # changes only when the stars do. 0x0052FC74, the old address, was noise.
 # A step from five to six, so a cheat (which goes 4 to 6) cannot earn it.
-trigger = 0xH486752==6
+trigger = 0xH486752==8
 
 [achievement]
 id = 27
