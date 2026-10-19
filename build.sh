@@ -347,9 +347,10 @@ if [ "$FROM" -le 0 ] && [ "$TO" -ge 0 ]; then
         note "extracted folder; boot $game_boot_file"
     else
         need_tool "$ps2_iso"
-        info=$("$ps2_iso" check "$IMAGE" 2>&1) || die "can't read $IMAGE"
+        info=$("$ps2_iso" check "$IMAGE" --boot "$game_boot_file" 2>&1) || die "can't read $IMAGE"
         printf '%s\n' "$info" | sed 's/^/    /'
         hash=$(printf '%s\n' "$info" | sed -n 's/.*boot hash: \([0-9a-f]*\).*/\1/p')
+        [ -n "$hash" ] || die "could not read this disc (the reason is above)"
     fi
     [ "$hash" = "$game_boot_hash_xxh3_128" ] || die "this disc is not $game_name (boot hash $hash)"
     note "recognised: $game_name"

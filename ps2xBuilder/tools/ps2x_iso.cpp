@@ -51,14 +51,54 @@ namespace
         return {};
     }
 
-    bool hashBootFile(ps2x::IsoImage &image, std::string &hash, std::string &error)
+    // The boot file's name: SYSTEM.CNF says which, and says it in one place, so a
+    // disc that does not have that file cannot be checked by name. When it cannot
+    // be read the manifest's name is used instead - the hash below still decides
+    // whether the disc is the right one, so this only changes how it is found.
+    std::string bootFileName(ps2x::IsoImage &image, const std::string &hint, std::string &note)
     {
-        const std::string path = "/" + ps2x::isoBootFile(image);
-        const ps2x::IsoEntry *entry = image.find(path);
-        std::vector<uint8_t> data;
-        if (!entry || !image.readFile(*entry, data, error))
+        const ps2x::IsoEntry *cnf = image.find("/SYSTEM.CNF");
+        if (!cnf)
+            note = "there is no SYSTEM.CNF in the disc's root";
+        else
         {
-            error = "can't read " + path;
+            std::vector<uint8_t> data;
+            std::string readError;
+            if (!image.readFile(*cnf, data, readError))
+                note = "SYSTEM.CNF could not be read: " + readError;
+            else
+            {
+                const std::string name = ps2x::isoBootFile(image);
+                if (!name.empty())
+                    return name;
+                note = "SYSTEM.CNF has no BOOT2 line";
+            }
+        }
+        return hint;
+    }
+
+    bool hashBootFile(ps2x::IsoImage &image, const std::string &hint, std::string &hash, std::string &error)
+    {
+        std::string note;
+        const std::string name = bootFileName(image, hint, note);
+        if (name.empty())
+        {
+            error = note + ", and no boot file name was given to look for";
+            return false;
+        }
+        if (!note.empty())
+            std::printf("    %s; using the boot file name the game expects: %s\n", note.c_str(), name.c_str());
+        const ps2x::IsoEntry *entry = image.find("/" + name);
+        std::vector<uint8_t> data;
+        std::string readError;
+        if (!entry)
+        {
+            error = "there is no " + name + " in the disc's root";
+            return false;
+        }
+        if (!image.readFile(*entry, data, readError))
+        {
+            error = "can't read " + name + ": " + readError;
             return false;
         }
         const XXH128_hash_t h = XXH3_128bits(data.data(), data.size());
@@ -68,7 +108,26 @@ namespace
         return true;
     }
 
-    int checkIso(const std::string &source, bool wait)
+    // What is in the root, so a disc that is not the expected one says what it is.
+    void printRoot(ps2x::IsoImage &image)
+    {
+        std::printf("    the disc's root holds:");
+        size_t shown = 0;
+        for (const auto &entry : image.entries())
+        {
+            if (entry.path.size() < 2 || entry.path.find('/', 1) != std::string::npos)
+                continue;
+            if (shown++ == 40)
+            {
+                std::printf(" ...");
+                break;
+            }
+            std::printf(" %s%s", entry.path.substr(1).c_str(), entry.directory ? "/" : "");
+        }
+        std::printf("\n");
+    }
+
+    int checkIso(const std::string &source, bool wait, const std::string &boot = {})
     {
         std::printf("ps2x_iso - disc check\n=====================\n\n");
 
@@ -115,9 +174,10 @@ namespace
                         image.volumeId().c_str(), ps2x::isoBootFile(image).c_str(), files, image.totalFileBytes());
 
             std::string hash;
-            if (!hashBootFile(image, hash, error))
+            if (!hashBootFile(image, boot, hash, error))
             {
                 std::printf("    %s\n", error.c_str());
+                printRoot(image);
                 continue;
             }
             std::printf("    boot hash: %s\n", hash.c_str());
@@ -143,7 +203,17 @@ int main(int argc, char **argv)
     if (argc < 2)
         return checkIso({}, true);
     if (argc >= 2 && std::string(argv[1]) == "check")
-        return checkIso(argc > 2 ? argv[2] : std::string{}, false);
+    {
+        std::string source, boot;
+        for (int i = 2; i < argc; ++i)
+        {
+            if (std::string(argv[i]) == "--boot" && i + 1 < argc)
+                boot = argv[++i];
+            else
+                source = argv[i];
+        }
+        return checkIso(source, false, boot);
+    }
     if (argc >= 2 && std::string(argv[1]) == "hashfile")
         return hashFile(argc > 2 ? argv[2] : std::string{});
     if (argc >= 2 && std::string(argv[1]) == "drives")
