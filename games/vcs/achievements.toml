@@ -255,7 +255,9 @@ points = 10
 # right, triangle, triangle, down, left, cross, cross) once, with a dump after
 # each. Exactly one address in 32 MB goes 0, 2, 4, 0 through those four dumps,
 # which is the wanted level itself. Three cheat entries reach six.
-trigger = 0xH52FC74>=6
+# A wanted level is 0-6, so a value above that is not one: this byte read 53 on a
+# gameplay frame during the learn route. Hence the step, not `>=6`.
+trigger = 0xH52FC74==6 && d0xH52FC74==5
 
 [achievement]
 id = 27
