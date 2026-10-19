@@ -494,7 +494,12 @@ if [ "$FROM" -le 5 ] && [ "$TO" -ge 5 ]; then
             # Every recording so far (a later pass only adds what is still
             # missing); empty files are passes that found nothing new.
             # Plus anything recorded while playing and compiled by --optimize.
-            mapfile -t recordings < <(find "$learn" "$WORK/vu_played" -name 'vu[01]_learn_*.bin' -size +0 2>/dev/null | sort)
+            # Plus $WORK/vu_pinned: full-playthrough captures that must always be in
+            # the set. A scripted learn route only reaches the intro, so without them
+            # a rebuild quietly drops back to ~21 programs and everything else runs
+            # interpreted (about ten times slower). Symlinks are fine there.
+            mapfile -t recordings < <({ find "$learn" "$WORK/vu_played" -name 'vu[01]_learn_*.bin' -size +0 2>/dev/null
+                                        find -L "$WORK/vu_pinned" -name '*.bin' -size +0 2>/dev/null; } | sort)
             "$vu1_recomp" "$vu1_dir" "${recordings[@]}" || die "vu1_recomp failed"
             [ -f "$vu1_dir/vu1_programs.cpp" ] || die "vu1_recomp wrote no registry"
             note "  $(ls "$vu1_dir"/vu1p_*.cpp 2>/dev/null | wc -l) program file(s)"

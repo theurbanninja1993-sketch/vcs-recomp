@@ -598,7 +598,7 @@ an A/B of each of those changed nothing.
   the intro (7000 frames). Measured with this route: 22 programs (8 VU0) instead
   of 15. That is still short of 30, because a scripted route cannot reach
   everything. So the runtime keeps learning during normal play (below).
-- **Learning during play (done, and the launcher button now exists).** By default the
+- **Learning during play (done; no launcher offer - see the 10-19 entry).** By default the
   runtime records every VU1/VU0 program it meets that has no compiled version
   (4 runs each, the same capture format) into `<config>/vu_learn/`, where
   `<config>` is `<game>/<platform>/config` for portable installs, and writes a
@@ -628,20 +628,51 @@ once driving. Which is exactly what a partial VU program set does - the intro's
 programs cover an interior, and everything outside runs interpreted, about ten times
 slower.
 
-**The launcher contract is implemented now** (launcher `v0.1.31`): the launcher looks
-for `<config>/vu_learn/PENDING` - both the portable folder and the user's config
-folder - says so on the card, and **O** runs `build.sh --optimize` in the port's own
-folder. Verified end to end: the marker is found, the compile runs, the marker is
-cleared, and the port reports "nothing new was recorded: every program the game has
-run is compiled".
-
-**Windows still to do:** the same WSL handoff the build uses, since the Windows
-launcher cannot run a POSIX build itself.
+**Correction (same day, later): the Optimize offer is removed.** The plugin was not the
+cure and may have made things worse; the cause was the program set itself (below).
+The launcher's card hint and O key are gone (local launcher commit; not published).
+`build.sh --optimize` still exists for testing. Recordings made during play are still
+written to `<config>/vu_learn/`, but nothing reads them now.
 
 **The lesson, in the plainest terms I can put it:** this file had the answer, the
 measurements, and the fix. I spent the evening on the renderer, the generated
 function table and the frame pacing instead, and every one of those was a real bug I
 introduced or found - but none of them was this. Read this file first.
+
+### 2026-10-19 (later): the real cause, and why it kept coming back
+
+**The slowdown was the program set, and it reverted without anyone noticing.** The
+10-17 fix (30 programs in `scratch/vcs-vu1.backup-20261017`, `build` and `build-win`
+pointed at it) was undone by the next `build.sh` run. Stage 5 does
+`rm -rf "$vu1_dir"` and rebuilds `build/vu1` from the scripted learn route (intro
+only, about 21 programs), then configures both builds to it. Anything not in that
+set runs interpreted.
+
+**Durable fix:** `build.sh` stage 5 now also feeds in every `.bin` under
+`$WORK/vu_pinned/` (captures that must always be in the set). The owner's four
+captures are linked there: `scratch/vu1_capture.bin`, `vu1_capture2.bin`,
+`vu1_capture3.bin`, `vu0_capture.bin`. Symlinks are fine. Regenerating with the
+stage's inputs gives **36 programs**: all 30 of the backup plus 6 from recordings made
+during play. The README in the backup says the set is one registry and a subset
+replaces it, so pass everything.
+
+**Measured** on the build's own learn route (7000 frames, the pad script from
+`games/vcs/game.toml`, `PS2X_PERF_LOG`):
+- the 15-program set (10-17, before the fix): VU1 worker 72-88%, cutscene 155-181/600
+  late. The 21-program set (what the build had reverted to) was not re-measured with
+  these counters; it has the same failure mode, with fewer missing programs.
+- 36-program set (this): every VU1 call compiled, **0 interpreted**, 0 late frames
+  in every 600-frame window.
+- The 36-program set is in `build/vu1`; both `build` and `build-win` are configured
+  to it. Driving outside the barracks is still the owner's test to confirm.
+
+**What to do:** the owner's captures live outside the repo. A player's build has
+none of them, so a player's VU1 set will be the intro-only set until a better
+capture route exists. That is the next real problem for the release, not this one.
+
+**Plugin lesson:** the learned plugin (`vu1_programs.so`) was built from play
+recordings and was not verified to help. It is parked as `.so.off` in `build/`.
+Verify with the counters above before using the plugin again.
 
 ## If you are reviewing this
 
