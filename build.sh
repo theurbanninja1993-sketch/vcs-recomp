@@ -323,21 +323,9 @@ if [ "$WINDOWS" -eq 1 ]; then
         fi
     done
 fi
-if [ "$WINDOWS" -eq 1 ] && [ "$wants_windows" -eq 0 ]; then
-    note "--windows given but no stage that uses it is in range; nothing to do"
-fi
-if [ "$wants_windows" -eq 1 ]; then
-    stage_begin "windows (configuring the cross-compile)"
-    ensure_toolchain
-    # Crossing needs the host's own build too: the VU1 microprograms are learnt by
-    # *running the game*, and the Linux runner is the one that can run here.
-    run cmake -S "$PS2RECOMP" -B "$PS2RECOMP/build-win" -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_TOOLCHAIN_FILE="$PS2RECOMP/cmake/toolchains/llvm-mingw-x86_64.cmake" \
-        -DLLVM_MINGW_ROOT="$TOOLCHAIN"
-    stage_end
-fi
-
 # ---------------------------------------------------------------- stage 0
+# Before the Windows configure, which takes minutes: a wrong disc is the one failure
+# that needs only ps2x_iso, which the tools stage has just built.
 if [ "$FROM" -le 0 ] && [ "$TO" -ge 0 ]; then
     stage_begin "0. checking the disc"
     if [ -d "$IMAGE" ]; then
@@ -354,6 +342,20 @@ if [ "$FROM" -le 0 ] && [ "$TO" -ge 0 ]; then
     fi
     [ "$hash" = "$game_boot_hash_xxh3_128" ] || die "this disc is not $game_name (boot hash $hash)"
     note "recognised: $game_name"
+    stage_end
+fi
+
+if [ "$WINDOWS" -eq 1 ] && [ "$wants_windows" -eq 0 ]; then
+    note "--windows given but no stage that uses it is in range; nothing to do"
+fi
+if [ "$wants_windows" -eq 1 ]; then
+    stage_begin "windows (configuring the cross-compile)"
+    ensure_toolchain
+    # Crossing needs the host's own build too: the VU1 microprograms are learnt by
+    # *running the game*, and the Linux runner is the one that can run here.
+    run cmake -S "$PS2RECOMP" -B "$PS2RECOMP/build-win" -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_TOOLCHAIN_FILE="$PS2RECOMP/cmake/toolchains/llvm-mingw-x86_64.cmake" \
+        -DLLVM_MINGW_ROOT="$TOOLCHAIN"
     stage_end
 fi
 
