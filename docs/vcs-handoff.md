@@ -1,8 +1,40 @@
 # GTA Vice City Stories (SLUS_215.90) recomp: handoff notes
 
 State as of 2026-10-18 (`vcs-bringup` is the tip the `release` branch players build
-from was cut at, tagged `stories-v0.1.6`; the launcher is its own repo at `d462890` =
-`v0.1.10`). Read this before changing anything. A reviewer will check work against it.
+from was cut at, tagged `stories-v0.1.6`; the launcher is its own repo at `171e2b3` =
+`v0.1.11`). Read this before changing anything. A reviewer will check work against it.
+
+## 2026-10-18 later still (Claude): B says why it cannot build on Windows
+
+Owner, after `v0.1.10`: *"nothing happens when I press B on the windows version. the
+Linux version works"* - and that was exactly right, and the worst possible answer.
+The Windows launcher has no build to drive: `runTool` on Windows is a stub returning
+-1 ("there is no Windows build to drive yet"), because the port is built by Linux and
+the Windows port is cross-compiled from Linux. The B handler's guard was an empty
+block with a comment. A key that does nothing reads as a broken key, not as a
+deliberate limit - the same lesson as "pressing U does nothing".
+
+Launcher `v0.1.11` (`171e2b3`). B now says which of the three things is missing - no
+`port=` in launcher.ini, a source that has not been fetched, or a machine that cannot
+build - in the same full-screen notice style as the other reports, and the last one
+prints the route with the player's own folder in it:
+
+    wsl --cd "C:\...\the-launcher" ./ps2x_launcher
+
+**The Windows release now carries the Linux launcher**, which is what makes that one
+line work: same folder, so the same `launcher.ini` and the same `port/`, and under
+WSL the launcher cross-compiles the *Windows* port - so what the WSL build produces
+is what the Windows launcher plays. Before this the Windows build story was "download
+the other release too and work out which folder to be in". `make_release.sh` takes an
+optional extra binary for the folder now.
+
+The notice takes the `--screenshot` capture the other screens take, so it can be
+looked at without a person at the screen. Verified that way: heading, wrapped
+paragraphs and the command on its own line all render as intended.
+
+**Note for whoever reads this next:** `v0.1.10` is the first launcher whose update
+button fetches and installs, and `v0.1.11` is the first release it can be tested
+against, because it needs something newer to exist. From here an update is a click.
 
 ## 2026-10-18 late (Claude): the launcher updates itself, and two fetch bugs
 
