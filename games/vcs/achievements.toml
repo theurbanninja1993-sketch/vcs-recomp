@@ -65,6 +65,11 @@ version = 1
 # ---------------------------------------------------------------- story (6)
 # One per act, first and last mission of each chapter, the way the official sets
 # name theirs after the mission.
+#
+# The story counter is a float at 0x004CD18C: 0.0 before the first story mission,
+# and one more for each story mission passed (found by RAM dumps, Soldier through
+# Conduct Unbecoming: 0, 1, 2, 3). Its value at each milestone is the number of
+# missions passed so far, so `0xf4CD18C>=n` is "passed at least n".
 
 [achievement]
 id = 1
@@ -72,7 +77,7 @@ title = Soldier
 description = Complete "Soldier".
 category = Story
 points = 10
-# TODO: the mission-passed flag or counter
+trigger = 0xf4CD18C>=1
 
 [achievement]
 id = 2
