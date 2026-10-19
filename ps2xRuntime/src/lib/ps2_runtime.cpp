@@ -12,6 +12,7 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_gpu_backend.h" // g_gsGpuPresent*: present readback cap
+#include "ps2_narrow.h"
 extern std::atomic<uint64_t> g_gsComposedFrames;
 #include "runtime/ps2_camera.h"
 #include "runtime/ee_scheduler.h"
@@ -1888,7 +1889,7 @@ namespace
             return;
         std::string path(env);
         path = path.substr(0, path.find(','));
-        if (FILE *f = std::fopen(path.c_str(), "wb"))
+        if (FILE *f = std::fopen(ps2x::narrow(path).c_str(), "wb"))
         {
             std::fwrite(g_pcSamples, sizeof(uint32_t), g_pcSampleCount.load(), f);
             std::fclose(f);
@@ -1964,7 +1965,7 @@ static void ps2Vu1TraceMscal(const uint8_t *vu1Data, uint32_t startPC, uint32_t 
         // Dump VU1 data memory at each traced MSCAL (before the program runs).
         const std::string path = std::string(dumpDir) + "/vu1data_" + std::to_string(traceIndex) +
                                  "_pc" + std::to_string(startPC) + ".bin";
-        if (FILE *f = std::fopen(path.c_str(), "wb"))
+        if (FILE *f = std::fopen(ps2x::narrow(path).c_str(), "wb"))
         {
             std::fwrite(vu1Data, 1, PS2_VU1_DATA_SIZE, f);
             std::fclose(f);
@@ -4094,7 +4095,7 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
             {
                 const std::string name = "ram_f8_" + std::to_string(s_presentedFrames) + ".bin";
                 const std::filesystem::path path = std::filesystem::absolute(name);
-                if (FILE *f = std::fopen(path.c_str(), "wb"))
+                if (FILE *f = std::fopen(ps2x::narrow(path).c_str(), "wb"))
                 {
                     std::fwrite(m_memory.getRDRAM(), 1, PS2_RAM_SIZE, f);
                     std::fclose(f);
@@ -4125,13 +4126,13 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
                 if (std::find(s_dumpFrames.begin(), s_dumpFrames.end(), static_cast<uint64_t>(s_presentedFrames)) != s_dumpFrames.end())
                 {
                     const std::string ramPath = "ram_" + std::to_string(s_presentedFrames) + ".bin";
-                    if (FILE *f = std::fopen(ramPath.c_str(), "wb"))
+                    if (FILE *f = std::fopen(ps2x::narrow(ramPath).c_str(), "wb"))
                     {
                         std::fwrite(m_memory.getRDRAM(), 1, PS2_RAM_SIZE, f);
                         std::fclose(f);
                     }
                     const std::string sprPath = "spr_" + std::to_string(s_presentedFrames) + ".bin";
-                    if (FILE *f = std::fopen(sprPath.c_str(), "wb"))
+                    if (FILE *f = std::fopen(ps2x::narrow(sprPath).c_str(), "wb"))
                     {
                         std::fwrite(m_memory.getScratchpad(), 1, PS2_SCRATCHPAD_SIZE, f);
                         std::fclose(f);

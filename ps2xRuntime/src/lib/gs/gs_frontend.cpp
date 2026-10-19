@@ -14,6 +14,7 @@
 #include <sstream>
 #include <thread>
 
+#include "../ps2_narrow.h"
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
@@ -224,7 +225,7 @@ static bool gsCaptureActive(GSRasterBackend *backend, bool hasLocalMemory)
         g_gsCaptureRequest.store(0u, std::memory_order_relaxed);
         const std::string path = "gs_capture_" + std::to_string(frame) + ".bin";
         c = GsCapture{};
-        c.file = std::fopen(path.c_str(), "wb");
+        c.file = std::fopen(ps2x::narrow(path).c_str(), "wb");
         c.startFrame = frame;
         c.endFrame = frame + requested;
         c.configured = c.file != nullptr;

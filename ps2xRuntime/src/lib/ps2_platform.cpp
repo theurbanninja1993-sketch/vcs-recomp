@@ -26,6 +26,7 @@
 #include <iterator>
 #include <system_error>
 
+#include "ps2_narrow.h"
 std::filesystem::path ps2ExecutableDirectory()
 {
     std::error_code ec;
@@ -273,7 +274,7 @@ void ps2OpenFolder(const std::string &path)
 #else
     const std::string command = "xdg-open \"" + path + "\" >/dev/null 2>&1 &";
 #endif
-    if (std::system(command.c_str()) != 0)
+    if (std::system(ps2x::narrow(command).c_str()) != 0)
         std::cerr << "could not open " << path << std::endl;
 #endif
 }
@@ -523,7 +524,7 @@ namespace
             if (std::chrono::steady_clock::now() - lastWrite > std::chrono::seconds(10))
             {
                 lastWrite = std::chrono::steady_clock::now();
-                if (FILE *f = std::fopen(path.c_str(), "w"))
+                if (FILE *f = std::fopen(ps2x::narrow(path).c_str(), "w"))
                 {
                     std::map<uint64_t, std::pair<std::string, uint64_t>> modules; // address -> (module, base)
                     for (auto &[name, total] : totals)

@@ -22,6 +22,7 @@
 #include <iostream>
 #include <string>
 
+#include "../../ps2_narrow.h"
 namespace fs = std::filesystem;
 
 std::atomic<uint32_t> g_gsGpuScaleRequest{0};
@@ -3990,7 +3991,7 @@ void main()
                 ++s_dumped;
                 const auto writePpm = [&](const std::string &path, const std::vector<uint8_t> &img, uint32_t iw, uint32_t ih)
                 {
-                    if (FILE *f = std::fopen(path.c_str(), "wb"))
+                    if (FILE *f = std::fopen(ps2x::narrow(path).c_str(), "wb"))
                     {
                         std::fprintf(f, "P6\n%u %u\n255\n", iw, ih);
                         for (uint32_t y = 0; y < ih; ++y)
