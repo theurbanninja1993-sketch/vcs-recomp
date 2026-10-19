@@ -31,6 +31,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$PWD/dist"
 GAME=""
+ACH=""
 DO_LINUX=0 DO_WINDOWS=0 DO_GAME=1 LINK_GAME=0
 
 while [ $# -gt 0 ]; do
@@ -40,6 +41,7 @@ while [ $# -gt 0 ]; do
         --both) DO_LINUX=1; DO_WINDOWS=1 ;;
         --out) OUT="$2"; shift ;;
         --game) GAME="$2"; shift ;;
+        --achievements) ACH="$2"; shift ;;
         --no-game-data) DO_GAME=0 ;;
         --link-game) LINK_GAME=1 ;;
         -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
@@ -82,7 +84,10 @@ copy_assets() {
     # elsewhere, and a stick (exFAT, NTFS) cannot store a symlink at all.
     # The achievement set, read from beside the runner. It is the game's own
     # content, like the prompt art: no game code and nothing of Rockstar's.
-    if [ -e "$GAME/achievements.toml" ]; then
+    if [ -n "$ACH" ]; then
+        [ -e "$ACH" ] || { echo "no achievement set at $ACH" >&2; exit 1; }
+        cp "$ACH" "$dest/achievements.toml"
+    elif [ -e "$GAME/achievements.toml" ]; then
         cp "$GAME/achievements.toml" "$dest/achievements.toml"
     elif [ -e "$GAME/games" ]; then
         set_file=$(find "$GAME/games" -maxdepth 2 -name achievements.toml | head -1)

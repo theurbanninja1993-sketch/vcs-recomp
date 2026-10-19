@@ -542,7 +542,10 @@ if [ "$FROM" -le 6 ] && [ "$TO" -ge 6 ]; then
     if [ -f "$PS2RECOMP/build-win/ps2xRuntime/ps2EntryRunner.exe" ]; then
         make_platforms="--linux --windows"
     fi
-    run "$make_portable" $make_platforms --out "$OUT" --game "$disc_dir"
+    run "$make_portable" $make_platforms --out "$OUT" --game "$disc_dir" \
+        --achievements "$GAME_DIR/achievements.toml"
+    # The development runner reads the set from beside itself, like a portable one.
+    run cp "$GAME_DIR/achievements.toml" "$PS2RECOMP/build/ps2xRuntime/achievements.toml"
     [ "$DRY_RUN" -eq 1 ] || note "game folder: $OUT"
     stage_end
 fi
