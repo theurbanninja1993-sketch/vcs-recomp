@@ -674,6 +674,27 @@ capture route exists. That is the next real problem for the release, not this on
 recordings and was not verified to help. It is parked as `.so.off` in `build/`.
 Verify with the counters above before using the plugin again.
 
+## 2026-10-19 (Claude, later): the laptop build got past the compile and stopped in the VU1 learn
+
+The owner's log (`vcs-build.log`, 15:00) reached the learn step: tools, the Windows
+cross-compiler, the disc check (passed), extract, recompile, install and the port's
+compile all completed. The stop was the learn pass: `GLXBadFBConfig` (X error, GLX
+opcode 149) with `PS2X_HIDDEN_WINDOW=1`, which recorded nothing, so the launcher stopped
+with "no microprograms were recorded".
+
+- The "Warnings: 1206, errors: 604" in the recompile stage are the recompiler's
+  unhandled-instruction reports, expected for this ELF; they are not what stopped the build.
+- The hidden window is the likely cause: the same pass runs fine here, and the visible game
+  path never hits this error on the laptop. The handoff's own rule is that test runs use a
+  visible window for this reason.
+
+**Fix (launcher `src/builder.cpp`, committed locally):** a learn pass that records nothing
+is run once more with a visible window before the build gives up. A working machine never
+reaches the retry. Not verified on the laptop; compiled and reviewed.
+
+`build.sh` stage 5 still has the hidden-only pass. It is the development path, not what the
+owner's launcher runs, so it is left as it is for now.
+
 ## If you are reviewing this
 
 Three things are waiting for a second pair of eyes, and they are the three worth
