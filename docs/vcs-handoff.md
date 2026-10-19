@@ -598,7 +598,7 @@ an A/B of each of those changed nothing.
   the intro (7000 frames). Measured with this route: 22 programs (8 VU0) instead
   of 15. That is still short of 30, because a scripted route cannot reach
   everything. So the runtime keeps learning during normal play (below).
-- **Learning during play (done, needs a launcher button).** By default the
+- **Learning during play (done, and the launcher button now exists).** By default the
   runtime records every VU1/VU0 program it meets that has no compiled version
   (4 runs each, the same capture format) into `<config>/vu_learn/`, where
   `<config>` is `<game>/<platform>/config` for portable installs, and writes a
@@ -614,6 +614,34 @@ an A/B of each of those changed nothing.
   another game running alongside), against ~57 interpreted. Tested end to end
   in a sandbox: recordings moved, 22 programs built, plugin loaded ("[vu1] 22
   compiled programs from .../vu1_programs.so"), nothing interpreted.
+
+## 2026-10-19 (Claude): the Optimize button, and a night spent not reading this file
+
+The owner, after a full evening of me chasing the wrong things: *"last time this
+happened claude said that something you changed made the VU1 compiler do only 15 of
+something instead of the full 30 did they leave a note about it in the handoff?"* -
+they had, and it was this section, with the same 20-30 fps in it. Everything below
+about VU1 was already written down; I had the file open and did not read it.
+
+**What the symptom looked like from the outside:** 60 fps inside the barracks, 20-30
+once driving. Which is exactly what a partial VU program set does - the intro's
+programs cover an interior, and everything outside runs interpreted, about ten times
+slower.
+
+**The launcher contract is implemented now** (launcher `v0.1.31`): the launcher looks
+for `<config>/vu_learn/PENDING` - both the portable folder and the user's config
+folder - says so on the card, and **O** runs `build.sh --optimize` in the port's own
+folder. Verified end to end: the marker is found, the compile runs, the marker is
+cleared, and the port reports "nothing new was recorded: every program the game has
+run is compiled".
+
+**Windows still to do:** the same WSL handoff the build uses, since the Windows
+launcher cannot run a POSIX build itself.
+
+**The lesson, in the plainest terms I can put it:** this file had the answer, the
+measurements, and the fix. I spent the evening on the renderer, the generated
+function table and the frame pacing instead, and every one of those was a real bug I
+introduced or found - but none of them was this. Read this file first.
 
 ## If you are reviewing this
 
