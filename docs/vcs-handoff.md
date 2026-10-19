@@ -1,8 +1,56 @@
 # GTA Vice City Stories (SLUS_215.90) recomp: handoff notes
 
 State as of 2026-10-18 (`vcs-bringup` is the tip the `release` branch players build
-from was cut at, tagged `stories-v0.1.6`; the launcher is its own repo at `397239b` =
-`v0.1.14`). Read this before changing anything. A reviewer will check work against it.
+from was cut at, tagged `stories-v0.1.6`; the launcher is its own repo at `4fb059a` =
+`v0.1.21`). Read this before changing anything. A reviewer will check work against it.
+
+## 2026-10-18 night (Claude): making the Windows build actually run - five bugs
+
+The owner worked through the Windows build story with me, one report at a time. Every
+one of the five was mine, and the launcher is `v0.1.21` (`4fb059a`) because of them.
+Recorded in full because the *shape* of them repeats.
+
+1. *"nothing happens when I press B on the windows version"* - the Windows launcher
+   has no build to drive (runTool on Windows is a stub), and the guard was an empty
+   block. B now says which of three things is missing, and the Windows release carries
+   the Linux launcher so the route is one command.
+2. *"is there a way to make the windows launcher automatically run the command"* and
+   *"can our launcher install WSL too"* - yes to both: B starts the Linux launcher
+   under WSL on that game's build, and W installs WSL (`wsl --install`, elevated) or
+   the toolchain inside it (as root, no password).
+3. *"clicking B appears to crash"* then *"it just took a while"* - asking WSL anything
+   starts Linux, and three such questions were on the thread that draws the menu. Moved
+   to a background thread with a **waiting** screen whose dots move.
+4. *"it says to press b again but nothing happens"* - the answer was cached including
+   the **no**. Only a yes is remembered now.
+5. *"it still keeps saying WSL is not setup"* - the message was right (a restart), but
+   a no now carries the evidence: what was asked, the exit code, what came back, kept
+   in `logs/wsl.txt`.
+
+Then, once WSL was set up and B reached the handoff:
+
+6. *"a terminal open for a second, but it quickly closes"* - the check now runs
+   `./ps2x_launcher --version` in WSL first, so a launcher that will not start says so
+   instead of flashing.
+7. *"The Linux Launcher will not start"* on v0.1.18 - `readelf` said the shipped binary
+   required **GLIBC 2.43**, because it was built here on a rolling-release
+   distribution. Ubuntu 24.04 has 2.39. **It could not start on any current Ubuntu, so
+   this was a release bug that would have hit every Linux player, not a WSL quirk.**
+   Fixed with link-time wrappers for four float maths functions
+   (`src/glibc_compat.c`), so it asks for 2.38.
+8. *"E: Package 'libasound2' has no installation candidate"* - Ubuntu 24.04 renamed it,
+   and **apt installs nothing at all when one name in a list is unknown**, so the
+   graphics libraries the binary is linked against were never installed. The
+   cannot-start-without three now get a command of their own.
+9. *exit 127, "no output"* - the launcher folder is `GTA The Stories Collection`, and
+   the paths handed to WSL were unquoted, so `--cd` got `/mnt/c/.../GTA` and WSL was
+   asked to run `The`. Reproduced here against a folder with spaces in its name.
+
+**The lesson, twice over:** two of those nine were the same mistake - a command that
+failed and said nothing, because `popen` takes stdout and the reason was on stderr.
+That is the first fetch failure, and the probes' "no output" in the last one. Anything
+that runs a command here keeps both streams and keeps the output somewhere it can be
+sent, which is what finally made these one-round fixes.
 
 ## 2026-10-18 evening (Claude): Windows players can build, without a command line
 
