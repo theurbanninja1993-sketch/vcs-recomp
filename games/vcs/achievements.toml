@@ -70,6 +70,11 @@ version = 1
 # and one more for each story mission passed (found by RAM dumps, Soldier through
 # Conduct Unbecoming: 0, 1, 2, 3). Its value at each milestone is the number of
 # missions passed so far, so `0xf4CD18C>=n` is "passed at least n".
+#
+# The thresholds are the milestones' place in the story order: To Victor, the Spoils
+# ends chapter 1 at 16, Jive Drive starts chapter 2 at 17, From Zero to Hero ends it at
+# 30, Brawn of the Dead starts chapter 3 at 31, Last Stand ends it at 59. Those numbers
+# are from the internet, not the game: check each against the counter as it happens.
 
 [achievement]
 id = 1
@@ -85,6 +90,7 @@ title = To Victor, the Spoils
 description = Complete "To Victor, the Spoils".
 category = Story
 points = 10
+trigger = 0xf4CD18C>=16
 
 [achievement]
 id = 3
@@ -92,6 +98,7 @@ title = Jive Drive
 description = Complete "Jive Drive".
 category = Story
 points = 10
+trigger = 0xf4CD18C>=17
 
 [achievement]
 id = 4
@@ -99,6 +106,7 @@ title = From Zero to Hero
 description = Complete "From Zero to Hero".
 category = Story
 points = 10
+trigger = 0xf4CD18C>=30
 
 [achievement]
 id = 5
@@ -106,6 +114,7 @@ title = Brawn of the Dead
 description = Complete "Brawn of the Dead".
 category = Story
 points = 10
+trigger = 0xf4CD18C>=31
 
 [achievement]
 id = 6
@@ -113,6 +122,7 @@ title = Last Stand
 description = Complete "Last Stand".
 category = Story
 points = 25
+trigger = 0xf4CD18C>=59
 
 # ------------------------------------------------- hidden mission challenges (4)
 # The four slots the official sets fill with a special way through one mission,
