@@ -706,6 +706,22 @@ X server (`xvfb-run -a`) when the `xvfb` package is installed, and the WSL setup
 Checked here: the VCS runner boots under `xvfb-run` with GL 4.6 (llvmpipe), no GLX error. Not
 verified on the laptop.
 
+## 2026-10-20 (Claude): the virtual-display pass hung on the learn step
+
+The owner's log on the stick (`vcs-build.log`, 07:01): the hidden and visible passes failed
+with `GLXBadFBConfig` as before, and then the virtual-display pass started and printed
+nothing. The owner came back hours later and the build was still on the learn step.
+
+**Cause:** the launcher wrapped the pass as `xvfb-run -a timeout 400 runner ...`. The 400 s
+timeout sat inside the X server, so an X server that never started had no limit at all.
+
+**Fix (launcher `6a4ba54`, local, not published):** the timeout now wraps the whole pass,
+`timeout 1800 xvfb-run -a runner ...`, and the virtual-display pass gets 1800 s, because it
+renders in software. The hidden and visible passes keep their 400 s.
+
+**Still open:** why the X server (or the game on it) does not start on the laptop. The log
+shows no game output for that pass, so the next run will tell us either way.
+
 ## If you are reviewing this
 
 Three things are waiting for a second pair of eyes, and they are the three worth
