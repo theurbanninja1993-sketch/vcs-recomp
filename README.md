@@ -82,3 +82,7 @@ here only to say which game this is for.
 
 GPL-3.0 — see `LICENSE`, inherited from PS2Recomp. The history here includes
 upstream's commits; the port is the work on top of it.
+
+## Special Thanks
+Thank you to AL2009man for their gamepad asset pack. You can find their pack 
+here: https://github.com/AL2009man/Gamepad-Asset-Pack
