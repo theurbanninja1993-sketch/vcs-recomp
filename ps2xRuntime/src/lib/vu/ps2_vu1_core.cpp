@@ -1851,6 +1851,8 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
 
 // Defined here, read by the perf log.
 std::atomic<uint64_t> g_ps2Vu1ExitEnded{0}, g_ps2Vu1ExitBudget{0}, g_ps2Vu1ExitContinue{0};
+// Hand-overs from one compiled program to another at a jump (see run()).
+std::atomic<uint64_t> g_ps2Vu1ChainedCalls{0};
 
 // Host CPU time spent inside run(), split by unit. VU0 and VU1 share this
 // interpreter class but only VU1 has a compiled path (lookupCompiled requires
@@ -1928,10 +1930,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // Microcode cannot change while a program runs (MPG needs the VIF, which
     // waits for us), so validate the decode cache once instead of per pair.
     DecodedInstructionPair uncachedDecoded{};
-    if (m_compiledEntry)
+    // A compiled program that leaves at a jump into code it does not cover (a JR
+    // into whatever the game has loaded beside it) hands over to the compiled
+    // program at the target, if there is one: programs are compiled per entry
+    // point, so they chain here instead of the rest running interpreted.
+    VU1CompiledFn compiled = m_compiledEntry;
+    m_compiledEntry = nullptr;
+    m_leftCompiled = false;
+    for (int hop = 0; compiled != nullptr; ++hop)
     {
-        const VU1CompiledFn compiled = m_compiledEntry;
-        m_compiledEntry = nullptr;
         const uint64_t before = m_cycle;
         const uint32_t entryPcForStats = m_state.pc;
         static const bool s_timeStats = std::getenv("PS2X_VU1_COMPILED_STATS") != nullptr;
@@ -1963,6 +1970,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 std::cerr << "[vu1:compiled] calls=" << s_calls << " tsc/call=" << s_tsc / s_calls << " cycles/call=" << s_cycles / s_calls << " ended=" << s_exits[0]
                           << " budget=" << s_exits[1] << " continue=" << s_exits[2] << " lastExitPc=0x" << std::hex << m_state.pc
                           << std::dec << std::endl;
+        }
+        compiled = nullptr;
+        if (exit == VU1CompiledContinue && hop < 64 && m_state.pc != entryPcForStats && m_cycle < budgetEnd)
+        {
+            compiled = lookupCompiled(vuCode, codeSize, memory, m_state.pc);
+            if (compiled != nullptr)
+                g_ps2Vu1ChainedCalls.fetch_add(1u, std::memory_order_relaxed);
+            else
+            {
+                m_leftCompiled = true;
+                m_leftCompiledAt = m_state.pc;
+            }
         }
     }
     // Decode cache for the interpreter loop (skipped when a compiled program

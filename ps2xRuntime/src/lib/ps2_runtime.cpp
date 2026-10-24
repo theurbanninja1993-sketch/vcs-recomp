@@ -1220,11 +1220,29 @@ bool PS2Runtime::syncCoreSubsystems()
                                      // next Optimize (see ps2VuLearnFile), in the
                                      // PS2X_VU1_CAPTURE format.
                                      static std::unordered_map<uint64_t, uint32_t> s_learned;
+                                     // Programs whose last compiled run fell back to the
+                                     // interpreter at a jump (by start, for the code loaded then):
+                                     // recorded too, so the target they jumped to gets compiled.
+                                     struct FellBack
+                                     {
+                                         uint64_t generation;
+                                         uint32_t at; // where it left compiled code
+                                     };
+                                     static std::unordered_map<uint32_t, FellBack> s_fellBack;
+                                     const uint64_t codeGeneration = m_memory.getVU1CodeGeneration();
+                                     const auto fell = s_fellBack.find(startPC);
+                                     const bool fellBack = fell != s_fellBack.end() && fell->second.generation == codeGeneration;
                                      FILE *recordTo = capture ? s_capture : nullptr;
                                      if (!recordTo &&
-                                         !m_vu1.lookupCompiled(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE, &m_memory, startPC))
+                                         (fellBack || !m_vu1.lookupCompiled(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE, &m_memory, startPC)))
                                      {
-                                         uint32_t &runs = s_learned[ps2Vu1ProgramKey(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE, startPC & 0x3FF8u)];
+                                         // Up to 4 runs per program, and per program and missing
+                                         // target when it fell back: the same program meets
+                                         // different code at its targets in every scene.
+                                         uint64_t learnKey = ps2Vu1ProgramKey(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE, startPC & 0x3FF8u);
+                                         if (fellBack)
+                                             learnKey ^= ps2Vu1ProgramKey(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE, fell->second.at) * 31u;
+                                         uint32_t &runs = s_learned[learnKey];
                                          if (runs < 4u)
                                          {
                                              ++runs;
@@ -1245,6 +1263,10 @@ bool PS2Runtime::syncCoreSubsystems()
                                                        m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                        m_gs, &m_memory, startPC, top, itop, 65536);
                                      }
+                                     if (m_vu1.leftCompiledLastRun())
+                                         s_fellBack[startPC] = {codeGeneration, m_vu1.leftCompiledAt()};
+                                     else if (fellBack)
+                                         s_fellBack.erase(startPC);
                                      if (recordTo)
                                      {
                                          std::fwrite(&m_vu1.state(), sizeof(VU1State), 1, recordTo);

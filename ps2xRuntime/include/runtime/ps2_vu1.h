@@ -323,6 +323,8 @@ private:
     // Compiled program for the next run() (set by execute()), and the
     // (code generation, entry PC) -> program cache behind it.
     VU1CompiledFn m_compiledEntry = nullptr;
+    bool m_leftCompiled = false; // see leftCompiledLastRun()
+    uint32_t m_leftCompiledAt = 0;
     uint64_t m_compiledGeneration = ~0ull;
     const uint8_t *m_compiledCode = nullptr;
     // Lookups per entry PC: the result for the current code generation, and
@@ -347,6 +349,11 @@ public:
     void clearRanFlagless() { m_ranFlagless = false; }
     // The compiled program for the code at startPC, or null (cached per code
     // generation; also used by PS2X_VU1_LEARN to spot uncompiled programs).
+    // The last run started compiled but left compiled code at a jump with no
+    // compiled program at its target, so the rest ran interpreted. The runtime
+    // records such runs, so the missing target can be compiled too.
+    bool leftCompiledLastRun() const { return m_leftCompiled; }
+    uint32_t leftCompiledAt() const { return m_leftCompiledAt; } // the jump target it left at
     VU1CompiledFn lookupCompiled(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t startPC);
 
 private:

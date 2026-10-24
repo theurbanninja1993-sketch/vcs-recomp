@@ -1379,27 +1379,52 @@ int main(int argc, char **argv)
     };
     std::map<uint64_t, Variant> generated; // by full key
     size_t skipped = 0;
+    // Each recorded program three ways. As recorded: the program with the code at
+    // every jump target it took, the fastest when that whole combination is loaded.
+    // Without its jump targets, so it still matches when the code beside it is
+    // different (a JR then leaves compiled code). And each jump target on its own,
+    // keyed by its own code only, which the runtime chains to after that JR. The
+    // game swaps the code at its jump targets per scene, and keyed as one unit the
+    // combinations never stopped being new.
+    struct Job
+    {
+        const Program *program;
+        uint32_t startPC;
+        std::vector<uint32_t> roots;
+    };
+    std::vector<Job> jobs;
     for (const auto &[ids, program] : programs)
     {
-        const uint64_t baseKey = ids.first;
         std::vector<uint32_t> roots(program.jumps.begin(), program.jumps.end());
-        const uint64_t fullKey = ps2Vu1ProgramKey(program.code.data(), program.codeSize, program.startPC, roots.data(),
+        jobs.push_back({&program, program.startPC, roots});
+        if (!roots.empty())
+            jobs.push_back({&program, program.startPC, {}});
+        for (uint32_t target : roots)
+            if (target != program.startPC)
+                jobs.push_back({&program, target, {}});
+    }
+    for (const Job &job : jobs)
+    {
+        const Program &program = *job.program;
+        const uint64_t baseKey = ps2Vu1ProgramKey(program.code.data(), program.codeSize, job.startPC);
+        std::vector<uint32_t> roots = job.roots;
+        const uint64_t fullKey = ps2Vu1ProgramKey(program.code.data(), program.codeSize, job.startPC, roots.data(),
                                                   static_cast<uint32_t>(roots.size()));
         if (std::getenv("VU1_RECOMP_VERBOSE"))
         {
-            std::fprintf(stderr, "group base=%016llx pc=0x%x image=%016llx full=%016llx roots:", static_cast<unsigned long long>(baseKey),
-                         program.startPC, static_cast<unsigned long long>(ids.second), static_cast<unsigned long long>(fullKey));
+            std::fprintf(stderr, "group base=%016llx pc=0x%x full=%016llx roots:", static_cast<unsigned long long>(baseKey),
+                         job.startPC, static_cast<unsigned long long>(fullKey));
             for (uint32_t root : roots)
                 std::fprintf(stderr, " %x", root);
             std::fprintf(stderr, "\n");
         }
         if (generated.count(fullKey))
             continue;
-        VU1Recompiler recompiler(program.code.data(), program.startPC, roots, program.codeSize);
+        VU1Recompiler recompiler(program.code.data(), job.startPC, roots, program.codeSize);
         std::string text, reason;
         if (!recompiler.generate(fullKey, text, reason))
         {
-            std::fprintf(stderr, "skipped %016llx (pc 0x%x): %s\n", static_cast<unsigned long long>(fullKey), program.startPC,
+            std::fprintf(stderr, "skipped %016llx (pc 0x%x): %s\n", static_cast<unsigned long long>(fullKey), job.startPC,
                          reason.c_str());
             ++skipped;
             continue;
