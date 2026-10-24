@@ -702,6 +702,12 @@ if(UNIX AND NOT APPLE AND NOT PS2X_IS_ANDROID)
 elseif(WIN32)
     target_link_libraries(ps2_runtime PUBLIC opengl32 gdi32)
 endif()
+# raylib first on Windows: its CloseWindow and ShowCursor share names with USER32's,
+# lld takes the first archive on the line that offers a symbol, and FFmpeg's system
+# libraries otherwise put -luser32 ahead of raylib.
+if(WIN32)
+    target_link_libraries(ps2EntryRunner PRIVATE raylib)
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
