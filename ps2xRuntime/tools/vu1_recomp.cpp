@@ -19,6 +19,9 @@
 #include "ps2_runtime.h"
 
 #include <cstdio>
+#include <memory>
+#include <iterator>
+#include <fstream>
 #include <filesystem>
 #include <cstring>
 #include <map>
@@ -41,15 +44,40 @@ public:
                   uint32_t codeSize = PS2_VU1_CODE_SIZE)
         : m_code(code), m_start(startPC), m_roots(roots), m_codeSize(codeSize) {}
 
+    // A region: every pair in [start, end) is an entry (a jump may land anywhere
+    // in it), nothing outside it is compiled, and leaving it - or reaching a pair
+    // that cannot be compiled - hands over at that pc.
+    void setRegion(uint32_t start, uint32_t end, const std::set<uint32_t> *extraEntries = nullptr)
+    {
+        m_regionStart = start;
+        m_regionEnd = end;
+        m_extraEntries = extraEntries;
+    }
+    const std::set<uint32_t> *m_extraEntries = nullptr;
+    // A region's entries that it actually compiled (after generate()).
+    std::set<uint32_t> compiledEntries() const
+    {
+        std::set<uint32_t> out;
+        for (uint32_t pc : regionEntries())
+            if (m_normalSet.count(pc))
+                out.insert(pc);
+        return out;
+    }
+
     // Returns false (with a reason) when the program can't be compiled.
     bool generate(uint64_t key, std::string &out, std::string &reason)
     {
-        ps2Vu1ProgramPairs(m_code, m_codeSize, m_start, m_normal, m_delay, m_roots.data(),
-                           static_cast<uint32_t>(m_roots.size()));
+        if (m_regionEnd > m_regionStart)
+            regionPairs();
+        else
+            ps2Vu1ProgramPairs(m_code, m_codeSize, m_start, m_normal, m_delay, m_roots.data(),
+                               static_cast<uint32_t>(m_roots.size()));
         m_normalSet.insert(m_normal.begin(), m_normal.end());
         std::set<uint32_t> delaySet(m_delay.begin(), m_delay.end());
         std::set<uint32_t> all = m_normalSet;
         all.insert(delaySet.begin(), delaySet.end());
+        if (m_normal.empty())
+            return fail(reason, m_start, "nothing compilable in the region");
         for (uint32_t pc : all)
         {
             const Decoded d = decode(pc);
@@ -95,13 +123,24 @@ public:
           << "    const uint32_t vuDataSize = J::dataSize(vu);\n"
           << "    const uint32_t vuDataMask = vuDataSize - 1u;\n"
           << (m_skipsFlags ? "    J::noteFlagless(vu);\n" : "")
-          << "    switch (S.pc)\n    {\n    case " << m_start << "u: goto L_" << m_start
-          << ";\n    default: return VU1CompiledContinue;\n    }\n";
+          << "    switch (S.pc)\n    {\n";
+        if (m_regionEnd > m_regionStart)
+        {
+            for (uint32_t pc : regionEntries())
+                if (m_normalSet.count(pc))
+                    o << "    case " << pc << "u: goto L_" << pc << ";\n";
+        }
+        else
+            o << "    case " << m_start << "u: goto L_" << m_start << ";\n";
+        o << "    default: return VU1CompiledContinue;\n    }\n";
         // Entry points: reached by jumps (state before them unknown). JR/JALR
         // can enter at the program start, the traced jump targets and call
         // return points; anywhere else leaves compiled code.
         std::set<uint32_t> jumpEntries = {m_start};
         jumpEntries.insert(m_roots.begin(), m_roots.end());
+        if (m_regionEnd > m_regionStart)
+            for (uint32_t pc : regionEntries())
+                jumpEntries.insert(pc);
         std::set<uint32_t> entries = jumpEntries;
         for (uint32_t pc : m_normal)
         {
@@ -440,6 +479,115 @@ private:
     NormWrite m_upperNorm, m_lowerNorm;
     VU1Interpreter m_decoder{VU1Interpreter::Unit::VU1};
 
+    // A static transfer: to the label when it is compiled here, otherwise out to
+    // whatever runs that pc (a region's edge, or a pair it could not compile).
+    std::string go(uint32_t pc) const
+    {
+        if (m_normalSet.count(pc))
+            return "goto L_" + std::to_string(pc) + ";";
+        return "return J::leaveAt(vu, cyc, " + std::to_string(pc) + "u);";
+    }
+
+    // Where a jump into the region can land: its first pair, and the pair after
+    // every program end (E-bit), unconditional jump (B, JR) or call (BAL, JALR) -
+    // where routines start, and what a jump table points at. Every JR target the
+    // LCS recordings took is one of these.
+    std::set<uint32_t> regionEntries() const
+    {
+        std::set<uint32_t> entries = {m_regionStart};
+        for (uint32_t pc = m_regionStart; pc + 8u <= m_regionEnd; pc += 8u)
+        {
+            const Decoded d = decode(pc);
+            const uint32_t op = opHi(d);
+            if (d.eBit || op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u)
+                if (pc + 16u < m_regionEnd)
+                    entries.insert(pc + 16u);
+        }
+        // And every static branch target in the region, from anywhere in the code
+        // image: a region is a piece of an upload, and a branch from the piece
+        // before it lands part-way in.
+        for (uint32_t pc = 0; pc + 8u <= m_codeSize; pc += 8u)
+        {
+            const Decoded d = decode(pc);
+            const uint32_t op = opHi(d);
+            if (!isBranch(d) || op == 0x24u || op == 0x25u)
+                continue;
+            const uint32_t target = (pc + 8u + static_cast<uint32_t>(IMM11(d.lower) * 8)) & (m_codeSize - 1u);
+            if (target >= m_regionStart && target < m_regionEnd)
+                entries.insert(target);
+            if (op != 0x20u && pc + 16u >= m_regionStart && pc + 16u < m_regionEnd)
+                entries.insert(pc + 16u); // fall-through / return point
+        }
+        // The same kinds of place in every other upload of this unit: a return or a
+        // jump from code loaded elsewhere lands in this one.
+        if (m_extraEntries)
+            for (auto it = m_extraEntries->lower_bound(m_regionStart); it != m_extraEntries->end() && *it < m_regionEnd; ++it)
+                entries.insert(*it);
+        return entries;
+    }
+
+    // The region's pairs: what its entries reach inside it. A branch whose delay
+    // slot is not compilable, or outside the region, is left out (a jump to it
+    // leaves compiled code), and so is anything else that would make the program
+    // fail. Branch targets outside stay outside.
+    void regionPairs()
+    {
+        std::set<uint32_t> bad;
+        const std::set<uint32_t> entries = regionEntries();
+        for (int pass = 0; pass < 4; ++pass)
+        {
+            std::vector<uint32_t> roots;
+            for (uint32_t pc : entries)
+                if (!bad.count(pc))
+                    roots.push_back(pc);
+            std::vector<uint32_t> normal, delay;
+            ps2Vu1ProgramPairs(m_code, m_codeSize, m_regionStart, normal, delay, roots.data(),
+                               static_cast<uint32_t>(roots.size()));
+            m_normal.clear();
+            m_delay.clear();
+            for (uint32_t pc : normal)
+                if (pc >= m_regionStart && pc + 8u <= m_regionEnd && !bad.count(pc))
+                    m_normal.push_back(pc);
+            for (uint32_t pc : delay)
+                if (pc >= m_regionStart && pc + 8u <= m_regionEnd)
+                    m_delay.push_back(pc);
+            const size_t before = bad.size();
+            for (uint32_t pc : m_normal)
+            {
+                const Decoded d = decode(pc);
+                const bool branch = isBranch(d);
+                bool ok = !(d.upperUsage.reserved || d.lowerUsage.reserved || d.dBit || d.tBit || (d.eBit && branch));
+                if (ok && (branch || d.eBit))
+                {
+                    const uint32_t slot = nextPc(pc);
+                    const Decoded ds = decode(slot);
+                    ok = slot >= m_regionStart && slot + 8u <= m_regionEnd && !isBranch(ds) && !ds.eBit &&
+                         !(ds.upperUsage.reserved || ds.lowerUsage.reserved || ds.dBit || ds.tBit);
+                }
+                if (!ok)
+                    bad.insert(pc);
+            }
+            if (bad.size() == before)
+                break;
+        }
+        std::vector<uint32_t> kept;
+        for (uint32_t pc : m_normal)
+            if (!bad.count(pc))
+                kept.push_back(pc);
+        m_normal.swap(kept);
+        // Delay slots of the branches kept, only.
+        std::set<uint32_t> slots;
+        for (uint32_t pc : m_normal)
+        {
+            const Decoded d = decode(pc);
+            if (isBranch(d) || d.eBit)
+                slots.insert(nextPc(pc));
+        }
+        m_delay.assign(slots.begin(), slots.end());
+    }
+
+    uint32_t m_regionStart = 0, m_regionEnd = 0;
+
     static bool fail(std::string &reason, uint32_t pc, const char *what)
     {
         char buf[128];
@@ -493,9 +641,9 @@ private:
                         successors->emplace_back(nextPc(next), h);
                 }
                 if (op == 0x20u || op == 0x21u)
-                    o << "    goto L_" << dest << ";\n";
+                    o << "    " << go(dest) << "\n";
                 else
-                    o << "    if (taken) goto L_" << dest << ";\n    goto L_" << nextPc(next) << ";\n";
+                    o << "    if (taken) " << go(dest) << "\n    " << go(nextPc(next)) << "\n";
             }
         }
         else if (d.eBit)
@@ -508,7 +656,7 @@ private:
         {
             if (successors)
                 successors->emplace_back(next, h);
-            o << "    goto L_" << next << ";\n";
+            o << "    " << go(next) << "\n";
         }
         return false;
     }
@@ -1278,9 +1426,26 @@ namespace
 
 int main(int argc, char **argv)
 {
-    if (argc < 3)
+    // vu1_recomp <outDir> [--elf <game ELF> --layout <layout.txt>] [recording.bin...]
+    // --elf/--layout: compile the microcode the game uploads straight from its ELF
+    // (the layout says which bytes go to which VU address), so a build needs no
+    // recordings for the programs the table covers.
+    std::string elfPath, layoutPath;
+    std::vector<char *> args = {argv[0]};
+    for (int i = 1; i < argc; ++i)
     {
-        std::fprintf(stderr, "usage: %s <out.cpp> <capture.bin>...\n", argv[0]);
+        if (std::strcmp(argv[i], "--elf") == 0 && i + 1 < argc)
+            elfPath = argv[++i];
+        else if (std::strcmp(argv[i], "--layout") == 0 && i + 1 < argc)
+            layoutPath = argv[++i];
+        else
+            args.push_back(argv[i]);
+    }
+    argc = static_cast<int>(args.size());
+    argv = args.data();
+    if (argc < 2 || (argc < 3 && elfPath.empty()))
+    {
+        std::fprintf(stderr, "usage: %s <outDir> [--elf <elf> --layout <layout.txt>] [capture.bin...]\n", argv[0]);
         return 2;
     }
     // Replay every captured MSCAL through the interpreter to learn the
@@ -1376,6 +1541,8 @@ int main(int argc, char **argv)
         std::vector<uint32_t> roots;
         std::string text;
         bool flagless = false;
+        uint32_t regionStart = 0, regionEnd = 0, codeSize = 0; // regions only
+        std::vector<uint32_t> entries;                          // regions only, sorted
     };
     std::map<uint64_t, Variant> generated; // by full key
     size_t skipped = 0;
@@ -1391,8 +1558,160 @@ int main(int argc, char **argv)
         const Program *program;
         uint32_t startPC;
         std::vector<uint32_t> roots;
+        uint32_t regionEnd = 0; // a region [startPC, regionEnd) (see VU1Recompiler::setRegion)
+        const std::set<uint32_t> *entries = nullptr; // likely entries from every upload of the unit
     };
     std::vector<Job> jobs;
+
+    // From the ELF: each upload of the layout alone at its VU address, and every
+    // program start in it - its first pair, and each pair after a program end
+    // (E-bit) or an unconditional jump (B, JR), where the next routine begins.
+    // Only starts whose code stays inside the upload: their key then does not
+    // depend on whatever else is loaded.
+    std::vector<std::unique_ptr<Program>> fromElf;
+    if (!elfPath.empty())
+    {
+        std::ifstream elfIn(elfPath, std::ios::binary);
+        const std::string elf((std::istreambuf_iterator<char>(elfIn)), std::istreambuf_iterator<char>());
+        std::ifstream layoutIn(layoutPath);
+        if (elf.empty() || !layoutIn)
+        {
+            std::fprintf(stderr, "cannot read %s or %s\n", elfPath.c_str(), layoutPath.c_str());
+            return 1;
+        }
+        struct Upload
+        {
+            unsigned unit;
+            unsigned long offset;
+            unsigned address, length;
+            std::string line;
+        };
+        std::vector<Upload> table;
+        std::map<unsigned, std::set<unsigned>> boundaries; // per unit: every upload's start and end
+        std::string line;
+        while (std::getline(layoutIn, line))
+        {
+            // vu<unit> elf=0x<offset> vu=0x<address> len=<bytes>
+            Upload u{0, 0, 0, 0, line};
+            if (line.empty() || line[0] == '#' ||
+                std::sscanf(line.c_str(), "vu%u elf=0x%lx vu=0x%x len=%u", &u.unit, &u.offset, &u.address, &u.length) != 4)
+                continue;
+            table.push_back(u);
+            boundaries[u.unit].insert(u.address);
+            boundaries[u.unit].insert(u.address + u.length);
+        }
+        // Likely entry points from every upload, per unit (see regionEntries).
+        static std::map<unsigned, std::set<uint32_t>> s_unitEntries;
+        for (const Upload &u : table)
+        {
+            std::set<uint32_t> &entries = s_unitEntries[u.unit];
+            const uint32_t size = u.unit == 0 ? PS2_VU0_CODE_SIZE : PS2_VU1_CODE_SIZE;
+            entries.insert(u.address);
+            for (uint32_t i = 0; i + 8u <= u.length; i += 8u)
+            {
+                uint32_t lower = 0, upper = 0;
+                std::memcpy(&lower, elf.data() + u.offset + i, 4);
+                std::memcpy(&upper, elf.data() + u.offset + i + 4, 4);
+                const uint32_t pc = u.address + i;
+                const uint32_t op = (upper & 0x80000000u) ? 0xFFu : (lower >> 25) & 0x7Fu;
+                const bool branch = op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u || op == 0x28u ||
+                                    op == 0x29u || (op >= 0x2Cu && op <= 0x2Fu);
+                if ((upper & 0x40000000u) || (branch && op != 0x20u) || op == 0x20u || op == 0x24u)
+                    entries.insert((pc + 16u) & (size - 1u));
+                if (branch && op != 0x24u && op != 0x25u)
+                {
+                    const int32_t imm = static_cast<int32_t>(lower << 21) >> 21;
+                    entries.insert((pc + 8u + static_cast<uint32_t>(imm * 8)) & (size - 1u));
+                }
+            }
+        }
+        size_t uploads = 0, starts = 0;
+        for (const Upload &u : table)
+        {
+            const unsigned unit = u.unit, length = u.length, address = u.address;
+            const unsigned long offset = u.offset;
+            line = u.line;
+            const uint32_t codeSize = unit == 0 ? PS2_VU0_CODE_SIZE : PS2_VU1_CODE_SIZE;
+            if (offset + length > elf.size() || address + length > codeSize || (address & 7u) || (length & 7u))
+            {
+                std::fprintf(stderr, "layout line out of range: %s\n", line.c_str());
+                continue;
+            }
+            auto program = std::make_unique<Program>();
+            program->codeSize = codeSize;
+            program->code.assign(codeSize, 0u);
+            std::memcpy(program->code.data() + address, elf.data() + offset, length);
+            ++uploads;
+            std::set<uint32_t> candidates = {address};
+            for (uint32_t pc = address; pc + 8u <= address + length; pc += 8u)
+            {
+                uint32_t lower = 0, upper = 0;
+                std::memcpy(&lower, program->code.data() + pc, 4);
+                std::memcpy(&upper, program->code.data() + pc + 4, 4);
+                const bool iBit = (upper & 0x80000000u) != 0u;
+                const uint32_t op = iBit ? 0xFFu : (lower >> 25) & 0x7Fu;
+                if ((upper & 0x40000000u) || op == 0x20u || op == 0x24u)
+                    candidates.insert(pc + 16u);
+            }
+            for (uint32_t start : candidates)
+            {
+                if (start >= address + length)
+                    continue;
+                std::vector<uint32_t> normal, delay;
+                ps2Vu1ProgramPairs(program->code.data(), codeSize, start, normal, delay);
+                bool inside = !normal.empty();
+                for (uint32_t pc : normal)
+                    inside = inside && pc >= address && pc + 8u <= address + length;
+                for (uint32_t pc : delay)
+                    inside = inside && pc >= address && pc + 8u <= address + length;
+                if (!inside)
+                    continue;
+                jobs.push_back({program.get(), start, {}});
+                ++starts;
+            }
+            // And the upload as regions, for the jumps that land between program
+            // starts (jump tables the game fills in at run time). Cut at every
+            // upload's edges: uploads overlap (a slot loaded over the end of a
+            // bigger block), and a region keyed across such an edge would stop
+            // matching whenever the other upload is in. A jump across a cut chains.
+            std::vector<unsigned> cuts = {address};
+            for (unsigned b : boundaries[unit])
+                if (b > address && b < address + length)
+                    cuts.push_back(b);
+            cuts.push_back(address + length);
+            for (size_t c = 0; c + 1 < cuts.size(); ++c)
+            {
+                if (cuts[c + 1] <= cuts[c])
+                    continue;
+                // A branch or program end in the last pair runs its delay slot from
+                // the pair after the piece: the region takes that pair in too (its
+                // key covers it, so it matches whatever the game loads there).
+                unsigned end = cuts[c + 1];
+                uint32_t lower = 0, upper = 0;
+                std::memcpy(&lower, program->code.data() + end - 8u, 4);
+                std::memcpy(&upper, program->code.data() + end - 4u, 4);
+                const uint32_t op = (upper & 0x80000000u) ? 0xFFu : (lower >> 25) & 0x7Fu;
+                const bool branch = op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u || op == 0x28u ||
+                                    op == 0x29u || (op >= 0x2Cu && op <= 0x2Fu);
+                if ((branch || (upper & 0x40000000u)) && end + 8u <= codeSize)
+                {
+                    // The pair there comes from whichever upload covers it.
+                    for (const Upload &other : table)
+                        if (other.unit == unit && other.address <= end && end + 8u <= other.address + other.length)
+                        {
+                            auto variant = std::make_unique<Program>(*program);
+                            std::memcpy(variant->code.data() + end, elf.data() + other.offset + (end - other.address), 8);
+                            jobs.push_back({variant.get(), cuts[c], {}, end + 8u, &s_unitEntries[unit]});
+                            fromElf.push_back(std::move(variant));
+                        }
+                    continue;
+                }
+                jobs.push_back({program.get(), cuts[c], {}, end, &s_unitEntries[unit]});
+            }
+            fromElf.push_back(std::move(program));
+        }
+        std::fprintf(stderr, "%s: %zu uploads, %zu program starts\n", layoutPath.c_str(), uploads, starts);
+    }
     for (const auto &[ids, program] : programs)
     {
         std::vector<uint32_t> roots(program.jumps.begin(), program.jumps.end());
@@ -1406,10 +1725,15 @@ int main(int argc, char **argv)
     for (const Job &job : jobs)
     {
         const Program &program = *job.program;
-        const uint64_t baseKey = ps2Vu1ProgramKey(program.code.data(), program.codeSize, job.startPC);
+        uint64_t baseKey = ps2Vu1ProgramKey(program.code.data(), program.codeSize, job.startPC);
         std::vector<uint32_t> roots = job.roots;
-        const uint64_t fullKey = ps2Vu1ProgramKey(program.code.data(), program.codeSize, job.startPC, roots.data(),
-                                                  static_cast<uint32_t>(roots.size()));
+        uint64_t fullKey = ps2Vu1ProgramKey(program.code.data(), program.codeSize, job.startPC, roots.data(),
+                                            static_cast<uint32_t>(roots.size()));
+        if (job.regionEnd != 0u)
+        {
+            // A region is keyed by its bytes where they sit (ps2Vu1RegionKey).
+            baseKey = fullKey = ps2Vu1RegionKey(program.code.data(), program.codeSize, job.startPC, job.regionEnd);
+        }
         if (std::getenv("VU1_RECOMP_VERBOSE"))
         {
             std::fprintf(stderr, "group base=%016llx pc=0x%x full=%016llx roots:", static_cast<unsigned long long>(baseKey),
@@ -1421,6 +1745,8 @@ int main(int argc, char **argv)
         if (generated.count(fullKey))
             continue;
         VU1Recompiler recompiler(program.code.data(), job.startPC, roots, program.codeSize);
+        if (job.regionEnd != 0u)
+            recompiler.setRegion(job.startPC, job.regionEnd, job.entries);
         std::string text, reason;
         if (!recompiler.generate(fullKey, text, reason))
         {
@@ -1429,7 +1755,16 @@ int main(int argc, char **argv)
             ++skipped;
             continue;
         }
-        generated.emplace(fullKey, Variant{baseKey, std::move(roots), std::move(text), recompiler.m_flagless});
+        Variant variant{baseKey, std::move(roots), std::move(text), recompiler.m_flagless};
+        if (job.regionEnd != 0u)
+        {
+            variant.regionStart = job.startPC;
+            variant.regionEnd = job.regionEnd;
+            variant.codeSize = program.codeSize;
+            for (uint32_t pc : recompiler.compiledEntries())
+                variant.entries.push_back(pc);
+        }
+        generated.emplace(fullKey, std::move(variant));
     }
     std::fprintf(stderr, "%zu program variants compiled, %zu skipped\n", generated.size(), skipped);
 
@@ -1483,8 +1818,12 @@ int main(int argc, char **argv)
                     std::string(name) + "[];\n";
     }
     registry += "\nextern const VU1CompiledProgram g_ps2Vu1CompiledPrograms[] = {\n";
+    size_t programCount = 0, regionCount = 0;
     for (const auto &[key, variant] : generated)
     {
+        if (variant.regionEnd != 0u)
+            continue;
+        ++programCount;
         char line[256];
         std::snprintf(line, sizeof(line), "    {0x%016llxull, vu1p_%llx, vu1r_%llx, %zuu, 0x%016llxull, %s},\n",
                       static_cast<unsigned long long>(variant.baseKey), static_cast<unsigned long long>(key),
@@ -1492,7 +1831,33 @@ int main(int argc, char **argv)
                       variant.flagless ? "true" : "false");
         registry += line;
     }
-    registry += "};\nextern const size_t g_ps2Vu1CompiledProgramCount = " + std::to_string(generated.size()) + ";\n";
+    registry += "    {0, nullptr, nullptr, 0u, 0, false},\n"; // never empty
+    registry += "};\nextern const size_t g_ps2Vu1CompiledProgramCount = " + std::to_string(programCount) + ";\n";
+    for (const auto &[key, variant] : generated)
+    {
+        if (variant.regionEnd == 0u)
+            continue;
+        char name[64];
+        std::snprintf(name, sizeof(name), "%llx", static_cast<unsigned long long>(key));
+        registry += "static const uint32_t vu1e_" + std::string(name) + "[] = {";
+        for (uint32_t pc : variant.entries)
+            registry += std::to_string(pc) + "u, ";
+        registry += "0u};\n";
+    }
+    registry += "\nextern const VU1CompiledRegion g_ps2Vu1CompiledRegions[] = {\n";
+    for (const auto &[key, variant] : generated)
+    {
+        if (variant.regionEnd == 0u)
+            continue;
+        ++regionCount;
+        char line[256];
+        std::snprintf(line, sizeof(line), "    {0x%016llxull, vu1p_%llx, %uu, %uu, %uu, vu1e_%llx, %zuu},\n",
+                      static_cast<unsigned long long>(key), static_cast<unsigned long long>(key), variant.codeSize,
+                      variant.regionStart, variant.regionEnd, static_cast<unsigned long long>(key), variant.entries.size());
+        registry += line;
+    }
+    registry += "    {0, nullptr, 0u, 0u, 0u, nullptr, 0u},\n";
+    registry += "};\nextern const size_t g_ps2Vu1CompiledRegionCount = " + std::to_string(regionCount) + ";\n";
     if (!writeIfChanged(dir + "/vu1_programs.cpp", registry))
         return 1;
     // Remove programs from earlier runs that are no longer generated.
