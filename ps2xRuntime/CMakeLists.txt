@@ -487,22 +487,6 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_achievements.cpp
 )
 
-# xxHash (header-only, XXH_INLINE_ALL): XXH3-64 texture hashes as PCSX2
-# computes them (texture-pack replacement names). The root project points
-# FetchContent at vendor/deps/xxhash.
-include(FetchContent)
-FetchContent_Declare(
-    xxhash
-    GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
-    GIT_TAG v0.8.3
-    GIT_SHALLOW TRUE
-)
-FetchContent_GetProperties(xxhash)
-if(NOT xxhash_POPULATED)
-    FetchContent_Populate(xxhash)
-endif()
-target_include_directories(ps2_runtime PRIVATE "${xxhash_SOURCE_DIR}")
-
 # Host-CPU code generation for the runtime/IOP libraries (VU1 interpreter, GS
 # rasterizer, SPU2). FP contraction stays off so FMA can't change emulated
 # float results (verified with tools/vu1_replay).
