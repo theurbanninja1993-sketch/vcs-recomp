@@ -426,6 +426,17 @@ void ps2HostSettingsLoad()
         s.mouseSensitivity = std::clamp(std::strtof(env, nullptr), 0.05f, 20.0f);
     if (std::getenv("PS2X_MOUSE_INVERT_Y"))
         s.mouseInvertY = true;
+    // The launcher's own mode: a fullscreen launcher starts the game fullscreen and a
+    // windowed one starts it in a window. Either fullscreen kind already chosen in F2
+    // is kept; otherwise fullscreen means borderless.
+    if (const char *env = std::getenv("PS2X_DISPLAY_MODE"))
+    {
+        const std::string mode = env;
+        if (mode == "windowed")
+            s.displayMode = PS2HostSettings::DisplayMode::Windowed;
+        else if (mode == "fullscreen" && s.displayMode == PS2HostSettings::DisplayMode::Windowed)
+            s.displayMode = PS2HostSettings::DisplayMode::Borderless;
+    }
     g_windowApplyPending = true;
     ps2HostSettingsApplyRenderer();
 }
