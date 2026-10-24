@@ -598,7 +598,7 @@ an A/B of each of those changed nothing.
   the intro (7000 frames). Measured with this route: 22 programs (8 VU0) instead
   of 15. That is still short of 30, because a scripted route cannot reach
   everything. So the runtime keeps learning during normal play (below).
-- **Learning during play (done, needs a launcher button).** By default the
+- **Learning during play (done; no launcher offer - see the 10-19 entry).** By default the
   runtime records every VU1/VU0 program it meets that has no compiled version
   (4 runs each, the same capture format) into `<config>/vu_learn/`, where
   `<config>` is `<game>/<platform>/config` for portable installs, and writes a
@@ -614,6 +614,113 @@ an A/B of each of those changed nothing.
   another game running alongside), against ~57 interpreted. Tested end to end
   in a sandbox: recordings moved, 22 programs built, plugin loaded ("[vu1] 22
   compiled programs from .../vu1_programs.so"), nothing interpreted.
+
+## 2026-10-19 (Claude): the Optimize button, and a night spent not reading this file
+
+The owner, after a full evening of me chasing the wrong things: *"last time this
+happened claude said that something you changed made the VU1 compiler do only 15 of
+something instead of the full 30 did they leave a note about it in the handoff?"* -
+they had, and it was this section, with the same 20-30 fps in it. Everything below
+about VU1 was already written down; I had the file open and did not read it.
+
+**What the symptom looked like from the outside:** 60 fps inside the barracks, 20-30
+once driving. Which is exactly what a partial VU program set does - the intro's
+programs cover an interior, and everything outside runs interpreted, about ten times
+slower.
+
+**Correction (same day, later): the Optimize offer is removed.** The plugin was not the
+cure and may have made things worse; the cause was the program set itself (below).
+The launcher's card hint and O key are gone (local launcher commit; not published).
+`build.sh --optimize` still exists for testing. Recordings made during play are still
+written to `<config>/vu_learn/`, but nothing reads them now.
+
+**The lesson, in the plainest terms I can put it:** this file had the answer, the
+measurements, and the fix. I spent the evening on the renderer, the generated
+function table and the frame pacing instead, and every one of those was a real bug I
+introduced or found - but none of them was this. Read this file first.
+
+### 2026-10-19 (later): the real cause, and why it kept coming back
+
+**The slowdown was the program set, and it reverted without anyone noticing.** The
+10-17 fix (30 programs in `scratch/vcs-vu1.backup-20261017`, `build` and `build-win`
+pointed at it) was undone by the next `build.sh` run. Stage 5 does
+`rm -rf "$vu1_dir"` and rebuilds `build/vu1` from the scripted learn route (intro
+only, about 21 programs), then configures both builds to it. Anything not in that
+set runs interpreted.
+
+**Durable fix:** `build.sh` stage 5 now also feeds in every `.bin` under
+`$WORK/vu_pinned/` (captures that must always be in the set). The owner's four
+captures are linked there: `scratch/vu1_capture.bin`, `vu1_capture2.bin`,
+`vu1_capture3.bin`, `vu0_capture.bin`. Symlinks are fine. Regenerating with the
+stage's inputs gives **36 programs**: all 30 of the backup plus 6 from recordings made
+during play. The README in the backup says the set is one registry and a subset
+replaces it, so pass everything.
+
+**Measured** on the build's own learn route (7000 frames, the pad script from
+`games/vcs/game.toml`, `PS2X_PERF_LOG`):
+- the 15-program set (10-17, before the fix): VU1 worker 72-88%, cutscene 155-181/600
+  late. The 21-program set (what the build had reverted to) was not re-measured with
+  these counters; it has the same failure mode, with fewer missing programs.
+- 36-program set (this): every VU1 call compiled, **0 interpreted**, 0 late frames
+  in every 600-frame window.
+- The 36-program set is in `build/vu1`; both `build` and `build-win` are configured
+  to it. Driving outside the barracks is still the owner's test to confirm.
+
+**What to do:** the owner's captures live outside the repo. A player's build has
+none of them, so a player's VU1 set will be the intro-only set until a better
+capture route exists. That is the next real problem for the release, not this one.
+
+**Plugin lesson:** the learned plugin (`vu1_programs.so`) was built from play
+recordings and was not verified to help. It is parked as `.so.off` in `build/`.
+Verify with the counters above before using the plugin again.
+
+## 2026-10-19 (Claude, later): the laptop build got past the compile and stopped in the VU1 learn
+
+The owner's log (`vcs-build.log`, 15:00) reached the learn step: tools, the Windows
+cross-compiler, the disc check (passed), extract, recompile, install and the port's
+compile all completed. The stop was the learn pass: `GLXBadFBConfig` (X error, GLX
+opcode 149) with `PS2X_HIDDEN_WINDOW=1`, which recorded nothing, so the launcher stopped
+with "no microprograms were recorded".
+
+- The "Warnings: 1206, errors: 604" in the recompile stage are the recompiler's
+  unhandled-instruction reports, expected for this ELF; they are not what stopped the build.
+- The hidden window is the likely cause: the same pass runs fine here, and the visible game
+  path never hits this error on the laptop. The handoff's own rule is that test runs use a
+  visible window for this reason.
+
+**Fix (launcher `src/builder.cpp`, committed locally):** a learn pass that records nothing
+is run once more with a visible window before the build gives up. A working machine never
+reaches the retry. Not verified on the laptop; compiled and reviewed.
+
+`build.sh` stage 5 still has the hidden-only pass. It is the development path, not what the
+owner's launcher runs, so it is left as it is for now.
+
+## 2026-10-19 (Claude, later): the learn pass failed again, and the visible-window retry did not help
+
+The owner's next log (`vcs-build.log`, 16:49) stopped at the same place. Both attempts failed
+with `GLXBadFBConfig`: the hidden window, then the visible retry. The learn pass also ran on
+`llvmpipe` (Mesa's software renderer), so the laptop's X display is not giving the game a GPU.
+
+**Launcher, local commit (not published):** a third attempt runs the learn pass under a private
+X server (`xvfb-run -a`) when the `xvfb` package is installed, and the WSL setup now installs it.
+Checked here: the VCS runner boots under `xvfb-run` with GL 4.6 (llvmpipe), no GLX error. Not
+verified on the laptop.
+
+## 2026-10-20 (Claude): the virtual-display pass hung on the learn step
+
+The owner's log on the stick (`vcs-build.log`, 07:01): the hidden and visible passes failed
+with `GLXBadFBConfig` as before, and then the virtual-display pass started and printed
+nothing. The owner came back hours later and the build was still on the learn step.
+
+**Cause:** the launcher wrapped the pass as `xvfb-run -a timeout 400 runner ...`. The 400 s
+timeout sat inside the X server, so an X server that never started had no limit at all.
+
+**Fix (launcher `6a4ba54`, local, not published):** the timeout now wraps the whole pass,
+`timeout 1800 xvfb-run -a runner ...`, and the virtual-display pass gets 1800 s, because it
+renders in software. The hidden and visible passes keep their 400 s.
+
+**Still open:** why the X server (or the game on it) does not start on the laptop. The log
+shows no game output for that pass, so the next run will tell us either way.
 
 ## If you are reviewing this
 

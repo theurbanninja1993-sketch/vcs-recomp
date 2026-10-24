@@ -323,6 +323,28 @@ if [ "$WINDOWS" -eq 1 ]; then
         fi
     done
 fi
+# ---------------------------------------------------------------- stage 0
+# Before the Windows configure, which takes minutes: a wrong disc is the one failure
+# that needs only ps2x_iso, which the tools stage has just built.
+if [ "$FROM" -le 0 ] && [ "$TO" -ge 0 ]; then
+    stage_begin "0. checking the disc"
+    if [ -d "$IMAGE" ]; then
+        [ -f "$IMAGE/$game_boot_file" ] || die "no $game_boot_file in $IMAGE"
+        need_tool "$ps2_iso"
+        hash=$("$ps2_iso" hashfile "$IMAGE/$game_boot_file" | cut -d' ' -f1)
+        note "extracted folder; boot $game_boot_file"
+    else
+        need_tool "$ps2_iso"
+        info=$("$ps2_iso" check "$IMAGE" --boot "$game_boot_file" 2>&1) || die "can't read $IMAGE"
+        printf '%s\n' "$info" | sed 's/^/    /'
+        hash=$(printf '%s\n' "$info" | sed -n 's/.*boot hash: \([0-9a-f]*\).*/\1/p')
+        [ -n "$hash" ] || die "could not read this disc (the reason is above)"
+    fi
+    [ "$hash" = "$game_boot_hash_xxh3_128" ] || die "this disc is not $game_name (boot hash $hash)"
+    note "recognised: $game_name"
+    stage_end
+fi
+
 if [ "$WINDOWS" -eq 1 ] && [ "$wants_windows" -eq 0 ]; then
     note "--windows given but no stage that uses it is in range; nothing to do"
 fi
@@ -334,25 +356,6 @@ if [ "$wants_windows" -eq 1 ]; then
     run cmake -S "$PS2RECOMP" -B "$PS2RECOMP/build-win" -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE="$PS2RECOMP/cmake/toolchains/llvm-mingw-x86_64.cmake" \
         -DLLVM_MINGW_ROOT="$TOOLCHAIN"
-    stage_end
-fi
-
-# ---------------------------------------------------------------- stage 0
-if [ "$FROM" -le 0 ] && [ "$TO" -ge 0 ]; then
-    stage_begin "0. checking the disc"
-    if [ -d "$IMAGE" ]; then
-        [ -f "$IMAGE/$game_boot_file" ] || die "no $game_boot_file in $IMAGE"
-        need_tool "$ps2_iso"
-        hash=$("$ps2_iso" hashfile "$IMAGE/$game_boot_file" | cut -d' ' -f1)
-        note "extracted folder; boot $game_boot_file"
-    else
-        need_tool "$ps2_iso"
-        info=$("$ps2_iso" check "$IMAGE" 2>&1) || die "can't read $IMAGE"
-        printf '%s\n' "$info" | sed 's/^/    /'
-        hash=$(printf '%s\n' "$info" | sed -n 's/.*boot hash: \([0-9a-f]*\).*/\1/p')
-    fi
-    [ "$hash" = "$game_boot_hash_xxh3_128" ] || die "this disc is not $game_name (boot hash $hash)"
-    note "recognised: $game_name"
     stage_end
 fi
 
@@ -494,7 +497,12 @@ if [ "$FROM" -le 5 ] && [ "$TO" -ge 5 ]; then
             # Every recording so far (a later pass only adds what is still
             # missing); empty files are passes that found nothing new.
             # Plus anything recorded while playing and compiled by --optimize.
-            mapfile -t recordings < <(find "$learn" "$WORK/vu_played" -name 'vu[01]_learn_*.bin' -size +0 2>/dev/null | sort)
+            # Plus $WORK/vu_pinned: full-playthrough captures that must always be in
+            # the set. A scripted learn route only reaches the intro, so without them
+            # a rebuild quietly drops back to ~21 programs and everything else runs
+            # interpreted (about ten times slower). Symlinks are fine there.
+            mapfile -t recordings < <({ find "$learn" "$WORK/vu_played" -name 'vu[01]_learn_*.bin' -size +0 2>/dev/null
+                                        find -L "$WORK/vu_pinned" -name '*.bin' -size +0 2>/dev/null; } | sort)
             "$vu1_recomp" "$vu1_dir" "${recordings[@]}" || die "vu1_recomp failed"
             [ -f "$vu1_dir/vu1_programs.cpp" ] || die "vu1_recomp wrote no registry"
             note "  $(ls "$vu1_dir"/vu1p_*.cpp 2>/dev/null | wc -l) program file(s)"
@@ -536,7 +544,10 @@ if [ "$FROM" -le 6 ] && [ "$TO" -ge 6 ]; then
     if [ -f "$PS2RECOMP/build-win/ps2xRuntime/ps2EntryRunner.exe" ]; then
         make_platforms="--linux --windows"
     fi
-    run "$make_portable" $make_platforms --out "$OUT" --game "$disc_dir"
+    run "$make_portable" $make_platforms --out "$OUT" --game "$disc_dir" \
+        --achievements "$GAME_DIR/achievements.toml"
+    # The development runner reads the set from beside itself, like a portable one.
+    run cp "$GAME_DIR/achievements.toml" "$PS2RECOMP/build/ps2xRuntime/achievements.toml"
     [ "$DRY_RUN" -eq 1 ] || note "game folder: $OUT"
     stage_end
 fi

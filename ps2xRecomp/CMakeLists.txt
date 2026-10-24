@@ -11,31 +11,33 @@ include(FetchContent)
 
 FetchContent_Declare(
     elfio
-    GIT_REPOSITORY https://github.com/serge1/ELFIO.git
-    GIT_TAG Release_3.12
-    GIT_SHALLOW TRUE
+    URL https://github.com/serge1/ELFIO/archive/refs/tags/Release_3.12.tar.gz
+    URL_HASH SHA256=e4ebc9ce3d6916461bc3e7765bb45e6210f0a9b93978bf91e59b05388c024489
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(elfio)
 
 FetchContent_Declare(
     toml11
-    GIT_REPOSITORY https://github.com/ToruNiina/toml11.git
-    GIT_TAG v4.4.0
+    URL https://github.com/ToruNiina/toml11/archive/refs/tags/v4.4.0.tar.gz
+    URL_HASH SHA256=815bfe6792aa11a13a133b86e7f0f45edc5d71eb78f5fb6686c49c7f792b9049
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(toml11)
 
 FetchContent_Declare(
     fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-    GIT_TAG 12.1.0
+    URL https://github.com/fmtlib/fmt/archive/refs/tags/12.1.0.tar.gz
+    URL_HASH SHA256=ea7de4299689e12b6dddd392f9896f08fb0777ac7168897a244a6d6085043fea
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(fmt)
  
 FetchContent_Declare(
     libdwarf
-    GIT_REPOSITORY https://github.com/davea42/libdwarf-code.git
-    GIT_TAG v2.2.0
-    GIT_SHALLOW TRUE
+    URL https://github.com/davea42/libdwarf-code/archive/refs/tags/v2.2.0.tar.gz
+    URL_HASH SHA256=379bc309a86a713ca0227c95e4f7f79e5c463200741e315feaa804b43a33d2d9
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 
 set(BUILD_DWARFDUMP    OFF CACHE BOOL "" FORCE)
@@ -51,8 +53,9 @@ set(LIBDWARF_INCLUDE_DIR "${libdwarf_SOURCE_DIR}/src/lib/libdwarf")
 
 FetchContent_Declare(
     rabbitizer
-    GIT_REPOSITORY https://github.com/Decompollaborate/rabbitizer.git
-    GIT_TAG 1.14.3
+    URL https://github.com/Decompollaborate/rabbitizer/archive/refs/tags/1.14.3.tar.gz
+    URL_HASH SHA256=cda4b90f68914e86f6d134c3edec944be09f8ba1327358fa217e99a0fb2e3e26
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(rabbitizer)
 

@@ -28,8 +28,8 @@ if(PS2X_ISO_CHD AND NOT CMAKE_CROSSCOMPILING)
     set(CHDR_WANT_SUBCODE ON CACHE BOOL "libchdr: output CD subchannel data" FORCE)
 
     FetchContent_Declare(libchdr
-        GIT_REPOSITORY https://github.com/rtissera/libchdr.git
-        GIT_TAG ${PS2X_LIBCHDR_REV})
+        URL https://github.com/rtissera/libchdr/archive/${PS2X_LIBCHDR_REV}.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
     FetchContent_MakeAvailable(libchdr)
 
     # chdr-static is defined whether or not the shared library is.

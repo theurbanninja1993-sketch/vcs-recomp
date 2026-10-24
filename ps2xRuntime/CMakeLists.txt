@@ -78,18 +78,18 @@ else()
 
     FetchContent_Declare(
         raylib
-        GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
-        GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
-        GIT_PROGRESS TRUE
+        URL https://github.com/raysan5/raylib/archive/refs/tags/5.5.tar.gz
+        URL_HASH SHA256=aea98ecf5bc5c5e0b789a76de0083a21a70457050ea4cc2aec7566935f5e258e
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     FetchContent_MakeAvailable(raylib)
 
     if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
             imgui
-            GIT_REPOSITORY https://github.com/ocornut/imgui.git
-            GIT_TAG "v1.92.7-docking"
-            GIT_SHALLOW TRUE
+            URL https://github.com/ocornut/imgui/archive/refs/tags/v1.92.7-docking.tar.gz
+            URL_HASH SHA256=2c58e28c957497eba0ed01c48a0bc5f118ec5f10a1c3721ba9436253a623bd72
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         )
         FetchContent_GetProperties(imgui)
 
@@ -110,9 +110,9 @@ else()
 
         FetchContent_Declare(
             rlImGui
-            GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
-            GIT_TAG "Raylib_5_5"
-            GIT_SHALLOW TRUE
+            URL https://github.com/raylib-extras/rlImGui/archive/118221c8a532501a3c2c236b62950877cbefc2b4.tar.gz
+            URL_HASH SHA256=8240dbe590aec8122cb0769b7c920461b1e17d5dcae029530a760fd97c2041e4
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         )
         FetchContent_GetProperties(rlImGui)
 
@@ -411,8 +411,8 @@ if(PS2X_ACHIEVEMENTS)
         "rcheevos revision the achievement engine is built from")
     FetchContent_Declare(
         rcheevos
-        GIT_REPOSITORY https://github.com/RetroAchievements/rcheevos.git
-        GIT_TAG ${PS2X_RCHEEVOS_REV}
+        URL https://github.com/RetroAchievements/rcheevos/archive/${PS2X_RCHEEVOS_REV}.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     FetchContent_GetProperties(rcheevos)
     if(NOT rcheevos_POPULATED)
@@ -693,9 +693,9 @@ target_include_directories(ps2_runtime PUBLIC
 include(FetchContent)
 FetchContent_Declare(
     xxhash
-    GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
-    GIT_TAG v0.8.3
-    GIT_SHALLOW TRUE
+    URL https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.3.tar.gz
+    URL_HASH SHA256=aae608dfe8213dfd05d909a57718ef82f30722c392344583d3f39050c7f29a80
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_GetProperties(xxhash)
 if(NOT xxhash_POPULATED)
@@ -717,6 +717,12 @@ elseif(WIN32)
     target_link_libraries(ps2_runtime PUBLIC opengl32 gdi32)
 endif()
 target_include_directories(ps2_runtime PUBLIC "${PS2X_GENERATED_DIR}")
+# raylib first on Windows: its CloseWindow and ShowCursor share names with USER32's,
+# lld takes the first archive on the line that offers a symbol, and FFmpeg's system
+# libraries otherwise put -luser32 ahead of raylib.
+if(WIN32)
+    target_link_libraries(ps2EntryRunner PRIVATE raylib)
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
