@@ -524,6 +524,8 @@ void ps2HostSettingsSave()
         << "aspect=" << static_cast<int>(s.aspect) << "\n"
         << "smooth_filtering=" << (s.smoothFiltering ? 1 : 0) << "\n"
         << "internal_scale=" << s.internalScale << "\n"
+        << "vsync=" << (s.vsync ? 1 : 0) << "\n"
+        << "pnach_cheats=" << (s.pnachCheats ? 1 : 0) << "\n"
         << "flicker_filter=" << (s.flickerFilter ? 1 : 0) << "\n"
         << "vsync=" << (s.vsync ? 1 : 0) << "\n"
         << "frame_rate=" << static_cast<int>(s.frameRate) << "\n"
@@ -541,6 +543,10 @@ void ps2HostSettingsSave()
         << "music_shuffle=" << (s.musicShuffle ? 1 : 0) << "\n"
         << "radio_off_enabled=" << (s.radioOffEnabled ? 1 : 0) << "\n"
         << "gamepad_layout=" << static_cast<int>(s.gamepadLayout) << "\n";
+    out << "mods_disabled=";
+    for (size_t i = 0; i < s.disabledMods.size(); ++i)
+        out << (i ? "|" : "") << s.disabledMods[i];
+    out << "\n";
     // Load sees the layout before the per-button lines.
     if (s.gamepadLayout == ps2controls::GamepadLayout::Custom)
         for (int context = 0; context < ps2controls::kContextCount; ++context)

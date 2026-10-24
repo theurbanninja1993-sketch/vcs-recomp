@@ -97,7 +97,11 @@ namespace
 {
     // SPU2 output ring, filled by the IOP (emulation thread) and drained by the
     // audio device callback. raylib callbacks carry no user pointer, hence the
-    // single global stream.
+    // single global stream. Ported from the VCS port's validated audio path:
+    // lock-free (a mutex here was a dropout hazard - the callback could block
+    // behind a submit and miss its deadline, heard as a dropout) with
+    // free-running counters so producer and consumer never touch each other's
+    // fields.
     struct StreamRing
     {
         // Power of two, so indexing is a mask, and free-running counters so the

@@ -487,6 +487,22 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_achievements.cpp
 )
 
+# xxHash (header-only, XXH_INLINE_ALL): XXH3-64 texture hashes as PCSX2
+# computes them (texture-pack replacement names). The root project points
+# FetchContent at vendor/deps/xxhash.
+include(FetchContent)
+FetchContent_Declare(
+    xxhash
+    GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
+    GIT_TAG v0.8.3
+    GIT_SHALLOW TRUE
+)
+FetchContent_GetProperties(xxhash)
+if(NOT xxhash_POPULATED)
+    FetchContent_Populate(xxhash)
+endif()
+target_include_directories(ps2_runtime PRIVATE "${xxhash_SOURCE_DIR}")
+
 # Host-CPU code generation for the runtime/IOP libraries (VU1 interpreter, GS
 # rasterizer, SPU2). FP contraction stays off so FMA can't change emulated
 # float results (verified with tools/vu1_replay).
@@ -587,7 +603,6 @@ endif()
 # Set to 0 (or remove) for release builds.
 target_compile_definitions(ps2_runtime PRIVATE
     PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
-    AGRESSIVE_LOGS=1
 )
 
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
@@ -598,9 +613,8 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
-file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
-)
+set(PS2X_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/runner" CACHE PATH "Generated game sources")
+file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS "${PS2X_GENERATED_DIR}/*.cpp")
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
@@ -637,8 +651,8 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        "${PS2X_GENERATED_DIR}/ps2_recompiled_functions.h"
+        "${PS2X_GENERATED_DIR}/ps2_recompiled_stubs.h")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()
@@ -702,6 +716,7 @@ if(UNIX AND NOT APPLE AND NOT PS2X_IS_ANDROID)
 elseif(WIN32)
     target_link_libraries(ps2_runtime PUBLIC opengl32 gdi32)
 endif()
+target_include_directories(ps2_runtime PUBLIC "${PS2X_GENERATED_DIR}")
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
@@ -814,6 +829,24 @@ if(NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
     # file to link into the runner and vu1_replay.
     add_executable(vu1_recomp EXCLUDE_FROM_ALL tools/vu1_recomp.cpp)
     target_link_libraries(vu1_recomp PRIVATE ps2_runtime)
+    add_executable(vu0_replay EXCLUDE_FROM_ALL tools/vu1_replay.cpp)
+    target_compile_definitions(vu0_replay PRIVATE PS2X_VU_UNIT=0)
+    target_link_libraries(vu0_replay PRIVATE ps2_runtime)
+    add_executable(vu0_recomp EXCLUDE_FROM_ALL tools/vu1_recomp.cpp)
+    target_compile_definitions(vu0_recomp PRIVATE PS2X_VU_UNIT=0)
+    target_link_libraries(vu0_recomp PRIVATE ps2_runtime)
+    set(PS2X_VU0_PROGRAMS "" CACHE PATH "Directory of generated VU0 programs")
+    if(PS2X_VU0_PROGRAMS AND EXISTS "${PS2X_VU0_PROGRAMS}/vu0_programs.cpp")
+        file(GLOB PS2X_VU0_PROGRAM_SOURCES CONFIGURE_DEPENDS "${PS2X_VU0_PROGRAMS}/*.cpp")
+        add_library(ps2_vu0_programs OBJECT ${PS2X_VU0_PROGRAM_SOURCES})
+        target_include_directories(ps2_vu0_programs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu)
+        target_link_libraries(ps2_vu0_programs PRIVATE ps2_runtime)
+        target_compile_options(ps2_vu0_programs PRIVATE -ffp-contract=off -frounding-math -O2)
+        target_link_libraries(vu0_replay PRIVATE ps2_vu0_programs)
+        if(TARGET ps2EntryRunner)
+            target_link_libraries(ps2EntryRunner PRIVATE ps2_vu0_programs)
+        endif()
+    endif()
     set(PS2X_VU1_PROGRAMS "" CACHE PATH "Directory of generated VU1 programs (vu1_recomp output)")
     if(PS2X_VU1_PROGRAMS AND EXISTS "${PS2X_VU1_PROGRAMS}/vu1_programs.cpp")
         file(GLOB PS2X_VU1_PROGRAM_SOURCES CONFIGURE_DEPENDS "${PS2X_VU1_PROGRAMS}/*.cpp")

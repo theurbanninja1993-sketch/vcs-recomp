@@ -73,6 +73,11 @@ struct VU1Jit
         // Generated code keeps the cycle count in a local (`cyc`); it is written
         // back before anything that reads vu.m_cycle and on every exit.
         vu.m_cycle = cyc;
+        // The interpreter commits ready flags at the end of every cycle.
+        // Lazy compiled flags already ready at this exit must be committed
+        // now; leaving them pending makes flushPipelines advance an extra
+        // cycle even when all architectural writes have completed.
+        syncFlags(vu, cyc);
         if (vu.m_flagCount != 0u)
             vu.m_nextCommitCycle = std::min(vu.m_nextCommitCycle, vu.m_flagPipeline[vu.m_flagHead].readyCycle);
     }

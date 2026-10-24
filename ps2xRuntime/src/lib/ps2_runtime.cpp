@@ -1,4 +1,8 @@
 #include "ps2_runtime.h"
+#include "runtime/gs/gs_gpu_backend.h" // g_gsGpuPresent*: present readback cap
+#include "runtime/gs/gpu/gl_context.h"   // publishHostGlContext
+#include "runtime/ps2_mods.h"
+#include "runtime/ps2_music_station.h"
 #include "runtime/ps2_host_settings.h"
 #include "runtime/ps2_pad.h"
 #include "runtime/ps2_platform.h"
@@ -78,6 +82,7 @@ extern "C" void rlDrawRenderBatchActive(void);
 // raylib's rlgl texture readback. rlgl.h is not on this file's include path, and
 // the symbol is exported with C linkage, so declare it here.
 #include <stdexcept>
+#include <exception>
 #include <fstream>
 #include <algorithm>
 #include <array>
@@ -1294,6 +1299,17 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
 
+        if (std::getenv("PS2X_HEADLESS"))
+        {
+            if (!syncCoreSubsystems())
+            {
+                std::cerr << "Failed to bind runtime core subsystems" << std::endl;
+                return false;
+            }
+            m_audioBackend.setAudioReady(false);
+            RUNTIME_LOG("[headless] Core initialized without a window or audio device");
+            return true;
+        }
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
         gsgpu::publishHostGlContext(); // the renderer joins the window's GL share group
@@ -1307,18 +1323,15 @@ bool PS2Runtime::initialize(const char *title)
         ps2ApplyGamepadMappings(); // GLFW is up now: install the extra pad mappings
         gsgpu::publishHostGlContext(); // the renderer joins the window's GL share group
         SetWindowMinSize(320, 240);
-        InitAudioDevice();
-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        // PS2X_NO_AUDIO=1: run without an audio device (silent test runs).
+        if (std::getenv("PS2X_NO_AUDIO") == nullptr)
+            InitAudioDevice();
+        m_audioBackend.setAudioReady(std::getenv("PS2X_NO_AUDIO") == nullptr && IsAudioDeviceReady());
 #endif
-
         // The GS renderer creates its own GL context, and it can only join the
-        // window's share group if the window already exists and its context has
-        // been published - so this must come *after* publishHostGlContext().
-        // It used to come first: the renderer silently fell back to a context of
-        // its own, the composed frame had to be read back and re-uploaded, and a
-        // synthesized frame - which is handed over as a texture, not read back -
-        // was drawn from a name that means nothing in the host's context, which
-        // is the black flicker between pictures.
+        // window's share group (so the host draws the composed frame directly,
+        // without a readback) once the window exists and its context has been
+        // published - so the GS comes up after the window.
         if (!syncCoreSubsystems())
         {
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
@@ -1340,6 +1353,7 @@ bool PS2Runtime::initialize(const char *title)
             // First launch (or "show at every launch"): settings before the
             // game starts. Automated runs skip it.
             const bool automated = std::getenv("PS2X_NO_LAUNCH_MENU") || std::getenv("PS2X_EXIT_AFTER_FRAME") ||
+                                   std::getenv("PS2X_EXIT_AFTER_VSYNC") ||
                                    std::getenv("PS2X_HIDDEN_WINDOW");
             if (!automated && (ps2HostSettingsFirstLaunch() || ps2HostSettings().showAtLaunch))
             {
@@ -1707,7 +1721,16 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.mcRoot = pickMemoryCardRoot(paths.elfDirectory);
     }
 
+    // Host launchers can keep writable saves outside an extracted disc tree.
+    // Port 1 is resolved beside this mc0 root by the memory-card service.
+    if (const char *mcRoot = std::getenv("PS2X_MC_ROOT"); mcRoot && *mcRoot)
+    {
+        paths.mcRoot = std::filesystem::path(mcRoot);
+    }
+
     setIoPaths(paths);
+    RUNTIME_LOG("[io:mounts] cd=\"" << getIoPaths().cdRoot.string()
+                << "\" mc=\"" << getIoPaths().mcRoot.string() << "\"" << std::endl);
 }
 
 namespace
@@ -1787,6 +1810,7 @@ bool g_ps2TraceBoolWrites = std::getenv("PS2X_WATCH_BOOL_WRITES") != nullptr;
 // the game thread (every 100 us of game-thread CPU time, from startFrame on),
 // written as raw little-endian u32 PCs. Unlike PS2X_COUNT_CALLS this also sees
 // functions reached through direct recompiled calls.
+extern std::atomic<int> g_ps2GsGpuWorkerTid, g_ps2GsGpuWorkerClock;
 namespace
 {
     constexpr size_t kPcSampleCapacity = 1u << 22;
@@ -1797,14 +1821,16 @@ namespace
     std::atomic<uint32_t> g_pcSampleCount{0};
     uint64_t g_pcSampleStartFrame = 0;
     PS2Runtime *g_pcSampleRuntime = nullptr;
+    const std::atomic<uint64_t> *g_pcSampleFrameClock = &g_ps2PresentedFrameCounter;
 
     // Records the host instruction pointer (offset from this handler's address,
     // so the PIE load base cancels out); map with nm on ps2EntryRunner.
     void pcSampleHandler(int, siginfo_t *, void *contextPtr)
     {
-        if (!g_pcSampleRuntime || g_ps2PresentedFrameCounter.load(std::memory_order_relaxed) < g_pcSampleStartFrame)
+        if (!g_pcSampleRuntime || g_pcSampleFrameClock->load(std::memory_order_relaxed) < g_pcSampleStartFrame)
             return;
-        static const bool s_vif1Only = std::getenv("PS2X_PC_SAMPLE_VIF1") != nullptr;
+        static const bool s_vif1Only = std::getenv("PS2X_PC_SAMPLE_VIF1") != nullptr &&
+                                      std::getenv("PS2X_PC_SAMPLE_GPU") == nullptr;
         if (s_vif1Only && !PS2Memory::onAsyncVif1Worker())
             return;
         // ITIMER_PROF is process-wide, so samples land on whichever thread is
@@ -1823,7 +1849,7 @@ namespace
             const uint64_t rsp = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RSP]);
             g_pcSampleCallers[index] = static_cast<uint32_t>(*reinterpret_cast<const uint64_t *>(rsp) -
                                                              reinterpret_cast<uint64_t>(&pcSampleHandler));
-            g_pcSampleCount.store(index + 1u, std::memory_order_relaxed);
+            g_pcSampleCount.store(index + 1u, std::memory_order_release);
         }
     }
 
@@ -1834,7 +1860,14 @@ namespace
             return;
         if (const char *comma = std::strchr(env, ','))
             g_pcSampleStartFrame = std::strtoull(comma + 1, nullptr, 10);
+        // Select before installing the handler; its only clock operation is an
+        // atomic load. Existing startFrame semantics remain the default.
+        g_pcSampleFrameClock = std::getenv("PS2X_PC_SAMPLE_VSYNC")
+                                  ? &runtime->memory().gs().vsyncTick : &g_ps2PresentedFrameCounter;
         g_pcSampleRuntime = runtime;
+        std::cerr << "[profile] start=" << g_pcSampleStartFrame
+                  << " clock=" << (g_pcSampleFrameClock == &g_ps2PresentedFrameCounter ? "frame" : "vsync")
+                  << std::endl;
         struct sigaction action{};
         action.sa_sigaction = pcSampleHandler;
         action.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -1843,20 +1876,37 @@ namespace
         event.sigev_notify = SIGEV_THREAD_ID;
         event.sigev_signo = SIGPROF;
         event._sigev_un._tid = static_cast<pid_t>(syscall(SYS_gettid));
+        clockid_t sampleClock = CLOCK_THREAD_CPUTIME_ID;
+        const bool gpu = std::getenv("PS2X_PC_SAMPLE_GPU") != nullptr;
+        if (gpu)
+        {
+            event._sigev_un._tid = static_cast<pid_t>(g_ps2GsGpuWorkerTid.load());
+            sampleClock = static_cast<clockid_t>(g_ps2GsGpuWorkerClock.load());
+            if (event._sigev_un._tid == 0)
+            {
+                std::cerr << "[profile] GPU worker unavailable; no samples armed" << std::endl;
+                return;
+            }
+        }
         // PS2X_PC_SAMPLE_GS=1: sample GS rasterizer worker 0 instead.
-        if (std::getenv("PS2X_PC_SAMPLE_GS") && g_ps2GsWorkerTid.load() != 0)
+        if (!gpu && std::getenv("PS2X_PC_SAMPLE_GS") && g_ps2GsWorkerTid.load() != 0)
             event._sigev_un._tid = static_cast<pid_t>(g_ps2GsWorkerTid.load());
         // PS2X_PC_SAMPLE_VIF1=1: the async VIF1/VU1 worker arms its own timer
         // (ps2PcSampleCurrentThread) instead.
-        if (std::getenv("PS2X_PC_SAMPLE_VIF1"))
+        if (!gpu && std::getenv("PS2X_PC_SAMPLE_VIF1"))
             return;
         timer_t timer{};
-        if (timer_create(CLOCK_THREAD_CPUTIME_ID, &event, &timer) != 0)
+        if (timer_create(sampleClock, &event, &timer) != 0)
+        {
+            std::perror("CPU profile timer");
             return;
+        }
         itimerspec spec{};
         spec.it_interval.tv_nsec = 100000;
         spec.it_value.tv_nsec = 100000;
         timer_settime(timer, 0, &spec, nullptr);
+        std::cerr << "[profile] thread=" << (gpu ? "gpu" : "ee") << " tid=" << event._sigev_un._tid
+                  << " clock=thread-cpu startFrame=" << g_pcSampleStartFrame << std::endl;
     }
 
     void writePcSamples();
@@ -1889,14 +1939,15 @@ namespace
             return;
         std::string path(env);
         path = path.substr(0, path.find(','));
+        const uint32_t count = g_pcSampleCount.load(std::memory_order_acquire);
         if (FILE *f = std::fopen(ps2x::narrow(path).c_str(), "wb"))
         {
-            std::fwrite(g_pcSamples, sizeof(uint32_t), g_pcSampleCount.load(), f);
+            std::fwrite(g_pcSamples, sizeof(uint32_t), count, f);
             std::fclose(f);
         }
         if (FILE *f = std::fopen((path + ".callers").c_str(), "wb"))
         {
-            std::fwrite(g_pcSampleCallers, sizeof(uint32_t), g_pcSampleCount.load(), f);
+            std::fwrite(g_pcSampleCallers, sizeof(uint32_t), count, f);
             std::fclose(f);
         }
         // <file>.maps: the handler's absolute address followed by
@@ -1917,7 +1968,7 @@ namespace
     }
 }
 #else
-// The PC sampler uses Linux per-thread CPU timers and SIGPROF.
+// The SIGPROF sampler is Linux-only (PS2X_PC_SAMPLE does nothing elsewhere).
 namespace
 {
     void startPcSampling(PS2Runtime *) {}
@@ -2023,9 +2074,94 @@ std::unordered_set<uint32_t> g_ps2WriteWatchSet = []()
     }
     return set;
 }();
+namespace
+{
+    // The executor publishes its RAM for optional write diagnostics. Device
+    // threads without an executor context leave this unset; the shadow watch
+    // can still capture their writes on the next guest dispatch.
+    thread_local const uint8_t *s_writeWatchRam = nullptr;
+}
 
 void ps2ReportWatchedWrite(uint32_t addr, uint32_t size, uint64_t value, const R5900Context *ctx, const char *op)
 {
+    const uint32_t watchedWord = g_ps2WriteWatchAddr & ~3u;
+    uint32_t oldWord = 0u, observedWord = 0u;
+    bool predicted = false;
+    if (s_writeWatchRam && watchedWord <= PS2_RAM_SIZE - 4u)
+    {
+        std::memcpy(&oldWord, s_writeWatchRam + watchedWord, 4u);
+        observedWord = oldWord;
+        // Store watches run before the store. Host range watches may run
+        // after a copy; their value argument is a placeholder, not copied data.
+        const bool scalar = op && (std::strcmp(op, "SB") == 0 || std::strcmp(op, "SH") == 0 ||
+                                  std::strcmp(op, "SW") == 0 || std::strcmp(op, "SD") == 0 ||
+                                  std::strcmp(op, "SQ") == 0);
+        if (scalar)
+        {
+            const uint32_t physical = addr & PS2_RAM_MASK;
+            for (uint32_t byte = 0u; byte < 4u; ++byte)
+            {
+                const uint32_t offset = watchedWord + byte - physical;
+                if (offset < size && offset < sizeof(value))
+                {
+                    const uint32_t shift = byte * 8u;
+                    observedWord = (observedWord & ~(0xFFu << shift)) |
+                                   (static_cast<uint32_t>((value >> (offset * 8u)) & 0xFFu) << shift);
+                    predicted = true;
+                }
+            }
+        }
+        static const std::string snapshotDir = []
+        {
+            const char *directory = std::getenv("PS2X_WATCH_SNAPSHOT_DIR");
+            return directory ? std::string(directory) : std::string{};
+        }();
+        static const bool hasWord = std::getenv("PS2X_WATCH_SNAPSHOT_WORD") != nullptr;
+        static const uint32_t snapshotWord = []
+        {
+            const char *word = std::getenv("PS2X_WATCH_SNAPSHOT_WORD");
+            return word ? static_cast<uint32_t>(std::strtoul(word, nullptr, 0)) : 0u;
+        }();
+        static const uint64_t startFrame = []
+        {
+            const char *frame = std::getenv("PS2X_WATCH_SNAPSHOT_START_FRAME");
+            return frame ? std::strtoull(frame, nullptr, 0) : 0ull;
+        }();
+        static std::atomic<bool> captured{false};
+        if (!snapshotDir.empty() && hasWord && observedWord == snapshotWord &&
+            g_ps2PresentedFrameCounter.load(std::memory_order_relaxed) >= startFrame && !captured.exchange(true))
+        {
+            std::error_code error;
+            const std::filesystem::path directory(snapshotDir);
+            std::filesystem::create_directories(directory, error);
+            if (!error)
+            {
+                std::ofstream ram(directory / "watched-write.ram.bin", std::ios::binary);
+                ram.write(reinterpret_cast<const char *>(s_writeWatchRam), PS2_RAM_SIZE);
+                std::ofstream registers(directory / "watched-write.registers.txt");
+                registers << "op=" << (op ? op : "unknown") << " predicted=" << predicted
+                          << " frame=" << g_ps2PresentedFrameCounter.load(std::memory_order_relaxed)
+                          << " addr=0x" << std::hex << addr << " wordAddr=0x" << watchedWord
+                          << " oldWord=0x" << oldWord << " observedWord=0x" << observedWord << '\n';
+                if (ctx)
+                {
+                    // Keep the full 128-bit registers, HI/LO, FPU and VU0
+                    // state too. The binary layout is native to this build.
+                    std::ofstream context(directory / "watched-write.context.bin", std::ios::binary);
+                    context.write(reinterpret_cast<const char *>(ctx), sizeof(*ctx));
+                    registers << "pc=0x" << ctx->pc << " branchPc=0x" << ctx->branch_pc
+                              << " delaySlot=" << ctx->in_delay_slot << " contextBytes=" << std::dec << sizeof(*ctx)
+                              << std::hex << '\n';
+                    for (uint32_t reg = 0u; reg < 32u; ++reg)
+                        registers << "r" << std::dec << reg << "=0x" << std::hex << getRegU32(ctx, reg) << '\n';
+                }
+                registers << "dispatch=" << formatDispatchHistory() << '\n';
+                std::cerr << "[watch-snapshot] saved=" << (ram.good() && registers.good())
+                          << " predicted=" << predicted << " word=0x" << std::hex << observedWord
+                          << std::dec << " directory=" << directory << std::endl;
+            }
+        }
+    }
     static const uint32_t s_limit = []() -> uint32_t
     {
         const char *env = std::getenv("PS2X_WATCH_LIMIT");
@@ -2038,6 +2174,9 @@ void ps2ReportWatchedWrite(uint32_t addr, uint32_t size, uint64_t value, const R
     }
     std::cerr << "[watch-write] " << (op ? op : "?") << " addr=0x" << std::hex << addr
               << " size=" << std::dec << size << " value=0x" << std::hex << value;
+    if (s_writeWatchRam)
+        std::cerr << " wordAddr=0x" << watchedWord << " oldWord=0x" << oldWord
+                  << " observedWord=0x" << observedWord << " predicted=" << predicted;
     if (ctx)
     {
         extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
@@ -2058,6 +2197,8 @@ void ps2ReportWatchedWrite(uint32_t addr, uint32_t size, uint64_t value, const R
 
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
+    if (g_ps2WriteWatchAddr != 0u)
+        s_writeWatchRam = m_memory.getRDRAM();
     // PS2X_SHADOW_WATCH=<addr>: report word changes (from any source, including
     // host-side writes that bypass the store watchpoint) at dispatch granularity.
     {
@@ -2077,6 +2218,8 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
                 ++s_reports;
                 std::cerr << std::hex << "[shadow-watch] addr=0x" << s_shadowAddr << " 0x" << s_last << " -> 0x" << now
                           << " entering=0x" << address << "\n  dispatch: " << formatDispatchHistory() << std::dec << std::endl;
+                if (g_ps2WriteWatchAddr != 0u && (g_ps2WriteWatchAddr & ~3u) == s_shadowAddr)
+                    ps2ReportWatchedWrite(s_shadowAddr, 4u, now, nullptr, "SHADOW");
             }
             s_last = now;
         }
@@ -2290,6 +2433,32 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             std::lock_guard<std::mutex> lock(s_missingFunctionLogMutex);
             std::cerr << oss.str() << std::endl;
         }
+        if (const char *dumpDir = std::getenv("PS2X_MISSING_TARGET_DUMP_DIR"); dumpDir && *dumpDir)
+        {
+            // Capture the failing EE call on its execution thread. Other device
+            // workers are not stopped, so this is a diagnostic memory snapshot.
+            std::error_code error;
+            const std::filesystem::path directory(dumpDir);
+            std::filesystem::create_directories(directory, error);
+            if (!error && m_memory.getRDRAM())
+            {
+                std::ostringstream name;
+                name << "missing_" << std::hex << sourcePc << "_" << targetPc;
+                const auto path = directory / (name.str() + ".ram.bin");
+                std::ofstream ram(path, std::ios::binary);
+                ram.write(reinterpret_cast<const char *>(m_memory.getRDRAM()), PS2_RAM_SIZE);
+                std::ofstream registers(directory / (name.str() + ".registers.txt"));
+                registers << oss.str() << '\n';
+                if (ctx)
+                    for (uint32_t reg = 0u; reg < 32u; ++reg)
+                        registers << "r" << std::dec << reg << "=0x" << std::hex << getRegU32(ctx, reg) << '\n';
+                std::cerr << "[guest-branch:dump] saved=" << (ram.good() && registers.good())
+                          << " path=" << path << std::endl;
+            }
+            else
+                std::cerr << "[guest-branch:dump] failed: "
+                          << (error ? error.message() : "EE RAM is not initialized") << std::endl;
+        }
     }
 
     if (firstReport && policy == MissingFunctionPolicy::BreakOnce)
@@ -2302,6 +2471,14 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     if (ctx)
     {
         ctx->pc = targetPc;
+    }
+
+    if (std::getenv("PS2X_FATAL_MISSING_TARGET"))
+    {
+        std::ostringstream failure;
+        failure << "Missing guest branch target 0x" << std::hex << targetPc
+                << " from 0x" << sourcePc;
+        throw std::runtime_error(failure.str());
     }
 
     if (policy == MissingFunctionPolicy::Stop)
@@ -3437,12 +3614,17 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
+    const bool headless = std::getenv("PS2X_HEADLESS") != nullptr;
+    Texture2D frameTex{};
+    if (!headless)
+    {
+        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+        frameTex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+    }
 
     std::atomic<bool> gameThreadFinished{false};
+    std::exception_ptr gameThreadError;
 
     std::thread gameThread([&]()
                            {
@@ -3466,16 +3648,81 @@ void PS2Runtime::run()
         catch (const std::exception &e)
         {
             std::cerr << "Error during program execution: " << e.what() << std::endl;
+            gameThreadError = std::current_exception();
         }
         catch (...)
         {
             std::cerr << "Error during program execution: unknown exception" << std::endl;
+            gameThreadError = std::current_exception();
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
     uint64_t tick = 0;
+    auto nextHeadlessReport = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const uint64_t exitFrame = []() -> uint64_t
+    {
+        const char *env = std::getenv("PS2X_EXIT_AFTER_FRAME");
+        return env ? std::strtoull(env, nullptr, 10) : 0u;
+    }();
+    const uint64_t exitVsync = []() -> uint64_t
+    {
+        const char *env = std::getenv("PS2X_EXIT_AFTER_VSYNC");
+        return env ? std::strtoull(env, nullptr, 10) : 0u;
+    }();
+    const uint64_t shotVsyncEvery = []() -> uint64_t
+    {
+        const char *env = std::getenv("PS2X_SCREENSHOT_VSYNC_EVERY");
+        return env ? std::strtoull(env, nullptr, 10) : 0u;
+    }();
+    uint64_t lastShotVsyncBucket = 0;
+    uint64_t hostFrames = 0;
+    const bool speedStats = std::getenv("PS2X_SPEED_STATS") != nullptr;
+    auto speedStart = std::chrono::steady_clock::now();
+    uint64_t speedTick = 0u;
+    uint64_t speedCompiled = 0u, speedInterpreted = 0u;
+    uint64_t speedVu0Compiled = 0u, speedVu0Interpreted = 0u;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        const uint64_t virtualTick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+        const auto speedNow = std::chrono::steady_clock::now();
+        const double speedSeconds = std::chrono::duration<double>(speedNow - speedStart).count();
+        if (speedStats && speedSeconds >= 5.0)
+        {
+            // Display-field progress, independent of host window refresh/FPS.
+            // The scheduler currently uses a 16667 us NTSC field period.
+            std::ostringstream report;
+            const uint64_t compiled = g_ps2Vu1CompiledCalls.load(std::memory_order_relaxed);
+            const uint64_t interpreted = g_ps2Vu1InterpretedCalls.load(std::memory_order_relaxed);
+            const uint64_t vu0Compiled = g_ps2Vu0CompiledCalls.load(std::memory_order_relaxed);
+            const uint64_t vu0Interpreted = g_ps2Vu0InterpretedCalls.load(std::memory_order_relaxed);
+            report << "[speed] vsync=" << virtualTick << " fields=" << (virtualTick - speedTick)
+                   << " hostFrames=" << hostFrames
+                   << " wallSeconds=" << speedSeconds
+                   << " fieldsPerSecond=" << (virtualTick - speedTick) / speedSeconds
+                   << " percent=" << (virtualTick - speedTick) * 0.016667 * 100.0 / speedSeconds
+                   << " compiledVu1Calls=" << (compiled - speedCompiled)
+                   << " interpretedVu1Calls=" << (interpreted - speedInterpreted)
+                   << " compiledVu0Calls=" << (vu0Compiled - speedVu0Compiled)
+                   << " interpretedVu0Calls=" << (vu0Interpreted - speedVu0Interpreted);
+            std::cerr << report.str() << std::endl;
+            speedStart = speedNow;
+            speedTick = virtualTick;
+            speedCompiled = compiled;
+            speedInterpreted = interpreted;
+            speedVu0Compiled = vu0Compiled;
+            speedVu0Interpreted = vu0Interpreted;
+        }
+        // A separate guest-progress limit works in both windowed and headless
+        // runs without changing the existing frame clock used by pad scripts,
+        // watchpoints and legacy captures. The host polls, so a small overshoot
+        // is possible; report the actual counters and use normal shutdown.
+        if (exitVsync != 0u && virtualTick >= exitVsync)
+        {
+            std::cerr << "[run] PS2X_EXIT_AFTER_VSYNC reached vsync=" << virtualTick
+                      << " hostFrames=" << hostFrames << " target=" << exitVsync << std::endl;
+            requestStop();
+            break;
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
@@ -3525,6 +3772,90 @@ void PS2Runtime::run()
 
             }
         });
+        if (headless)
+        {
+            // Headless input scripts and diagnostics use virtual display ticks
+            // as their frame clock; the windowed presentation loop is absent.
+            g_ps2PresentedFrameCounter.store(virtualTick, std::memory_order_relaxed);
+            if (exitFrame != 0u && virtualTick >= exitFrame)
+            {
+                std::cerr << "[run] PS2X_EXIT_AFTER_FRAME reached at virtual field " << virtualTick << std::endl;
+                requestStop();
+                break;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= nextHeadlessReport)
+            {
+                const auto kernel = m_eeScheduler->snapshot();
+                const auto gsSnapshot = m_gs.getDebugSnapshot();
+                std::cerr << "[headless] pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
+                          << " ra=0x" << m_debugRa.load(std::memory_order_relaxed) << std::dec
+                          << " running=" << kernel.runningThreadId
+                          << " vsync=" << m_eeScheduler->currentVSyncTick()
+                          << " dma=" << m_memory.dmaStartCount()
+                          << " gif=" << m_memory.gifCopyCount()
+                          << " gs=" << m_memory.gsWriteCount()
+                          << " scanout=" << gsSnapshot.hostPresentationWidth << "x" << gsSnapshot.hostPresentationHeight
+                          << " present=" << gsSnapshot.hasHostPresentationFrame << std::endl;
+                for (const auto &thread : kernel.threads)
+                {
+                    std::cerr << "[headless:thread] id=" << thread.id
+                              << " status=" << static_cast<unsigned>(thread.status)
+                              << " wait=" << static_cast<unsigned>(thread.waitReason)
+                              << " waitId=" << thread.waitId
+                              << " invocations=" << thread.invocationDepth
+                              << " pc=0x" << std::hex << thread.pc << " entry=0x" << thread.entry
+                              << " ra=0x" << thread.ra << " sp=0x" << thread.sp
+                              << std::dec << std::endl;
+                    if (std::getenv("PS2X_HEADLESS_STACK") && thread.waitReason != EeWaitReason::None)
+                    {
+                        const uint32_t stack = thread.sp & PS2_RAM_MASK;
+                        constexpr uint32_t wordCount = 24u;
+                        if (stack <= PS2_RAM_SIZE - wordCount * sizeof(uint32_t))
+                        {
+                            std::cerr << "[headless:stack] id=" << thread.id << " addr=0x" << std::hex << stack << " words=";
+                            for (uint32_t i = 0; i < wordCount; ++i)
+                            {
+                                uint32_t word = 0u;
+                                std::memcpy(&word, m_memory.getRDRAM() + stack + i * sizeof(word), sizeof(word));
+                                std::cerr << " " << word;
+                            }
+                            std::cerr << std::dec << std::endl;
+                        }
+                    }
+                }
+                // Capture the same latched RGBA buffer used by UploadFrame,
+                // without creating a texture or calling any OpenGL function.
+                if (const char *captureDir = std::getenv("PS2X_HEADLESS_CAPTURE_DIR"); captureDir && *captureDir)
+                {
+                    std::vector<uint8_t> pixels;
+                    uint32_t width = 0u, height = 0u;
+                    if (m_gs.copyLatchedHostPresentationFrame(pixels, width, height) &&
+                        width != 0u && height != 0u &&
+                        pixels.size() == static_cast<size_t>(width) * height * 4u)
+                    {
+                        size_t rgbNonzero = 0u;
+                        for (size_t offset = 0u; offset < pixels.size(); offset += 4u)
+                            rgbNonzero += (pixels[offset] | pixels[offset + 1u] | pixels[offset + 2u]) != 0u;
+                        std::error_code ec;
+                        const std::filesystem::path directory(captureDir);
+                        std::filesystem::create_directories(directory, ec);
+                        const auto path = directory / ("headless_" + std::to_string(m_eeScheduler->currentVSyncTick()) + ".png");
+                        Image shot{pixels.data(), static_cast<int>(width), static_cast<int>(height), 1,
+                                   PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                        const bool saved = !ec && ExportImage(shot, path.string().c_str());
+                        std::cerr << "[headless:capture] saved=" << saved
+                                  << " size=" << width << "x" << height << " rgbNonzero=" << rgbNonzero
+                                  << " path=\"" << path.string() << "\"" << std::endl;
+                    }
+                }
+                nextHeadlessReport = now + std::chrono::seconds(1);
+            }
+            // EE/VBlank timing is owned by the scheduler. No window polling,
+            // audio device or OpenGL calls are needed for a startup observation.
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            continue;
+        }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         // The GPU renderer caps its presentation readback to the window (see
@@ -3790,6 +4121,7 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
 #if !defined(PLATFORM_VITA)
         ps2HostSettingsApplyWindow();
 #endif
+        ps2ModsApplyPatches(m_memory.getRDRAM()); // enabled mods' .pnach writes, once per frame
         const PS2HostSettings &hostSettings = ps2HostSettings();
         {
             static int s_filter = -1;
@@ -3984,6 +4316,9 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
 
         // Opt-in frame capture for headless bring-up: PS2X_SCREENSHOT_EVERY=<frames>
         // writes the presented guest frame (no debug UI) to frame_<n>.png in the cwd.
+        // Windowed screenshots use host frames by default. The separate
+        // PS2X_SCREENSHOT_VSYNC_EVERY option uses guest progress, with a bucket
+        // crossing check so polling past an exact multiple does not miss a shot.
         {
             static const uint64_t s_shotEvery = []() -> uint64_t
             {
@@ -3992,6 +4327,7 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
             }();
             static uint64_t s_presentedFrames = 0;
             ++s_presentedFrames;
+            ++hostFrames; // the exit gates (PS2X_EXIT_AFTER_VSYNC) report it
             // g_ps2PresentedFrameCounter is *not* this: it counts pictures and is
             // updated above, where a new one is detected. This one is the host
             // frame count, which is what the dumps and the exit gates want.
@@ -4043,6 +4379,15 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
                         __gcov_dump();
                     if (__llvm_profile_write_file)
                         __llvm_profile_write_file();
+                    // libgcov flushes its counters from its atexit handler, which
+                    // _Exit skips - and an explicit __gcov_dump() does not replace
+                    // it (measured: nothing is written). PS2X_PGO_EXIT=1 trades
+                    // the hard exit for a clean one so a profile-generating run
+                    // actually writes build/pgo. The window may linger while the
+                    // static destructors run with worker threads alive; the
+                    // profile is already written by then, so closing it is safe.
+                    if (std::getenv("PS2X_PGO_EXIT") != nullptr)
+                        std::exit(0);
                     std::_Exit(0);
                 }
             }
@@ -4140,15 +4485,23 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
                     std::cerr << "[ram:dump] frame=" << s_presentedFrames << std::endl;
                 }
             }
-            if (s_shotEvery != 0u && (s_presentedFrames % s_shotEvery) == 0u)
+            const uint64_t shotVsync = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+            const uint64_t shotBucket = shotVsyncEvery != 0u ? shotVsync / shotVsyncEvery : 0u;
+            const bool guestShot = shotVsyncEvery != 0u && shotBucket > lastShotVsyncBucket;
+            if (guestShot || (shotVsyncEvery == 0u && s_shotEvery != 0u && (s_presentedFrames % s_shotEvery) == 0u))
             {
-                Image shot = LoadImageFromTexture(frameTex);
+                lastShotVsyncBucket = shotBucket;
+                Image shot = LoadImageFromTexture(presentDraw);
                 ImageCrop(&shot, Rectangle{0.0f, 0.0f, srcWidth, srcHeight});
                 ImageResize(&shot, 640, 480); // 4:3 display aspect, like the window
                 char shotPath[64];
-                std::snprintf(shotPath, sizeof(shotPath), "frame_%06llu.png",
-                              static_cast<unsigned long long>(s_presentedFrames));
-                ExportImage(shot, shotPath);
+                std::snprintf(shotPath, sizeof(shotPath), guestShot ? "frame_vsync_%06llu.png" : "frame_%06llu.png",
+                              static_cast<unsigned long long>(guestShot ? shotVsync : s_presentedFrames));
+                const bool saved = ExportImage(shot, shotPath);
+                if (guestShot)
+                    std::cerr << "[run:screenshot] clock=vsync vsync=" << shotVsync
+                              << " hostFrames=" << hostFrames << " saved=" << saved
+                              << " path=" << shotPath << std::endl;
                 UnloadImage(shot);
             }
         }
@@ -4163,7 +4516,8 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
 
     requestStop();
 #if !defined(PLATFORM_VITA)
-    ps2HostSettingsSave(); // keeps a window size set by hand
+    if (!headless)
+        ps2HostSettingsSave(); // keeps a window size set by hand
 #endif
     if (gameThread.joinable())
     {
@@ -4176,8 +4530,15 @@ UpdateTexture(s_synthTex, s_synthPixels.data());
         m_debugUiInitialized = false;
     }
     writePcSamples();
-    UnloadTexture(frameTex);
-    CloseWindow();
+    if (!headless)
+    {
+        UnloadTexture(frameTex);
+        CloseWindow();
+    }
 
     RUNTIME_LOG("[run] exiting loop");
+    // join() synchronizes the worker's exception with this thread. Let main()
+    // report failure instead of returning exit code zero after a guest crash.
+    if (gameThreadError)
+        std::rethrow_exception(gameThreadError);
 }

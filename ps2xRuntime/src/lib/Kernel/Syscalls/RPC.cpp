@@ -8,6 +8,7 @@ namespace ps2_syscalls
 {
     namespace
     {
+        std::string formatRpcTraceBytes(const uint8_t *bytes, uint32_t count);
         SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx, PS2Runtime *runtime)
         {
             SifRpcDebugEvent event{};
@@ -22,6 +23,17 @@ namespace ps2_syscalls
         {
             event.seq = ++g_sif_rpc_debug_next_seq;
             g_sif_rpc_debug_history[event.seq % kSifRpcDebugHistoryCount] = event;
+            static const bool trace = std::getenv("PS2X_RPC_TRACE") != nullptr;
+            if (trace)
+            {
+                std::cerr << "[rpc:trace] seq=" << event.seq << " op=" << event.op
+                          << " sid=0x" << std::hex << event.sid << " rpc=0x" << event.rpcNum
+                          << " pc=0x" << event.pc << " ra=0x" << event.ra
+                          << " flags=0x" << event.flags << std::dec
+                          << " send=[" << formatRpcTraceBytes(event.sendPreview, event.sendPreviewSize)
+                          << "] recv=[" << formatRpcTraceBytes(event.recvPreview, event.recvPreviewSize)
+                          << "]" << std::endl;
+            }
         }
 
         void pushSifRpcDebugEvent(SifRpcDebugEvent event)
@@ -743,6 +755,39 @@ namespace ps2_syscalls
                            : nullptr;
         if (server)
         {
+            // This descriptor pool lives in guest RAM (now 0x01FE8000+, the
+            // never-written gap between the game's heap and stack). If
+            // unrelated memory traffic overwrote a runtime-owned descriptor,
+            // its sid no longer matches; restore the runtime's own state
+            // instead of trusting a corrupted buffer pointer. Only
+            // runtime-bound descriptors use this pool, so the expected state
+            // is the zeroed descriptor with sid set. Healthy runs are
+            // unaffected.
+            if (sid != 0u && static_cast<uint32_t>(server->sid) != sid)
+            {
+                static std::atomic<uint32_t> s_descriptorRepairs{0};
+                if (s_descriptorRepairs.fetch_add(1, std::memory_order_relaxed) < 8u)
+                    std::fprintf(stderr, "[rpc-srv] clobbered descriptor at 0x%x (sid=0x%x, expected 0x%x); restored\n",
+                                 serverPtr, static_cast<uint32_t>(server->sid), sid);
+                std::memset(server, 0, sizeof(*server));
+                server->sid = static_cast<int>(sid);
+                {
+                    // Register-time fields live only in this descriptor and the
+                    // game sets them once (sceSifRegisterRpc): restore them from
+                    // the host-side shadow so a clobbered server keeps its
+                    // function and receive buffer instead of silently dropping
+                    // sends and misrouting replies.
+                    std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                    const auto shadowIt = g_rpc_servers.find(sid);
+                    if (shadowIt != g_rpc_servers.end())
+                    {
+                        server->func = shadowIt->second.func;
+                        server->buf = shadowIt->second.buf;
+                        server->cbuf = shadowIt->second.cbuf;
+                        server->cfunc = shadowIt->second.cfunc;
+                    }
+                }
+            }
             server->client = clientPtr;
             server->pkt_addr = client->hdr.pkt_addr;
             server->rpc_number = rpcNum;
@@ -754,7 +799,12 @@ namespace ps2_syscalls
 
             if (server->buf != 0u && sendBuf != 0u && sendSize != 0u)
             {
-                rpcCopyToRdram(rdram, server->buf, sendBuf, sendSize);
+                // PS2X_RPC_COPY_TRACE: opt-in diagnostic (sector-corruption writer).
+                static const bool s_rpcCopyTrace = std::getenv("PS2X_RPC_COPY_TRACE") != nullptr;
+                if (s_rpcCopyTrace)
+                    std::fprintf(stderr, "[rpc-srv] sid=0x%x rpc=0x%x serverPtr=0x%x clientPtr=0x%x buf=0x%x sendBuf=0x%x sendSize=%u\n",
+                                 sid, rpcNum, serverPtr, clientPtr, server->buf, sendBuf, static_cast<unsigned>(sendSize));
+                rpcCopyToRdram(rdram, server->buf, sendBuf, sendSize, "SifCallRpc.serverBuf");
             }
         }
 
@@ -837,11 +887,11 @@ namespace ps2_syscalls
             {
                 if (handled && resultPointer != 0u && resultPointer != receiveBuffer)
                 {
-                    rpcCopyToRdram(rdram, receiveBuffer, resultPointer, receiveSize);
+                    rpcCopyToRdram(rdram, receiveBuffer, resultPointer, receiveSize, "SifCallRpc.result");
                 }
                 else if (!handled && sendBuf != 0u && sendSize != 0u && sendBuf != receiveBuffer)
                 {
-                    rpcCopyToRdram(rdram, receiveBuffer, sendBuf, std::min(sendSize, receiveSize));
+                    rpcCopyToRdram(rdram, receiveBuffer, sendBuf, std::min(sendSize, receiveSize), "SifCallRpc.sendFallback");
                     copiedFallback = true;
                 }
                 else if (!handled)
@@ -981,6 +1031,13 @@ namespace ps2_syscalls
         sd->sid = static_cast<int>(sid);
         sd->func = func;
         sd->buf = buf;
+        {
+            // PS2X_RPC_COPY_TRACE: opt-in diagnostic (sector-corruption writer).
+            static const bool s_rpcCopyTrace = std::getenv("PS2X_RPC_COPY_TRACE") != nullptr;
+            if (s_rpcCopyTrace)
+                std::fprintf(stderr, "[rpc-reg] sid=0x%x sdPtr=0x%x func=0x%x buf=0x%x cbuf=0x%x cfunc=0x%x\n",
+                             sid, sdPtr, func, buf, cbuf, cfunc);
+        }
         sd->size = 0;
         sd->cfunc = cfunc;
         sd->cbuf = cbuf;
@@ -1029,7 +1086,7 @@ namespace ps2_syscalls
                 }
             }
 
-            g_rpc_servers[sid] = {sid, sdPtr};
+            g_rpc_servers[sid] = {sid, sdPtr, func, buf, cbuf, cfunc};
             for (auto &entry : g_rpc_clients)
             {
                 if (entry.second.sid == sid)
@@ -1227,7 +1284,7 @@ namespace ps2_syscalls
 
         if (sizeExtra > 0 && srcExtra && destExtra)
         {
-            rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
+            rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra, "sceSifSendCmd.extra");
         }
 
         static int logCount = 0;

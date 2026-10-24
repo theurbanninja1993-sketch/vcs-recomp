@@ -17,6 +17,7 @@
 #include "../src/lib/vu/ps2_vu1_jit.h"
 #include "../src/lib/vu/ps2_vu1_detail.h"
 #include "ps2_runtime.h"
+#include "vu_unit_config.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -67,6 +68,19 @@ public:
             if (isBranch(d) || d.eBit)
                 return fail(reason, pc, "branch / E-bit in a delay slot");
         }
+        // The VI branch-backup is only read by a branch executing right after the
+        // pair that wrote a VI (see emitPair). If the program has no branch op at
+        // all, the per-instruction clear/record stores are dead weight, so skip
+        // them entirely (~1-3 host cycles per instruction).
+        m_programHasBranches = false;
+        for (uint32_t pc : all)
+        {
+            if (isBranch(decode(pc)))
+            {
+                m_programHasBranches = true;
+                break;
+            }
+        }
         m_flagless = true;
         for (uint32_t pc : all)
         {
@@ -78,7 +92,7 @@ public:
             if (op == 0x14u || op == 0x15u || op == 0x16u || op == 0x17u || op == 0x18u || op == 0x1Au || op == 0x1Bu)
                 m_flagless = false;
         }
-        static const bool s_keepFlags = std::getenv("VU1_RECOMP_KEEP_FLAGS") != nullptr;
+        static const bool s_keepFlags = kVu0 || std::getenv("VU1_RECOMP_KEEP_FLAGS") != nullptr;
         if (m_eagerFlags || s_keepFlags)
             m_flagless = false;
         m_needFlags.clear();
@@ -87,7 +101,7 @@ public:
             computeLiveFlagWriters(all, delaySet);
 
         std::ostringstream o;
-        o << "static int vu1p_" << std::hex << key << std::dec << "(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n"
+        o << "static int " << (kVu0 ? "vu0p_" : "vu1p_") << std::hex << key << std::dec << "(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n"
           << "    using J = VU1Jit;\n    VU1State &S = J::st(vu);\n    uint32_t jumpTarget = 0;\n    uint64_t cyc = J::now(vu);\n"
           << "    // A run does not change the VU's data pointer or its size, so the address\n"
           << "    // arithmetic below uses these instead of re-reading them per access.\n"
@@ -115,18 +129,25 @@ public:
                 entries.insert(nextPc(nextPc(pc)));
             }
             if (op != 0x24u && op != 0x25u)
-                entries.insert((pc + 8u + static_cast<uint32_t>(IMM11(d.lower) * 8)) & 0x3FFFu);
+                entries.insert((pc + 8u + static_cast<uint32_t>(IMM11(d.lower) * 8)) & (kCodeSize - 1u));
         }
         // Forward dataflow over the program's labels: the timing / normalization
         // state at a label is the pessimistic merge of every static
         // predecessor's exit state (jump entries are unknown), iterated to a
         // fixed point.
         std::map<uint32_t, Rel> labelState;
+        // The branch-backup valid bit is only observable by a VI branch in
+        // the immediately following pair. Track whether a valid backup can
+        // reach each label so generated code need not store `false` when it
+        // is already known to be false. Jump entries start conservatively:
+        // a previous compiled invocation may have left the bit set.
+        std::map<uint32_t, bool> labelBranchBackup;
         std::vector<uint32_t> work;
         for (uint32_t pc : jumpEntries)
             if (m_normalSet.count(pc))
             {
                 labelState[pc] = Rel::unknown();
+                labelBranchBackup[pc] = true;
                 work.push_back(pc);
             }
         std::vector<std::pair<uint32_t, History>> successors;
@@ -135,9 +156,10 @@ public:
             const uint32_t pc = work.back();
             work.pop_back();
             History h = labelState[pc].toHistory();
+            bool branchBackupMayBeValid = labelBranchBackup[pc];
             std::ostringstream scratch;
             successors.clear();
-            (void)emitInstance(scratch, pc, h, &successors);
+            (void)emitInstance(scratch, pc, h, &successors, branchBackupMayBeValid);
             for (auto &[next, exitHistory] : successors)
             {
                 if (!m_normalSet.count(next))
@@ -147,15 +169,18 @@ public:
                 if (it == labelState.end())
                 {
                     labelState[next] = incoming;
+                    labelBranchBackup[next] = branchBackupMayBeValid;
                     work.push_back(next);
                 }
                 else
                 {
                     Rel merged = it->second;
                     merged.merge(incoming);
-                    if (!(merged == it->second))
+                    const bool mergedBranchBackup = labelBranchBackup[next] || branchBackupMayBeValid;
+                    if (!(merged == it->second) || mergedBranchBackup != labelBranchBackup[next])
                     {
                         it->second = merged;
+                        labelBranchBackup[next] = mergedBranchBackup;
                         work.push_back(next);
                     }
                 }
@@ -329,6 +354,9 @@ public:
     // No MAC/status flag reader: FMACs queue no flags (MAC/status are then
     // not maintained, which no VU1 program in the capture set can observe).
     bool m_flagless = false;
+    // True when the program contains any branch op. Only a branch can read the
+    // VI branch-backup, so a branch-free program emits no clear/record stores.
+    bool m_programHasBranches = true;
 
 private:
     // Flag liveness (programs with readers): only FMACs whose MAC/status
@@ -376,7 +404,7 @@ private:
                             exits.push_back(next);
                         else
                         {
-                            const uint32_t target = (pc + 8u + static_cast<uint32_t>(IMM11(d.lower) * 8)) & 0x3FFFu;
+                            const uint32_t target = (pc + 8u + static_cast<uint32_t>(IMM11(d.lower) * 8)) & (kCodeSize - 1u);
                             preds[target].push_back(next);
                             if (op != 0x20u && op != 0x21u) // conditional: also falls through
                                 preds[nextPc(next)].push_back(next);
@@ -438,7 +466,7 @@ private:
         uint32_t source = 0;
     };
     NormWrite m_upperNorm, m_lowerNorm;
-    VU1Interpreter m_decoder{VU1Interpreter::Unit::VU1};
+    VU1Interpreter m_decoder{kVuUnit};
 
     static bool fail(std::string &reason, uint32_t pc, const char *what)
     {
@@ -463,19 +491,20 @@ private:
 
     // Returns true when it jumps through the shared JR dispatch.
     // `successors` (analysis): static successor labels with the exit state.
-    bool emitInstance(std::ostringstream &o, uint32_t pc, History &h, std::vector<std::pair<uint32_t, History>> *successors)
+    bool emitInstance(std::ostringstream &o, uint32_t pc, History &h, std::vector<std::pair<uint32_t, History>> *successors,
+                      bool &branchBackupMayBeValid)
     {
         const Decoded d = decode(pc);
         const bool branch = isBranch(d);
         if (branch)
             o << "    bool taken = false;\n    uint32_t target = 0;\n";
-        emitPair(o, pc, d, Context::Normal, h);
+        emitPair(o, pc, d, Context::Normal, h, branchBackupMayBeValid);
         const uint32_t next = nextPc(pc);
         if (branch)
         {
             // Delay slot, then the branch.
             const Decoded ds = decode(next);
-            emitPair(o, next, ds, Context::BranchDelay, h);
+            emitPair(o, next, ds, Context::BranchDelay, h, branchBackupMayBeValid);
             const uint32_t op = opHi(d);
             if (op == 0x24u || op == 0x25u)
             {
@@ -485,7 +514,7 @@ private:
             else
             {
                 const int32_t imm = IMM11(d.lower);
-                const uint32_t dest = (pc + 8u + static_cast<uint32_t>(imm * 8)) & 0x3FFFu;
+                const uint32_t dest = (pc + 8u + static_cast<uint32_t>(imm * 8)) & (kCodeSize - 1u);
                 if (successors)
                 {
                     successors->emplace_back(dest, h);
@@ -501,7 +530,7 @@ private:
         else if (d.eBit)
         {
             const Decoded ds = decode(next);
-            emitPair(o, next, ds, Context::EbitDelay, h);
+            emitPair(o, next, ds, Context::EbitDelay, h, branchBackupMayBeValid);
             o << "    return J::ended(vu, cyc);\n";
         }
         else
@@ -513,7 +542,8 @@ private:
         return false;
     }
 
-    void emitPair(std::ostringstream &o, uint32_t pc, const Decoded &d, Context ctx, History &h)
+    void emitPair(std::ostringstream &o, uint32_t pc, const Decoded &d, Context ctx, History &h,
+                  bool &branchBackupMayBeValid)
     {
         m_pairFlags = !m_flagless && (m_needFlags.empty() ? !m_skipsFlags : m_needFlags.count(pc) != 0u);
         const uint32_t k = h.index;
@@ -590,7 +620,14 @@ private:
             emitUpper(o, d.upper);
             emitLower(o, pc, d.lower, d.upper);
         }
-        o << "        J::clearBranchBackup(vu);\n";
+        // WORK-005 reverted 2026-10-15 by the lead: the CFG-gated clear (below)
+        // was emitted only on paths a compile-time fixpoint judged invalid, but
+        // it leaked a valid branch backup on a path the VU capture corpus did not
+        // cover, crashing/hanging the game (4/5 abnormal vs 3/3 clean). The
+        // unconditional clear is the known-good pre-WORK-005 behaviour.
+        o << (m_programHasBranches ? "        J::clearBranchBackup(vu);\n" : "");
+        // Keep the (now unused) propagation state consistent for the caller.
+        branchBackupMayBeValid = false;
         if (writtenVi)
             o << "        S.vi[" << writtenVi << "] = static_cast<int16_t>(S.vi[" << writtenVi << "]);\n";
 
@@ -656,8 +693,9 @@ private:
             m_hist = nullptr;
         }
         // The backup is only read by a branch executing right after this pair.
-        if (writtenVi && lu.delaysNextBranchRead && nextMayBeBranch(pc, d, ctx))
+        if (m_programHasBranches && writtenVi && lu.delaysNextBranchRead && nextMayBeBranch(pc, d, ctx))
             o << "        J::recordBranchBackup<" << writtenVi << ">(vu, oldVi);\n";
+        branchBackupMayBeValid = writtenVi && lu.delaysNextBranchRead && nextMayBeBranch(pc, d, ctx);
         if (writesVf0(d))
             o << "        S.vf[0][0] = 0.0f; S.vf[0][1] = 0.0f; S.vf[0][2] = 0.0f; S.vf[0][3] = 1.0f;\n";
 
@@ -1038,7 +1076,7 @@ private:
         const uint32_t dest = (instr >> 21) & 0xFu;
         const int32_t imm = IMM11(instr);
         const uint32_t vfT = FT(instr), vfS = FS(instr), viT = VIT(instr), viS = VIS(instr), viD = VID(instr);
-        const uint32_t branchTarget = (pc + 8u + static_cast<uint32_t>(imm * 8)) & 0x3FFFu;
+        const uint32_t branchTarget = (pc + 8u + static_cast<uint32_t>(imm * 8)) & (kCodeSize - 1u);
         auto addr = [&](const std::string &base) -> std::string
         {
             return "uint32_t a = (" + base + ") * 16u; a &= vuDataMask;";
@@ -1141,7 +1179,7 @@ private:
             return;
         case 0x24u: // JR
         case 0x25u: // JALR
-            o << "        target = (static_cast<uint32_t>(static_cast<uint16_t>(J::branchVi<" << viS << ">(vu))) * 8u) & 0x3FFFu; taken = true;\n";
+            o << "        target = (static_cast<uint32_t>(static_cast<uint16_t>(J::branchVi<" << viS << ">(vu))) * 8u) & " << (kCodeSize - 1u) << "u; taken = true;\n";
             if (op == 0x25u && viT != 0u)
                 o << "        S.vi[" << viT << "] = " << (pc + 16u) / 8u << ";\n";
             return;
@@ -1297,7 +1335,7 @@ int main(int argc, char **argv)
     // One group per (program, whole code image): the code at a program's
     // jump targets depends on what else is loaded.
     std::map<std::pair<uint64_t, uint64_t>, Program> programs;
-    std::vector<uint8_t> dataAfter(PS2_VU1_DATA_SIZE);
+    std::vector<uint8_t> dataAfter(kVuDataSize);
     for (int arg = 2; arg < argc; ++arg)
     {
         FILE *f = std::fopen(argv[arg], "rb");
@@ -1368,6 +1406,7 @@ int main(int argc, char **argv)
         }
         std::fclose(f);
         std::fprintf(stderr, "%s: %zu records\n", argv[arg], records);
+        if (records == 0u) return 1;
     }
 
     struct Variant
@@ -1448,40 +1487,40 @@ int main(int argc, char **argv)
         std::string function = variant.text;
         function.replace(0, std::strlen("static int"), "int");
         text += function;
-        text += "extern const uint32_t vu1r_" + std::string(name) + "[] = {";
+        text += "extern const uint32_t " + prefix + "r_" + std::string(name) + "[] = {";
         for (uint32_t root : variant.roots)
             text += std::to_string(root) + "u, ";
         text += "0u};\n";
-        if (!writeIfChanged(dir + "/vu1p_" + name + ".cpp", text))
+        if (!writeIfChanged(dir + "/" + prefix + "p_" + name + ".cpp", text))
             return 1;
-        registry += "int vu1p_" + std::string(name) + "(VU1Interpreter &, uint64_t);\nextern const uint32_t vu1r_" +
+        registry += "int " + prefix + "p_" + std::string(name) + "(VU1Interpreter &, uint64_t);\nextern const uint32_t " + prefix + "r_" +
                     std::string(name) + "[];\n";
     }
-    registry += "\nextern const VU1CompiledProgram g_ps2Vu1CompiledPrograms[] = {\n";
+    registry += kVu0 ? "\nextern const VU1CompiledProgram g_ps2Vu0CompiledPrograms[] = {\n" : "\nextern const VU1CompiledProgram g_ps2Vu1CompiledPrograms[] = {\n";
     for (const auto &[key, variant] : generated)
     {
         char line[256];
-        std::snprintf(line, sizeof(line), "    {0x%016llxull, vu1p_%llx, vu1r_%llx, %zuu, 0x%016llxull, %s},\n",
-                      static_cast<unsigned long long>(variant.baseKey), static_cast<unsigned long long>(key),
-                      static_cast<unsigned long long>(key), variant.roots.size(), static_cast<unsigned long long>(key),
+        std::snprintf(line, sizeof(line), "    {0x%016llxull, %sp_%llx, %sr_%llx, %zuu, 0x%016llxull, %s},\n",
+                      static_cast<unsigned long long>(variant.baseKey), prefix.c_str(), static_cast<unsigned long long>(key),
+                      prefix.c_str(), static_cast<unsigned long long>(key), variant.roots.size(), static_cast<unsigned long long>(key),
                       variant.flagless ? "true" : "false");
         registry += line;
     }
-    registry += "};\nextern const size_t g_ps2Vu1CompiledProgramCount = " + std::to_string(generated.size()) + ";\n";
-    if (!writeIfChanged(dir + "/vu1_programs.cpp", registry))
+    registry += std::string(kVu0 ? "};\nextern const size_t g_ps2Vu0CompiledProgramCount = " : "};\nextern const size_t g_ps2Vu1CompiledProgramCount = ") + std::to_string(generated.size()) + ";\n";
+    if (!writeIfChanged(dir + "/" + prefix + "_programs.cpp", registry))
         return 1;
     // Remove programs from earlier runs that are no longer generated.
     std::set<std::string> current;
     for (const auto &[key, variant] : generated)
     {
         char name[64];
-        std::snprintf(name, sizeof(name), "vu1p_%llx.cpp", static_cast<unsigned long long>(key));
+        std::snprintf(name, sizeof(name), "%sp_%llx.cpp", prefix.c_str(), static_cast<unsigned long long>(key));
         current.insert(name);
     }
     for (const auto &entry : std::filesystem::directory_iterator(dir))
     {
         const std::string file = entry.path().filename().string();
-        if (file.rfind("vu1p_", 0) == 0 && file.size() > 4 && file.substr(file.size() - 4) == ".cpp" && !current.count(file))
+        if (file.rfind(prefix + "p_", 0) == 0 && file.size() > 4 && file.substr(file.size() - 4) == ".cpp" && !current.count(file))
             std::filesystem::remove(entry.path());
     }
     return 0;

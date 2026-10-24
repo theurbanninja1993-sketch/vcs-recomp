@@ -77,6 +77,8 @@ struct VU1PluginHost
 // program is compiled.
 extern const VU1CompiledProgram g_ps2Vu1CompiledPrograms[] __attribute__((weak));
 extern const size_t g_ps2Vu1CompiledProgramCount __attribute__((weak));
+extern const VU1CompiledProgram g_ps2Vu0CompiledPrograms[] __attribute__((weak));
+extern const size_t g_ps2Vu0CompiledProgramCount __attribute__((weak));
 
 namespace
 {
@@ -87,7 +89,7 @@ namespace
         return word;
     }
 
-    const std::unordered_multimap<uint64_t, const VU1CompiledProgram *> &compiledPrograms()
+    const std::unordered_multimap<uint64_t, const VU1CompiledProgram *> &compiledPrograms(bool vu1)
     {
         static const std::unordered_multimap<uint64_t, const VU1CompiledProgram *> s_programs = []()
         {
@@ -103,12 +105,24 @@ namespace
                 programs.clear();
             return programs;
         }();
-        return s_programs;
+        static const std::unordered_multimap<uint64_t, const VU1CompiledProgram *> s_vu0Programs = []()
+        {
+            std::unordered_multimap<uint64_t, const VU1CompiledProgram *> programs;
+            if (&g_ps2Vu0CompiledProgramCount != nullptr && &g_ps2Vu0CompiledPrograms != nullptr)
+                for (size_t i = 0; i < g_ps2Vu0CompiledProgramCount; ++i)
+                    if (!g_ps2Vu0CompiledPrograms[i].flagless)
+                        programs.emplace(g_ps2Vu0CompiledPrograms[i].key, &g_ps2Vu0CompiledPrograms[i]);
+            if (std::getenv("PS2X_VU0_NO_COMPILED"))
+                programs.clear();
+            return programs;
+        }();
+        return vu1 ? s_programs : s_vu0Programs;
     }
 }
 
 void (*g_ps2Vu1JumpTraceHook)(uint32_t target) = nullptr;
 std::atomic<uint64_t> g_ps2Vu1CompiledCalls{0}, g_ps2Vu1InterpretedCalls{0};
+std::atomic<uint64_t> g_ps2Vu0CompiledCalls{0}, g_ps2Vu0InterpretedCalls{0};
 std::atomic<uint64_t> g_ps2Vu1LookupRevalidations{0}, g_ps2Vu1LookupRecomputes{0};
 
 void ps2Vu1ProgramPairs(const uint8_t *code, uint32_t codeSize, uint32_t startPC, std::vector<uint32_t> &normal,
@@ -135,9 +149,10 @@ void ps2Vu1ProgramPairs(const uint8_t *code, uint32_t codeSize, uint32_t startPC
         pc = wrap(pc) & ~7u;
         seen[pc / 8u] |= 2u;
     };
-    addNormal(startPC & 0x3FF8u);
+    const uint32_t codeMask = codeSize - 1u;
+    addNormal(startPC & codeMask & ~7u);
     for (uint32_t i = 0; i < rootCount; ++i)
-        addNormal(roots[i] & 0x3FF8u);
+        addNormal(roots[i] & codeMask & ~7u);
     while (!work.empty())
     {
         const uint32_t pc = work.back();
@@ -161,7 +176,7 @@ void ps2Vu1ProgramPairs(const uint8_t *code, uint32_t codeSize, uint32_t startPC
         }
         addDelay(pc + 8u);
         const int32_t imm = static_cast<int32_t>(lower << 21) >> 21;
-        const uint32_t target = (pc + 8u + static_cast<uint32_t>(imm * 8)) & 0x3FFFu;
+        const uint32_t target = (pc + 8u + static_cast<uint32_t>(imm * 8)) & codeMask;
         if (opHi == 0x20u || opHi == 0x21u)
             addNormal(target);
         else if (opHi != 0x24u && opHi != 0x25u)
@@ -192,7 +207,7 @@ uint64_t ps2Vu1ProgramKey(const uint8_t *code, uint32_t codeSize, uint32_t start
             hash *= 1099511628211ull;
         }
     };
-    mix(startPC & 0x3FF8u);
+    mix(startPC & (codeSize - 1u) & ~7u);
     std::vector<uint32_t> all = normal;
     all.insert(all.end(), delay.begin(), delay.end());
     std::sort(all.begin(), all.end());
@@ -208,7 +223,8 @@ uint64_t ps2Vu1ProgramKey(const uint8_t *code, uint32_t codeSize, uint32_t start
 
 VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t startPC)
 {
-    const auto &programs = compiledPrograms();
+    const bool vu1 = m_unit == Unit::VU1;
+    const auto &programs = compiledPrograms(vu1);
     if (programs.empty() || memory == nullptr)
         return nullptr;
     // VU0 and VU1 are the same interpreter class and the same generated code;
@@ -216,7 +232,6 @@ VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t cod
     // VU0 has no interpreter-side compiled path otherwise, and it is the unit
     // with the headroom (measured 5.3 us/call interpreted vs ~6 us/record for
     // compiled VU1 in tools/vu1_replay).
-    const bool vu1 = m_unit == Unit::VU1;
     if (vu1 ? vuCode != memory->getVU1Code() : vuCode != memory->getVU0Code())
         return nullptr;
     const uint64_t generation = vu1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
@@ -288,9 +303,10 @@ VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t cod
     if (entry.layouts.size() > kMaxLayouts)
         entry.layouts.pop_back();
     entry.fn = entry.layouts[0].fn;
-    static const bool s_log = std::getenv("PS2X_VU1_COMPILED_LOG") != nullptr;
-    if (s_log)
-        std::cerr << "[vu1:compiled] pc=0x" << std::hex << startPC << std::dec << (entry.fn ? " compiled" : " interpreted")
+    static const bool s_logVu1 = std::getenv("PS2X_VU1_COMPILED_LOG") != nullptr;
+    static const bool s_logVu0 = std::getenv("PS2X_VU0_COMPILED_LOG") != nullptr;
+    if (vu1 ? s_logVu1 : s_logVu0)
+        std::cerr << (vu1 ? "[vu1:compiled] pc=0x" : "[vu0:compiled] pc=0x") << std::hex << startPC << std::dec << (entry.fn ? " compiled" : " interpreted")
                   << std::endl;
     return entry.fn;
 }

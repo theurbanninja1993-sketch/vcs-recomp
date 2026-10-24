@@ -39,7 +39,6 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackLimit = 0x001FFF00u;
         constexpr uint32_t kCallStackSize = 0x2000u;
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
-        constexpr uint64_t kCdvdCompletionCycles = 128u;
         constexpr int kSpu2DmaIrq[2] = {0x24, 0x28}; // IOP DMA channels 4 and 7
 
         uint32_t physicalAddress(uint32_t address)
@@ -263,12 +262,23 @@ namespace ps2x::iop::detail
             if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
 
-            if (iequals(call.library, "cdvdman") && cdvd.dispatchImport(call.ordinal, cpu))
+            if (iequals(call.library, "cdvdman"))
             {
+                cdvd.advanceCycles(totalCycles);
+                const uint64_t completion = cdvd.completionCycle();
+                if (call.ordinal == 11u && a0 == 0u && completion > totalCycles)
+                {
+                    if (kernel.hasCurrentThread())
+                        kernel.delayCurrentUntil(completion, cpu);
+                    else
+                        (void)runNestedUntil([this, completion] { return totalCycles >= completion; });
+                }
+                if (!cdvd.dispatchImport(call.ordinal, cpu, totalCycles))
+                    return ImportDisposition::Missing;
                 if (const auto callback = cdvd.takeCompletionCallback())
                 {
                     pendingGuestCallbacks.emplace(
-                        totalCycles + kCdvdCompletionCycles,
+                        callback->deadlineCycle,
                         ScheduledGuestCallback{
                             callback->address,
                             callback->gp,
@@ -543,6 +553,7 @@ namespace ps2x::iop::detail
 
         void servicePendingGuestCallbacks()
         {
+            cdvd.advanceCycles(totalCycles);
             if (servicingGuestCallbacks || pendingGuestCallbacks.empty())
                 return;
 
@@ -598,6 +609,8 @@ namespace ps2x::iop::detail
                     if (!next)
                     {
                         uint64_t nextWake = kernel.nextWakeCycle(target);
+                        if (const uint64_t completion = cdvd.completionCycle(); completion > totalCycles)
+                            nextWake = std::min(nextWake, completion);
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                             nextWake = std::min(nextWake, completionCycle);
                         if (!pendingGuestCallbacks.empty())
@@ -659,6 +672,8 @@ namespace ps2x::iop::detail
                 if (!next)
                 {
                     uint64_t nextWake = kernel.nextWakeCycle(limit);
+                    if (const uint64_t completion = cdvd.completionCycle(); completion > totalCycles)
+                        nextWake = std::min(nextWake, completion);
                     for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                         nextWake = std::min(nextWake, completionCycle);
                     if (!pendingGuestCallbacks.empty())
@@ -762,6 +777,7 @@ namespace ps2x::iop::detail
             out << "[IOP] loaded IRX id=" << result.moduleId
                 << " entry=0x" << std::hex << modules[result.moduleId].entry
                 << " base=0x" << modules[result.moduleId].base
+                << " size=0x" << modules[result.moduleId].size
                 << " start=" << std::dec << result.startResult;
             log(LogLevel::Info, out.str());
             return result;

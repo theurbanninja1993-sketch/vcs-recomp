@@ -4,6 +4,7 @@
 #include "../core/iop_cpu.h"
 #include "../core/iop_kernel.h"
 #include "../core/iop_memory.h"
+#include "../iop_emulator_const.h"
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/ps2_path.h"
 
@@ -200,13 +201,27 @@ namespace ps2x::iop::detail
             virtualIsoBuilt = false;
             virtualIsoValid = false;
             completionCallback.reset();
+            readDeadline = 0u;
+            nextReadLsn.reset();
             nodes.clear();
             metadataSectors.clear();
             imageHandle = 0u;
         }
 
-        bool dispatchImport(uint16_t ordinal, IopCpuState &cpu)
+        void advanceCycles(uint64_t currentCycle)
         {
+            if (readDeadline != 0u && currentCycle >= readDeadline)
+            {
+                readDeadline = 0u;
+                signalCommandComplete();
+            }
+        }
+
+        uint64_t completionCycle() const noexcept { return readDeadline; }
+
+        bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+        {
+            advanceCycles(currentCycle);
             const uint32_t a0 = cpu.gpr[4];
             const uint32_t a1 = cpu.gpr[5];
             const uint32_t a2 = cpu.gpr[6];
@@ -219,6 +234,8 @@ namespace ps2x::iop::detail
                 {
                     callback = {};
                     completionCallback.reset();
+                    readDeadline = 0u;
+                    nextReadLsn.reset();
                 }
                 lastError = kCdvdErrorNone;
                 cpu.gpr[2] = 1u;
@@ -229,15 +246,36 @@ namespace ps2x::iop::detail
                 return true;
 
             case 6: // sceCdRead
+                if (readDeadline != 0u)
+                {
+                    cpu.gpr[2] = 0u;
+                    return true;
+                }
                 if (readSectors(a0, a1, a2))
                 {
-                    signalCommandComplete();
+                    // Approximate DVD 4x transfer budget and a 50 ms seek for
+                    // a nonsequential command. Host copying is eager; guest command
+                    // completion, Sync and callbacks remain asynchronous.
+                    // This is a scheduling model, not cycle-accurate CDVD.
+                    constexpr uint64_t sectorsPerSecond = 2700u;
+                    const uint64_t transfer = (static_cast<uint64_t>(a1) * kIopClockHz + sectorsPerSecond - 1u) / sectorsPerSecond;
+                    const uint64_t seek = nextReadLsn && *nextReadLsn == a0 ? 0u : kIopClockHz / 20u;
+                    readDeadline = currentCycle + seek + std::max<uint64_t>(128u, transfer);
+                    nextReadLsn = a0 + a1;
+                    if (interruptEventFlagId != 0)
+                    {
+                        IopCpuState clear{};
+                        clear.gpr[4] = static_cast<uint32_t>(interruptEventFlagId);
+                        clear.gpr[5] = ~kCdvdInterruptReadyBits;
+                        (void)kernel.dispatchEventImport(8u, clear);
+                    }
                     if (callback.address != 0u)
                     {
                         completionCallback = CompletionCallback{
                             callback.address,
                             callback.gp,
                             kCdvdCallbackRead,
+                            readDeadline,
                         };
                     }
                     cpu.gpr[2] = 1u;
@@ -256,6 +294,7 @@ namespace ps2x::iop::detail
                         callback.address,
                         callback.gp,
                         kCdvdCallbackSeek,
+                            currentCycle + 128u,
                     };
                 }
                 cpu.gpr[2] = 1u;
@@ -270,7 +309,9 @@ namespace ps2x::iop::detail
                 return true;
 
             case 11: // sceCdSync
-                cpu.gpr[2] = 0u;
+                // The emulator parks a blocking caller at readDeadline before
+                // resuming it. Polling callers observe the pending phase.
+                cpu.gpr[2] = a0 == 0u ? 0u : (readDeadline != 0u ? 1u : 0u);
                 return true;
 
             case 12: // sceCdGetDiskType
@@ -372,7 +413,7 @@ namespace ps2x::iop::detail
             if (interruptEventFlagId == 0)
             {
                 interruptEventFlagId = kernel.createInternalEventFlag(
-                    kEventFlagMulti, 0u, kCdvdInterruptReadyBits);
+                    kEventFlagMulti, 0u, readDeadline != 0u ? 0u : kCdvdInterruptReadyBits);
             }
             return interruptEventFlagId;
         }
@@ -734,6 +775,8 @@ namespace ps2x::iop::detail
         uint32_t lastError = kCdvdErrorNone;
         uint32_t streamFlag = 0u;
         uint32_t lastReadTimeout = 0u;
+        uint64_t readDeadline = 0u;
+        std::optional<uint32_t> nextReadLsn;
         int interruptEventFlagId = 0;
         uint64_t imageHandle = 0u;
         bool virtualIsoBuilt = false;
@@ -755,9 +798,19 @@ namespace ps2x::iop::detail
         m_impl->reset();
     }
 
-    bool IopCdvd::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
+    bool IopCdvd::dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
     {
-        return m_impl->dispatchImport(ordinal, cpu);
+        return m_impl->dispatchImport(ordinal, cpu, currentCycle);
+    }
+
+    void IopCdvd::advanceCycles(uint64_t currentCycle)
+    {
+        m_impl->advanceCycles(currentCycle);
+    }
+
+    uint64_t IopCdvd::completionCycle() const noexcept
+    {
+        return m_impl->completionCycle();
     }
 
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept

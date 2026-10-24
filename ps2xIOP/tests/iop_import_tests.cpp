@@ -4,6 +4,7 @@
 #include "emulator/imports/iop_cdvd.h"
 #include "emulator/imports/iop_imports.h"
 #include "emulator/imports/iop_loadcore.h"
+#include "emulator/imports/iop_sysmem.h"
 #include "emulator/imports/iop_timrman.h"
 #include "emulator/services/iop_rpc.h"
 #include "ps2x/iop/iop_host.h"
@@ -96,6 +97,137 @@ namespace
             return true;
         std::cerr << "FAIL: " << message << '\n';
         return false;
+    }
+
+    bool testSysmemReuseAndQueries()
+    {
+        NullHost host;
+        IopMemory memory;
+        IopSysmem sysmem(host, memory);
+        const uint32_t capacity = IopMemory::HeapLimit - IopMemory::HeapBase;
+        const uint32_t low = memory.allocate(0x40000u);
+        const uint32_t middle = memory.allocate(0x40000u);
+        const uint32_t high = memory.allocate(capacity - 0x80000u);
+        if (!expect(low && middle && high, "could not fill IOP arena") ||
+            !expect(memory.maxFreeMemory() == 0u, "full arena reports free memory") ||
+            !expect(memory.freeAllocation(low), "could not release low buffer"))
+            return false;
+        memory.write32(middle, 0x12345678u);
+        memory.write32(high, 0x87654321u);
+        // Repeated movie-buffer lifetimes must not exhaust the arena or damage
+        // modules above the hole. Exercise the guest sysmem import each time.
+        IopCpuState cpu{};
+        for (uint32_t i = 0; i < 32u; ++i)
+        {
+            cpu.gpr[4] = 0u;
+            cpu.gpr[5] = 0x40000u;
+            if (!expect(sysmem.dispatchImport(4u, cpu) && cpu.gpr[2] == low,
+                        "AllocSysMemory did not reuse freed movie buffer"))
+                return false;
+            cpu.gpr[4] = cpu.gpr[2];
+            if (!expect(sysmem.dispatchImport(5u, cpu) && cpu.gpr[2] == 0u,
+                        "FreeSysMemory failed"))
+                return false;
+        }
+        if (!expect(memory.read32(middle) == 0x12345678u && memory.read32(high) == 0x87654321u,
+                    "reusing a hole corrupted a live allocation") ||
+            !expect(memory.freeAllocation(high), "could not release high buffer"))
+            return false;
+        if (!expect(sysmem.dispatchImport(7u, cpu) && cpu.gpr[2] == capacity - 0x80000u,
+                    "QueryMaxFreeMemSize did not report largest hole") ||
+            !expect(sysmem.dispatchImport(8u, cpu) && cpu.gpr[2] == capacity - 0x40000u,
+                    "QueryTotalFreeMemSize did not sum disjoint holes") ||
+            !expect(memory.allocate(0xFFFFFFFFu) == 0u && memory.allocate(0xFFFFFFF0u) == 0u,
+                    "oversized request wrapped to a small allocation"))
+            return false;
+        memory.reset();
+        // Fixed module reservations and alignment must constrain first-fit reuse.
+        const uint32_t reserved = IopMemory::HeapBase + 0x200u;
+        if (!expect(memory.allocate(0x100u, 0x100u, reserved) == reserved,
+                    "fixed module reservation failed") ||
+            !expect(memory.allocate(0x100u, 0x100u, reserved) == 0u,
+                    "overlapping reservation succeeded") ||
+            !expect(memory.allocate(0x180u, 0x100u) == IopMemory::HeapBase,
+                    "aligned low hole was not used") ||
+            !expect(memory.allocate(0x100u, 0x100u) == reserved + 0x100u,
+                    "aligned allocation overlapped fixed module"))
+            return false;
+        return true;
+    }
+
+    bool testCdvdPendingRead()
+    {
+        class SectorHost final : public NullHost
+        {
+        public:
+            bool readCdSectors(uint32_t, uint32_t sectors, void *destination) override
+            {
+                ++reads;
+                std::memset(destination, 0x5Au, sectors * 2048u);
+                return true;
+            }
+            unsigned reads = 0;
+        } host;
+        IopMemory memory;
+        IopKernel kernel(memory);
+        IopCdvd cdvd(host, memory, kernel);
+        IopCpuState cpu{};
+        cpu.gpr[4] = static_cast<uint32_t>(-11);
+        cpu.gpr[5] = 0x1000u;
+        if (!expect(cdvd.dispatchImport(50u, cpu), "CDVD interrupt flag query failed"))
+            return false;
+        const uint32_t flag = cpu.gpr[2];
+        cpu = {};
+        cpu.gpr[4] = 0x1234u;
+        if (!expect(cdvd.dispatchImport(37u, cpu), "CDVD callback registration failed"))
+            return false;
+        const uint32_t buffer = memory.allocate(5u * 2048u);
+        cpu = {};
+        cpu.gpr[4] = 0x100u;
+        cpu.gpr[5] = 5u;
+        cpu.gpr[6] = buffer;
+        if (!expect(cdvd.dispatchImport(6u, cpu, 100u) && cpu.gpr[2] == 1u,
+                    "CDVD read was not accepted"))
+            return false;
+        const uint64_t deadline = cdvd.completionCycle();
+        const auto callback = cdvd.takeCompletionCallback();
+        if (!expect(deadline > 100u && callback && callback->deadlineCycle == deadline,
+                    "read callback was not tied to asynchronous completion") ||
+            !expect(memory.read8(buffer) == 0x5Au, "host sector data was not copied"))
+            return false;
+        cpu.gpr[4] = 1u;
+        if (!expect(cdvd.dispatchImport(11u, cpu, deadline - 1u) && cpu.gpr[2] == 1u,
+                    "poll reported completion before the deadline"))
+            return false;
+        cpu.gpr[4] = 0x100u;
+        if (!expect(cdvd.dispatchImport(6u, cpu, deadline - 1u) && cpu.gpr[2] == 0u && host.reads == 1u,
+                    "pending read was replaced by another read"))
+            return false;
+        cpu = {};
+        cpu.gpr[4] = flag;
+        cpu.gpr[5] = 0x29u;
+        cpu.gpr[6] = 1u;
+        if (!expect(kernel.dispatchEventImport(11u, cpu) && static_cast<int32_t>(cpu.gpr[2]) == -418,
+                    "CDVD completion event was signaled while pending"))
+            return false;
+        cdvd.advanceCycles(deadline);
+        if (!expect(kernel.dispatchEventImport(11u, cpu) && cpu.gpr[2] == 0u,
+                    "CDVD completion event was not signaled at deadline"))
+            return false;
+        cpu.gpr[4] = 1u;
+        if (!expect(cdvd.dispatchImport(11u, cpu, deadline) && cpu.gpr[2] == 0u,
+                    "poll did not report completed read"))
+            return false;
+        cpu = {};
+        cpu.gpr[4] = 0x200u;
+        cpu.gpr[5] = 5u;
+        cpu.gpr[6] = buffer;
+        if (!expect(cdvd.dispatchImport(6u, cpu, deadline) && cpu.gpr[2] == 1u,
+                    "completed command prevented the next read"))
+            return false;
+        cdvd.reset();
+        return expect(cdvd.completionCycle() == 0u && !cdvd.takeCompletionCallback(),
+                      "reset retained a pending read or callback");
     }
 
     bool testLoadcoreRebootLibraryMode()
@@ -330,7 +462,7 @@ namespace
 
 int main()
 {
-    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+    if (!testSysmemReuseAndQueries() || !testCdvdPendingRead() || !testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
         !testTimrmanPeriodicCallback())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";

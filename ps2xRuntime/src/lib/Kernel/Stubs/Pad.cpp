@@ -294,11 +294,12 @@ namespace ps2_stubs
             data[19] = pressureValue(state, portState, kPadBtnR2);
         }
 
-        // PS2X_PAD_SCRIPT="<frame>:<button>[+<button>...]:<frames>;..." presses buttons on
-        // port 0 for <frames> presented frames starting at <frame> (headless testing).
+        // PS2X_PAD_SCRIPT="<tick>:<button>[+<button>...]:<ticks>;..." presses buttons on
+        // port 0 for <ticks> frames starting at <tick>. The clock defaults to
+        // host presentations; PS2X_PAD_SCRIPT_CLOCK=vsync selects guest fields.
         // Buttons: up down left right start select l1 l2 l3 r1 r2 r3 cross circle square triangle,
         // plus the left stick pushed fully: sleft sright sup sdown (bits 16-19).
-        uint32_t scriptedPadButtonsDown()
+        uint32_t scriptedPadButtonsDown(PS2Runtime *runtime)
         {
             struct Step
             {
@@ -342,11 +343,29 @@ namespace ps2_stubs
             }();
             if (s_steps.empty())
                 return 0u;
-            const uint64_t frame = g_ps2PresentedFrameCounter.load(std::memory_order_relaxed);
+            static const bool useVsync = []()
+            {
+                const char *clock = std::getenv("PS2X_PAD_SCRIPT_CLOCK");
+                return clock && std::string(clock) == "vsync";
+            }();
+            const bool guestClock = useVsync && runtime;
+            const uint64_t tick = guestClock
+                ? runtime->memory().gs().vsyncTick.load(std::memory_order_acquire)
+                : g_ps2PresentedFrameCounter.load(std::memory_order_relaxed);
             uint32_t mask = 0u;
             for (const Step &step : s_steps)
-                if (frame >= step.start && frame < step.start + step.frames)
+                if (tick >= step.start && tick - step.start < step.frames)
                     mask |= step.mask;
+            static const bool trace = std::getenv("PS2X_PAD_SCRIPT_TRACE") != nullptr;
+            static uint32_t lastMask = 0u;
+            if (trace && mask != lastMask)
+            {
+                std::ostringstream record;
+                record << "[pad:script] clock=" << (guestClock ? "vsync" : "frame")
+                       << " tick=" << tick << " mask=0x" << std::hex << mask << '\n';
+                std::cerr << record.str();
+            }
+            lastMask = mask;
             return mask;
         }
 
@@ -405,7 +424,7 @@ namespace ps2_stubs
 
             if (port == 0)
             {
-                const uint32_t scripted = scriptedPadButtonsDown();
+                const uint32_t scripted = scriptedPadButtonsDown(runtime);
                 state.buttons = static_cast<uint16_t>(state.buttons & ~scripted);
                 if (scripted & 0x10000u) state.lx = 0x00;
                 if (scripted & 0x20000u) state.lx = 0xFF;

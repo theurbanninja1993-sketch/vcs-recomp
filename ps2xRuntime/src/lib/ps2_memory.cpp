@@ -22,6 +22,9 @@ extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
 
 uint64_t ps2Vif1StreamCommitted();
 uint64_t ps2Vif1StreamPosition();
+// Times the VU1 worker had to block because the bounded GS queue was full.
+// Distinguishes a VU1-compute-bound stall from a GS/GPU-bound stall.
+std::atomic<uint64_t> g_ps2GsSpaceBlocks{0};
 
 namespace
 {
@@ -1518,6 +1521,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     // Big frames (world sectors) easily exceed thousands of tags per chain;
                     // the cap only guards against looping chains.
                     const int kMaxChainTags = 1 << 20;
+                    // A corrupt/cyclic chain can otherwise copy without bound and spin
+                    // the EE here for minutes (the observed dormant-guest stall). Bound
+                    // the total copied bytes so a bad chain bails quickly instead.
+                    constexpr uint64_t kMaxChainBytes = 256ull * 1024ull * 1024ull;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1711,6 +1718,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         if (hasPayload)
                             appendData(dataAddr, tagQwc);
+                        if (chainBuf.size() > kMaxChainBytes)
+                        {
+                            static std::atomic<uint32_t> s_byteLogs{0};
+                            if (s_byteLogs.fetch_add(1, std::memory_order_relaxed) < 8u)
+                                std::cerr << "[dma:chain-bytes] ch=0x" << std::hex << channelBase
+                                          << " tadr=0x" << tagAddr << std::dec << " tags=" << tagsProcessed
+                                          << " bytes=" << chainBuf.size() << std::endl;
+                            break;
+                        }
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
@@ -1946,6 +1962,8 @@ void PS2Memory::enqueueGsWork(GsWorkItem &&item)
         std::unique_lock<std::mutex> lock(m_gsQueueMutex);
         // Bounded so the VU1 worker cannot run far ahead of the GS.
         constexpr size_t kMaxQueued = 4096u;
+        if (m_gsQueue.size() >= kMaxQueued)
+            g_ps2GsSpaceBlocks.fetch_add(1u, std::memory_order_relaxed);
         m_gsSpaceCv.wait(lock, [this]()
                          { return m_gsQueue.size() < kMaxQueued || m_gsStop; });
         m_gsQueue.push_back(std::move(item));
@@ -1959,9 +1977,17 @@ void PS2Memory::enqueueGsWork(GsWorkItem &&item)
 void PS2Memory::gsFrontendLoop()
 {
     ThreadNaming::SetCurrentThreadName("GsFrontend");
+    // PS2X_GS_FRONTEND_STATS: wall time waiting for work vs processing it (by
+    // item kind), every ~5 s, to tell a busy frontend from a blocked one.
+    static const bool s_stats = std::getenv("PS2X_GS_FRONTEND_STATS") != nullptr;
+    using Clock = std::chrono::steady_clock;
+    double idleSeconds = 0.0, packetSeconds = 0.0, otherSeconds = 0.0;
+    uint64_t packets = 0, packetBytes = 0;
+    auto statStart = Clock::now();
     for (;;)
     {
         GsWorkItem item;
+        const auto waitStart = s_stats ? Clock::now() : Clock::time_point{};
         {
             std::unique_lock<std::mutex> lock(m_gsQueueMutex);
             m_gsQueueCv.wait(lock, [this]()
@@ -1972,6 +1998,9 @@ void PS2Memory::gsFrontendLoop()
             m_gsQueue.pop_front();
         }
         m_gsSpaceCv.notify_one();
+        const auto workStart = s_stats ? Clock::now() : Clock::time_point{};
+        if (s_stats)
+            idleSeconds += std::chrono::duration<double>(workStart - waitStart).count();
         switch (item.kind)
         {
         case GsWorkItem::Kind::Packet:
@@ -2000,6 +2029,32 @@ void PS2Memory::gsFrontendLoop()
             m_vif1IdleCv.notify_all();
             break;
         }
+        }
+        if (s_stats)
+        {
+            const auto now = Clock::now();
+            const double seconds = std::chrono::duration<double>(now - workStart).count();
+            if (item.kind == GsWorkItem::Kind::Packet)
+            {
+                packetSeconds += seconds;
+                ++packets;
+                packetBytes += item.data.size();
+            }
+            else
+            {
+                otherSeconds += seconds;
+            }
+            const double window = std::chrono::duration<double>(now - statStart).count();
+            if (window >= 5.0)
+            {
+                std::fprintf(stderr, "[gsfront] f=%llu window=%.2fs idle=%.2fs packets=%.2fs (%llu, %.1f MB) other=%.2fs\n",
+                             static_cast<unsigned long long>(g_ps2PresentedFrameCounter.load(std::memory_order_relaxed)),
+                             window, idleSeconds, packetSeconds, static_cast<unsigned long long>(packets),
+                             packetBytes / 1048576.0, otherSeconds);
+                idleSeconds = packetSeconds = otherSeconds = 0.0;
+                packets = packetBytes = 0;
+                statStart = now;
+            }
         }
         if (!item.data.empty() || item.data.capacity() != 0u)
         {
