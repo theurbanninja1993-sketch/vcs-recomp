@@ -19,6 +19,10 @@ config = "config/lcs-us.toml"
 override = "GTA Liberty City Stories (SLUS_214.23)"
 
 [vu1]
+# The microcode's place in the boot ELF (offsets only). With it every VU
+# program is compiled from the player's own disc during the build, and the
+# learn passes below are not run.
+layout = "config/vu_layout.txt"
 # The learn passes: a new game (no memory card), through the opening, into the
 # car beside Toni and a short drive. Programs the route never reaches are
 # recorded while playing and compiled when the game closes.

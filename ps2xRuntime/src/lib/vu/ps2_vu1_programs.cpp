@@ -77,6 +77,8 @@ struct VU1PluginHost
 // program is compiled.
 extern const VU1CompiledProgram g_ps2Vu1CompiledPrograms[] __attribute__((weak));
 extern const size_t g_ps2Vu1CompiledProgramCount __attribute__((weak));
+extern const VU1CompiledRegion g_ps2Vu1CompiledRegions[] __attribute__((weak));
+extern const size_t g_ps2Vu1CompiledRegionCount __attribute__((weak));
 
 namespace
 {
@@ -181,6 +183,25 @@ void ps2Vu1ProgramPairs(const uint8_t *code, uint32_t codeSize, uint32_t startPC
     }
 }
 
+uint64_t ps2Vu1RegionKey(const uint8_t *code, uint32_t codeSize, uint32_t start, uint32_t end)
+{
+    uint64_t hash = 1469598103934665603ull;
+    auto mix = [&](uint32_t value)
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            hash ^= (value >> (8 * i)) & 0xFFu;
+            hash *= 1099511628211ull;
+        }
+    };
+    mix(codeSize);
+    mix(start);
+    mix(end);
+    for (uint32_t pc = start; pc + 4u <= end && pc + 4u <= codeSize; pc += 4u)
+        mix(loadWord(code, pc));
+    return hash;
+}
+
 uint64_t ps2Vu1ProgramKey(const uint8_t *code, uint32_t codeSize, uint32_t startPC, const uint32_t *roots,
                           uint32_t rootCount)
 {
@@ -212,7 +233,9 @@ uint64_t ps2Vu1ProgramKey(const uint8_t *code, uint32_t codeSize, uint32_t start
 VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t startPC)
 {
     const auto &programs = compiledPrograms();
-    if (programs.empty() || memory == nullptr)
+    static const bool s_regions = &g_ps2Vu1CompiledRegionCount != nullptr && g_ps2Vu1CompiledRegionCount > 0u &&
+                                  !std::getenv("PS2X_VU_NO_REGIONS");
+    if ((programs.empty() && !s_regions) || memory == nullptr)
         return nullptr;
     // VU0 and VU1 are the same interpreter class and the same generated code;
     // only the code memory (4 KB vs 16 KB) and its generation counter differ.
@@ -265,6 +288,27 @@ VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t cod
     }
     if (chosen)
         layout.fn = chosen->run;
+    // No program keyed by its reachable code: a compiled region holding startPC
+    // whose bytes are the ones loaded now. The layout then depends on the whole
+    // region, so its words are what revalidation checks.
+    const VU1CompiledRegion *region = nullptr;
+    if (!chosen && s_regions)
+    {
+        for (size_t i = 0; i < g_ps2Vu1CompiledRegionCount && !region; ++i)
+        {
+            const VU1CompiledRegion &r = g_ps2Vu1CompiledRegions[i];
+            if (r.codeSize == codeSize && startPC >= r.start && startPC < r.end &&
+                std::binary_search(r.entries, r.entries + r.entryCount, startPC) &&
+                ps2Vu1RegionKey(vuCode, codeSize, r.start, r.end) == r.key)
+                region = &r;
+            static const bool s_dbg = std::getenv("PS2X_VU_REGION_DEBUG") != nullptr;
+            if (s_dbg && r.codeSize == codeSize && startPC >= r.start && startPC < r.end)
+                std::cerr << "[vu:region] pc=0x" << std::hex << startPC << " region 0x" << r.start << "-0x" << r.end
+                          << (ps2Vu1RegionKey(vuCode, codeSize, r.start, r.end) == r.key ? " match" : " differs") << std::dec << std::endl;
+        }
+        if (region)
+            layout.fn = region->run;
+    }
     // The layout matches only while the code every candidate depends on is
     // unchanged (a change could select a different variant).
     std::vector<uint32_t> covered, normal, delay;
@@ -278,6 +322,9 @@ VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t cod
         covered.insert(covered.end(), normal.begin(), normal.end());
         covered.insert(covered.end(), delay.begin(), delay.end());
     }
+    if (region)
+        for (uint32_t pc = region->start; pc + 8u <= region->end; pc += 8u)
+            covered.push_back(pc);
     std::sort(covered.begin(), covered.end());
     covered.erase(std::unique(covered.begin(), covered.end()), covered.end());
     for (uint32_t pc : covered)

@@ -1,3 +1,8 @@
+#include <cstdio>
+#include <cstdlib>
+#include <tuple>
+#include <set>
+#include <mutex>
 #include <vector>
 #include <unordered_map>
 #include <iostream>
@@ -81,6 +86,33 @@ namespace
         }
 
         return 0u;
+    }
+}
+
+namespace
+{
+    // PS2X_VU_LAYOUT_LOG=<file>: every distinct microcode upload (unit, VU address,
+    // bytes), for building a game's VU layout table - which parts of its ELF it
+    // uploads where - so a build can compile the programs straight from the disc.
+    // Developer tool; off unless the variable is set.
+    void logMicrocodeUpload(uint32_t unit, uint32_t destAddr, const uint8_t *bytes, uint32_t length)
+    {
+        static const char *s_path = std::getenv("PS2X_VU_LAYOUT_LOG");
+        if (s_path == nullptr || length == 0u)
+            return;
+        static std::mutex s_mutex;
+        static std::set<std::tuple<uint32_t, uint32_t, uint64_t>> s_seen;
+        static FILE *s_file = std::fopen(s_path, "ab");
+        uint64_t hash = 1469598103934665603ull;
+        for (uint32_t i = 0; i < length; ++i)
+            hash = (hash ^ bytes[i]) * 1099511628211ull;
+        std::lock_guard<std::mutex> lock(s_mutex);
+        if (s_file == nullptr || !s_seen.insert({unit, destAddr, hash}).second)
+            return;
+        const uint32_t header[4] = {0x594C5556u /* 'VULY' */, unit, destAddr, length};
+        std::fwrite(header, sizeof(header), 1, s_file);
+        std::fwrite(bytes, 1, length, s_file);
+        std::fflush(s_file);
     }
 }
 
@@ -186,6 +218,7 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
                 {
                     std::memcpy(m_vu0Code + destAddr, data + pos, copyBytes);
                     markVU0CodeModified();
+                    logMicrocodeUpload(0u, destAddr, data + pos, copyBytes);
                 }
             }
 
@@ -499,6 +532,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 {
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                     markVU1CodeModified();
+                    logMicrocodeUpload(1u, destAddr, data + pos, copyBytes);
                 }
             }
             pos += mpgBytes;

@@ -18,6 +18,10 @@ function_map = "config/vcs_clean.csv"
 override = "GTA Vice City Stories (SLUS_215.90)"
 
 [vu1]
+# The microcode's place in the boot ELF (offsets only). With it every VU
+# program is compiled from the player's own disc during the build, and the
+# learn passes below are not run.
+layout = "config/vu_layout.txt"
 # Automated PS2X_VU1_LEARN / PS2X_VU0_CAPTURE passes after the first build: the
 # fast-boot script, the opening cutscene, then taking Sgt. Martinez's bike and
 # riding it. Every VU program the run reaches is compiled; ones it never reaches

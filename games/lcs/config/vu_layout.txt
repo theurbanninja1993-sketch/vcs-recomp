@@ -1,0 +1,31 @@
+# Microcode the game uploads to its vector units, from its own boot ELF:
+# vu<unit> elf=<file offset> vu=<VU code address> len=<bytes>. Offsets and sizes
+# only - the code itself is read from the player's disc at build time.
+# Made by playing with PS2X_VU_LAYOUT_LOG=<file> and running tools/vu_layout.py.
+vu0 elf=0x287600 vu=0x0000 len=1960
+vu0 elf=0x1fb800 vu=0x0c00 len=944
+vu1 elf=0x14c5a0 vu=0x0000 len=2048
+vu1 elf=0x288510 vu=0x0000 len=192
+vu1 elf=0x288810 vu=0x0200 len=160
+vu1 elf=0x288190 vu=0x0400 len=32
+vu1 elf=0x047690 vu=0x07f0 len=672
+vu1 elf=0x1303b0 vu=0x07f0 len=992
+vu1 elf=0x14cd90 vu=0x07f0 len=1072
+vu1 elf=0x14cda0 vu=0x0800 len=2048
+vu1 elf=0x047930 vu=0x0c38 len=704
+vu1 elf=0x130790 vu=0x0c38 len=944
+vu1 elf=0x1d5bc0 vu=0x0c38 len=1024
+vu1 elf=0x14d5a0 vu=0x1000 len=2048
+vu1 elf=0x047bf0 vu=0x1440 len=304
+vu1 elf=0x14d9e0 vu=0x1440 len=336
+vu1 elf=0x14dda0 vu=0x1800 len=2048
+vu1 elf=0x14e5a0 vu=0x2000 len=1792
+vu1 elf=0x01c820 vu=0x2700 len=144
+vu1 elf=0x1084c0 vu=0x2700 len=432
+vu1 elf=0x173740 vu=0x2700 len=1264
+vu1 elf=0x173c30 vu=0x2700 len=1104
+vu1 elf=0x1e3e20 vu=0x2700 len=816
+vu1 elf=0x1dabc0 vu=0x2a30 len=240
+vu1 elf=0x054110 vu=0x2b50 len=2048
+vu1 elf=0x1e3aa0 vu=0x2bf0 len=896
+vu1 elf=0x054910 vu=0x3350 len=480

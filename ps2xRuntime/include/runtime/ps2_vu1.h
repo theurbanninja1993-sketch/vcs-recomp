@@ -32,6 +32,21 @@ struct VU1CompiledProgram
     bool flagless = false; // reads no MAC/status flags, so computes none
 };
 
+// A whole microcode upload compiled as one region: every pair in [start, end) is
+// an entry, keyed by the region's bytes where they sit (ps2Vu1RegionKey). Used
+// when no program keyed by its reachable code matches - it is what a build
+// compiles straight from the game's ELF, before anything has been recorded.
+struct VU1CompiledRegion
+{
+    uint64_t key;
+    VU1CompiledFn run;
+    uint32_t codeSize; // the unit: 4 KB VU0, 16 KB VU1
+    uint32_t start, end;
+    const uint32_t *entries; // where it can be entered, sorted
+    uint32_t entryCount;
+};
+uint64_t ps2Vu1RegionKey(const uint8_t *code, uint32_t codeSize, uint32_t start, uint32_t end);
+
 // Key of the program entered at startPC: entry, plus the address and words of
 // every pair reachable from it (and from `roots`) without following JR/JALR.
 uint64_t ps2Vu1ProgramKey(const uint8_t *code, uint32_t codeSize, uint32_t startPC,
