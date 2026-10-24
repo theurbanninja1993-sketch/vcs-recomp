@@ -773,7 +773,7 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
     }
 
-    void writeCdvdPvdReadIrx(TestHost &host, uint32_t address)
+    void writeCdvdPvdReadIrx(TestHost &host, uint32_t address, bool blocking = false)
     {
         constexpr uint32_t codeOffset = 0x100u;
         constexpr uint32_t loadAddress = 0x00010000u;
@@ -781,6 +781,7 @@ namespace
         constexpr uint32_t importTableAddress = loadAddress + 0x100u;
         constexpr uint32_t callbackStub = importTableAddress + 20u;
         constexpr uint32_t readStub = callbackStub + 8u;
+        constexpr uint32_t syncStub = readStub + 8u;
         constexpr uint32_t callbackFunction = loadAddress + 0x180u;
         constexpr uint32_t epilogueAddress = loadAddress + 26u * sizeof(uint32_t);
 
@@ -814,6 +815,7 @@ namespace
             0x64766463u, 0x006E616Du, // "cdvdman"
             0x03E00008u, 0x24000025u, // sceCdCallback
             0x03E00008u, 0x24000006u, // sceCdRead
+            0x03E00008u, 0x2400000Bu, // sceCdSync
             0u, 0u,
         };
         const uint32_t callback[] = {
@@ -823,6 +825,18 @@ namespace
 
         std::vector<uint8_t> segment(program.filesz, 0u);
         std::memcpy(segment.data(), entry, sizeof(entry));
+        if (blocking)
+        {
+            const uint32_t blockingEntry[] = {
+                0x27BDFFF0u, 0xAFBF000Cu,
+                0x3C040001u, 0x34840180u, jal(callbackStub), 0u,
+                0x24040010u, 0x24050001u,
+                0x3C060001u, 0x34C60800u, jal(readStub), 0u,
+                0x00002021u, jal(syncStub), 0u,
+                0x8FBF000Cu, 0x27BD0010u, 0x03E00008u, 0u,
+            };
+            std::memcpy(segment.data(), blockingEntry, sizeof(blockingEntry));
+        }
         std::memcpy(segment.data() + 0x100u, imports, sizeof(imports));
         std::memcpy(segment.data() + (callbackFunction - loadAddress), callback, sizeof(callback));
         std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
@@ -1099,6 +1113,10 @@ int main()
     writeCdvdPvdReadIrx(host, 0x100u);
     const ModuleLoadResult cdvdPvdRead = iop.loadModuleBuffer(0x100u);
     iop.runEeCycles(4096u);
+    uint32_t earlyCdvdCallback = 0u;
+    if (!expect(iop.readMemory(0x000101C0u, &earlyCdvdCallback, sizeof(earlyCdvdCallback)) && earlyCdvdCallback == 0u,
+                "CDVD callback ran before the pending read completed")) return 1;
+    iop.runEeCycles(25'000'000u);
     iop.onSifTransfer({
         SifTransferKind::GetOtherData,
         SifTransferPhase::BeforeCopy,
@@ -1109,12 +1127,19 @@ int main()
     uint32_t cdvdCallbackReason = 0u;
     if (!expect(iop.readMemory(0x000101C0u, &cdvdCallbackReason, sizeof(cdvdCallbackReason)),
                 "Could not read the physical CDVD callback result")) return 1;
-    host.cdRoot.clear();
-    std::filesystem::remove(virtualCdRoot, cdRootError);
     if (!expect(cdvdPvdRead.handled && cdvdPvdRead.startResult == 0,
                 "CDVD did not expose the extracted CD root as an ISO9660 PVD")) return 1;
     if (!expect(cdvdCallbackReason == 1u,
                 "CDVD read completion did not invoke the registered guest callback")) return 1;
+
+    iop.reset();
+    writeCdvdPvdReadIrx(host, 0x100u, true);
+    const ModuleLoadResult blockingCdvdRead = iop.loadModuleBuffer(0x100u);
+    if (!expect(blockingCdvdRead.handled && blockingCdvdRead.startResult == 0 &&
+                iop.cycles() >= 36'864'000u / 20u,
+                "blocking sceCdSync returned before the pending command completed")) return 1;
+    host.cdRoot.clear();
+    std::filesystem::remove(virtualCdRoot, cdRootError);
 
     iop.reset();
     host.logs.clear();

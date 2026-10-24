@@ -20,6 +20,10 @@
 #include <algorithm>
 #include <cstdlib>
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include <unistd.h>
@@ -207,6 +211,25 @@ int main(int argc, char *argv[])
     redirectStdioToLogcat();
 #endif
     setupTerminateLogger();
+
+#if defined(__linux__)
+    // Mesa's GL threading (glthread) runs GL calls on a second thread, but the
+    // GPU renderer's frequent buffer/sync round trips make the two threads
+    // take turns: in a busy LCS driving scene the GS stage halved and the game
+    // fell to 80-90% speed; with it off the same scene holds 100%. Must be set
+    // before the GL context exists. Forced: launchers (Steam) export
+    // mesa_glthread=true, and the owner's runs from there still had the GL
+    // thread - with stalls of 40-160 ms per VBlank while every thread sat idle,
+    // and the cutscene audio underrunning. PS2X_GLTHREAD=1 leaves it on.
+    if (std::getenv("PS2X_GLTHREAD") == nullptr)
+        setenv("mesa_glthread", "false", 1);
+
+    // PS2X_ALLOW_PTRACE=1 lets any process ptrace this one, so external samplers
+    // (eu-stack / gdb) can capture thread stacks under yama ptrace_scope=1.
+    // Diagnostic only; default off.
+    if (std::getenv("PS2X_ALLOW_PTRACE") != nullptr)
+        prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+#endif
 
     try
     {

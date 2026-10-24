@@ -65,6 +65,21 @@ version = 1
 # ---------------------------------------------------------------- story (6)
 # One per act, first and last mission of each chapter, the way the official sets
 # name theirs after the mission.
+#
+# The story counter is a float at 0x004CD18C: 0.0 before the first story mission,
+# and one more for each story mission passed (found by RAM dumps, Soldier through
+# Conduct Unbecoming: 0, 1, 2, 3). Its value at each milestone is the number of
+# missions passed so far. Each milestone is the raw 32-bit pattern of the float, compared
+# as an integer: `0xX4CD18C==<bits(n)>`. The float itself (`0xf...`) cannot be compared:
+# 0.0 was seen to satisfy `>=1`. Integer compares on the bits are exact for whole numbers.
+# The delta form (`d0x...`) was tried and is ignored in combined conditions in this build
+# (a delta of 8 satisfied a delta of 5), so a milestone fires on reaching its value, which
+# rcheevos only does from a non-matching value.
+#
+# The thresholds are the milestones' place in the story order: To Victor, the Spoils
+# ends chapter 1 at 16, Jive Drive starts chapter 2 at 17, From Zero to Hero ends it at
+# 30, Brawn of the Dead starts chapter 3 at 31, Last Stand ends it at 59. Those numbers
+# are from the internet, not the game: check each against the counter as it happens.
 
 [achievement]
 id = 1
@@ -72,7 +87,7 @@ title = Soldier
 description = Complete "Soldier".
 category = Story
 points = 10
-# TODO: the mission-passed flag or counter
+trigger = 0xX4CD18C==1065353216
 
 [achievement]
 id = 2
@@ -80,6 +95,7 @@ title = To Victor, the Spoils
 description = Complete "To Victor, the Spoils".
 category = Story
 points = 10
+trigger = 0xX4CD18C==1098907648
 
 [achievement]
 id = 3
@@ -87,6 +103,7 @@ title = Jive Drive
 description = Complete "Jive Drive".
 category = Story
 points = 10
+trigger = 0xX4CD18C==1099431936
 
 [achievement]
 id = 4
@@ -94,6 +111,7 @@ title = From Zero to Hero
 description = Complete "From Zero to Hero".
 category = Story
 points = 10
+trigger = 0xX4CD18C==1106247680
 
 [achievement]
 id = 5
@@ -101,6 +119,7 @@ title = Brawn of the Dead
 description = Complete "Brawn of the Dead".
 category = Story
 points = 10
+trigger = 0xX4CD18C==1106771968
 
 [achievement]
 id = 6
@@ -108,6 +127,7 @@ title = Last Stand
 description = Complete "Last Stand".
 category = Story
 points = 25
+trigger = 0xX4CD18C==1114374144
 
 # ------------------------------------------------- hidden mission challenges (4)
 # The four slots the official sets fill with a special way through one mission,
@@ -238,7 +258,14 @@ points = 10
 # right, triangle, triangle, down, left, cross, cross) once, with a dump after
 # each. Exactly one address in 32 MB goes 0, 2, 4, 0 through those four dumps,
 # which is the wanted level itself. Three cheat entries reach six.
-trigger = 0xH52FC74>=6
+# A wanted level is 0-6, so a value above that is not one: this byte read 53 on a
+# gameplay frame during the learn route. Hence the step, not `>=6`.
+# The wanted level is the byte at 0x00486752, which is the stars plus two: 4 is two stars,
+# 6 four, 8 six (checked against the HUD at frames 3100, 3300 and 3600). Found from four dumps taken through the
+# raise-wanted cheat (0, 2, 4, 6 in order), and checked with a per-frame trace: it
+# changes only when the stars do. 0x0052FC74, the old address, was noise.
+# A step from five to six, so a cheat (which goes 4 to 6) cannot earn it.
+trigger = 0xH486752==8
 
 [achievement]
 id = 27

@@ -109,6 +109,9 @@ namespace
 
 void (*g_ps2Vu1JumpTraceHook)(uint32_t target) = nullptr;
 std::atomic<uint64_t> g_ps2Vu1CompiledCalls{0}, g_ps2Vu1InterpretedCalls{0};
+// VU0 programs share VU1's registry (vu1_recomp compiles both units); these
+// stay for the perf log's VU0 fields.
+std::atomic<uint64_t> g_ps2Vu0CompiledCalls{0}, g_ps2Vu0InterpretedCalls{0};
 std::atomic<uint64_t> g_ps2Vu1LookupRevalidations{0}, g_ps2Vu1LookupRecomputes{0};
 
 void ps2Vu1ProgramPairs(const uint8_t *code, uint32_t codeSize, uint32_t startPC, std::vector<uint32_t> &normal,

@@ -48,6 +48,10 @@ std::atomic<float> g_gsInterpShownYaw{0.0f};    // the camera yaw the host is sh
     }
 
 std::atomic<bool> g_gsMotionBlurOff{false};
+// The game's motion-blur buffers (TEX0 bases), set by its override: VCS's two
+// accumulation buffers by default; LCS uses 12288 plus the front-buffer trail.
+std::atomic<uint32_t> g_gsMotionBlurBase[2]{{13440u}, {14464u}};
+std::atomic<bool> g_gsMotionBlurFrontTrail{false};
 std::atomic<uint32_t> g_gsFrameRate{60};
 std::atomic<bool> g_gsFrameInterp{false};
 std::atomic<bool> g_gsModernBlur{false};
@@ -2194,18 +2198,29 @@ void main()
             static const uint32_t s_blurBase0 = []()
             {
                 const char *env = std::getenv("PS2X_MOTIONBLUR_BUFS");
-                return env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 13440u;
+                return env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : g_gsMotionBlurBase[0].load(std::memory_order_relaxed);
             }();
             static const uint32_t s_blurBase1 = []()
             {
                 const char *env = std::getenv("PS2X_MOTIONBLUR_BUFS");
                 if (!env)
-                    return 14464u;
+                    return g_gsMotionBlurBase[1].load(std::memory_order_relaxed);
                 const char *comma = std::strchr(env, ',');
-                return comma ? static_cast<uint32_t>(std::strtoul(comma + 1, nullptr, 10)) : 14464u;
+                return comma ? static_cast<uint32_t>(std::strtoul(comma + 1, nullptr, 10)) : g_gsMotionBlurBase[1].load(std::memory_order_relaxed);
             }();
+            // The buffers are per game (g_gsMotionBlurBase, set by the game
+            // override; VCS's two accumulation buffers by default). LCS's trail is
+            // one full-screen blend, (Cs - Cd) * FIX + Cd, of an earlier picture
+            // over the display - from its 512x512 copy at TEX0 12288 or, in some
+            // scenes, straight from the front buffer at TEX0 0; with
+            // g_gsMotionBlurFrontTrail base 0 is matched together with that blend
+            // so ordinary textures there are left alone.
             const uint32_t tbp = m_keyState.context.tex0.tbp0;
-            if (tbp == s_blurBase0 || tbp == s_blurBase1)
+            constexpr uint32_t kTrailBlend = 0u | (1u << 2) | (2u << 4) | (1u << 6); // A=Cs B=Cd C=FIX D=Cd
+            const bool trailFromFront = g_gsMotionBlurFrontTrail.load(std::memory_order_relaxed) && tbp == 0u && m_keyState.prim.tme && m_keyState.prim.abe &&
+                                        (m_keyState.context.alpha & 0xFFu) == kTrailBlend &&
+                                        m_keyState.context.frame.fbp == 140u;
+            if (tbp == s_blurBase0 || tbp == s_blurBase1 || trailFromFront)
             {
                 m_vertices.clear();
                 m_haveKey = false;

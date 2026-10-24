@@ -789,23 +789,27 @@ namespace ps2_stubs
                             }
                             dirEntries.push_back(entry);
                         }
-std::stable_sort(dirEntries.begin(), dirEntries.end(),
-                          [](const std::filesystem::directory_entry &lhs,
-                             const std::filesystem::directory_entry &rhs)
-                          {
-                              // A real card lists a directory in the order its entries
-                              // were created: fixed files first, numbered saves last.
-                              // VCS finds its saves by their position in the listing, so
-                              // alphabetising pulls them forward and it can no longer
-                              // load them. Keep named files ahead of numbered ones.
-                              const auto numbered = [](const std::filesystem::directory_entry &e)
-                              {
-                                  const std::string name = e.path().filename().string();
-                                  const char c = name.empty() ? '\0' : name[0];
-                                  return c >= '0' && c <= '9';
-                              };
-                              return !numbered(lhs) && numbered(rhs);
-                          });
+
+                        // A real card lists a directory in the order its entries were
+                        // created: the game's fixed files first, numbered saves last.
+                        // The Stories games find saves by their position in that listing
+                        // (VCS scans entries 5..14 for the slot digit), so a plain
+                        // alphabetical order - which puts "1: ..." first - hides them
+                        // and the game starts a new one. Named files first, then
+                        // numbered ones, each group alphabetical (deterministic on any
+                        // host filesystem). Same fix as VCS 905abf2.
+                        std::sort(dirEntries.begin(), dirEntries.end(),
+                                  [](const std::filesystem::directory_entry &lhs,
+                                     const std::filesystem::directory_entry &rhs)
+                                  {
+                                      const auto numbered = [](const std::string &name)
+                                      { return !name.empty() && name[0] >= '0' && name[0] <= '9'; };
+                                      const std::string l = toLowerAscii(lhs.path().filename().string());
+                                      const std::string r = toLowerAscii(rhs.path().filename().string());
+                                      if (numbered(l) != numbered(r))
+                                          return !numbered(l);
+                                      return l < r;
+                                  });
 
                         for (const auto &entry : dirEntries)
                         {

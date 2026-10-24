@@ -40,6 +40,13 @@ extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
+// GLFW's gamepad mappings (from SDL's database, generated into mappings.h at
+// build time) only carry the device revisions it knew about. A pad whose
+// firmware reports a different revision matches nothing: it is detected, but
+// every button and axis reads zero. GLFW can be handed extra mappings at
+// runtime, which is how those are fixed without rebuilding.
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
 namespace
 {
     constexpr uint8_t kPadAnalogMarker = 0x73;
@@ -823,6 +830,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     const bool freeAimAllowed = settings.freeAim && context == ps2controls::OnFoot && m_freeAimProbe != nullptr &&
                                 m_freeAimRdram != nullptr && m_freeAimProbe(m_freeAimRdram);
     bool freeAimHeld = false;
+    bool moving = false; // movement input this frame (movingInput())
     constexpr int kPs2R1 = 11;
     // The game's pause flag only becomes visible next frame, so the prompt
     // art would show the gameplay keys for one frame after pressing Start.
@@ -932,6 +940,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         data[7] = static_cast<uint8_t>(128 + ly * 127);
         data[4] = static_cast<uint8_t>(128 + rx * 127);
         data[5] = static_cast<uint8_t>(128 + ry * 127);
+        moving = moving || std::fabs(lx) > 0.25f || std::fabs(ly) > 0.25f;
     }
 
     // Keyboard + mouse (modern GTA PC style by default, rebindable), merged
@@ -1074,11 +1083,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
                 if (held(pc::MoveBackward))
                     moveY += 1.0f;
             }
+            moving = moving || moveX != 0.0f || moveY != 0.0f;
         }
-        if (moveX != 0.0f)
-            data[6] = static_cast<uint8_t>(128 + moveX * 127);
-        if (moveY != 0.0f)
-            data[7] = static_cast<uint8_t>(128 + moveY * 127);
 
         // Weapon cycling: mouse wheel / the Next weapon key, as short R2
         // (next) / L2 (previous) presses. In the game's menus the wheel is the
@@ -1119,6 +1125,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             freeAimHeld = true;
     }
     m_freeAimHeld.store(freeAimHeld, std::memory_order_relaxed);
+    m_movingInput.store(moving, std::memory_order_relaxed);
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
     // Analog pressure, by PS2 button bit, for readPadPortData to pick up.

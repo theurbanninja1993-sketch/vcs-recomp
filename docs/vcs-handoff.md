@@ -674,6 +674,54 @@ capture route exists. That is the next real problem for the release, not this on
 recordings and was not verified to help. It is parked as `.so.off` in `build/`.
 Verify with the counters above before using the plugin again.
 
+## 2026-10-19 (Claude, later): the laptop build got past the compile and stopped in the VU1 learn
+
+The owner's log (`vcs-build.log`, 15:00) reached the learn step: tools, the Windows
+cross-compiler, the disc check (passed), extract, recompile, install and the port's
+compile all completed. The stop was the learn pass: `GLXBadFBConfig` (X error, GLX
+opcode 149) with `PS2X_HIDDEN_WINDOW=1`, which recorded nothing, so the launcher stopped
+with "no microprograms were recorded".
+
+- The "Warnings: 1206, errors: 604" in the recompile stage are the recompiler's
+  unhandled-instruction reports, expected for this ELF; they are not what stopped the build.
+- The hidden window is the likely cause: the same pass runs fine here, and the visible game
+  path never hits this error on the laptop. The handoff's own rule is that test runs use a
+  visible window for this reason.
+
+**Fix (launcher `src/builder.cpp`, committed locally):** a learn pass that records nothing
+is run once more with a visible window before the build gives up. A working machine never
+reaches the retry. Not verified on the laptop; compiled and reviewed.
+
+`build.sh` stage 5 still has the hidden-only pass. It is the development path, not what the
+owner's launcher runs, so it is left as it is for now.
+
+## 2026-10-19 (Claude, later): the learn pass failed again, and the visible-window retry did not help
+
+The owner's next log (`vcs-build.log`, 16:49) stopped at the same place. Both attempts failed
+with `GLXBadFBConfig`: the hidden window, then the visible retry. The learn pass also ran on
+`llvmpipe` (Mesa's software renderer), so the laptop's X display is not giving the game a GPU.
+
+**Launcher, local commit (not published):** a third attempt runs the learn pass under a private
+X server (`xvfb-run -a`) when the `xvfb` package is installed, and the WSL setup now installs it.
+Checked here: the VCS runner boots under `xvfb-run` with GL 4.6 (llvmpipe), no GLX error. Not
+verified on the laptop.
+
+## 2026-10-20 (Claude): the virtual-display pass hung on the learn step
+
+The owner's log on the stick (`vcs-build.log`, 07:01): the hidden and visible passes failed
+with `GLXBadFBConfig` as before, and then the virtual-display pass started and printed
+nothing. The owner came back hours later and the build was still on the learn step.
+
+**Cause:** the launcher wrapped the pass as `xvfb-run -a timeout 400 runner ...`. The 400 s
+timeout sat inside the X server, so an X server that never started had no limit at all.
+
+**Fix (launcher `6a4ba54`, local, not published):** the timeout now wraps the whole pass,
+`timeout 1800 xvfb-run -a runner ...`, and the virtual-display pass gets 1800 s, because it
+renders in software. The hidden and visible passes keep their 400 s.
+
+**Still open:** why the X server (or the game on it) does not start on the laptop. The log
+shows no game output for that pass, so the next run will tell us either way.
+
 ## If you are reviewing this
 
 Three things are waiting for a second pair of eyes, and they are the three worth

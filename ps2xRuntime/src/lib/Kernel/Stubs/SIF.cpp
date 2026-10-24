@@ -10,6 +10,8 @@
 #include <limits>
 #include <vector>
 
+extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
+
 namespace ps2_stubs
 {
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -697,6 +699,17 @@ namespace ps2_stubs
             }
 
             pending[pendingCount++] = xfer;
+            // PS2X_SIF_DMA_TRACE=<lo>,<hi>: log transfers into that IOP range.
+            static const char *s_traceEnv = std::getenv("PS2X_SIF_DMA_TRACE");
+            if (s_traceEnv)
+            {
+                static uint32_t s_lo = 0, s_hi = 0;
+                static const bool s_parsed = std::sscanf(s_traceEnv, "%x,%x", &s_lo, &s_hi) == 2;
+                if (s_parsed && xfer.dest >= s_lo && xfer.dest < s_hi)
+                    std::fprintf(stderr, "[sif:dma] f=%llu src=0x%x dst=0x%x size=0x%x\n",
+                                 static_cast<unsigned long long>(g_ps2PresentedFrameCounter.load(std::memory_order_relaxed)),
+                                 xfer.src, xfer.dest, static_cast<uint32_t>(xfer.size));
+            }
         }
 
         if (ok)

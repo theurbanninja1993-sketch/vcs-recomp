@@ -1,0 +1,27 @@
+# Builder / launcher manifest for one game (see games/vcs/game.toml).
+[game]
+id = "SLUS_214.23"
+name = "Grand Theft Auto: Liberty City Stories"
+region = "NTSC-U"
+# XXH3-128 of the boot ELF on the disc (ps2x_iso hash <image>).
+boot_file = "SLUS_214.23"
+boot_hash_xxh3_128 = "3d2280cadf1a74ce39e121d1ea6941b2"
+
+[recompiler]
+# The builder writes a copy with absolute paths: [general] input = the
+# extracted boot ELF, output = a work folder. LCS needs no function map: the
+# recompiler finds the functions itself (ghidra_output stays empty).
+config = "config/lcs-us.toml"
+
+[runtime]
+# Selected by the ELF's identity in ps2xRuntime/src/lib/game_overrides.cpp
+# (applyGtaLcsUs).
+override = "GTA Liberty City Stories (SLUS_214.23)"
+
+[vu1]
+# The learn passes: a new game (no memory card), through the opening, into the
+# car beside Toni and a short drive. Programs the route never reaches are
+# recorded while playing and compiled when the game closes.
+learn_passes = 2
+learn_pad_script = "100:cross:12;250:cross:12;400:cross:12;550:cross:12;900:cross:12;1200:cross:12;2100:cross:12;8800:triangle:20;9200:cross:4800;9700:sleft:90;10300:sright:150;11200:sleft:200;12100:sright:120;13000:sleft:100"
+learn_frames = 13500

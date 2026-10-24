@@ -23,6 +23,7 @@ namespace ps2x::iop::detail
             uint32_t address = 0u;
             uint32_t gp = 0u;
             uint32_t reason = 0u;
+            uint64_t deadlineCycle = 0u;
         };
 
         IopCdvd(IopHost &host, IopMemory &memory, IopKernel &kernel);
@@ -33,7 +34,9 @@ namespace ps2x::iop::detail
 
         void reset() noexcept;
 
-        [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
+        [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle = 0u);
+        void advanceCycles(uint64_t currentCycle);
+        [[nodiscard]] uint64_t completionCycle() const noexcept;
         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
 
     private:

@@ -26,6 +26,8 @@ extern std::atomic<uint32_t> g_gsGpuScaleRequest;
 // that read the game's blur accumulation buffers, so the picture stays sharp.
 // Both "Off" and "Modern" set it: Modern replaces the game's smear with its own.
 extern std::atomic<bool> g_gsMotionBlurOff;
+extern std::atomic<uint32_t> g_gsMotionBlurBase[2]; // per-game blur buffers (game override)
+extern std::atomic<bool> g_gsMotionBlurFrontTrail;
 // Settings > Display > Frame rate. 60 shows only the game's own frames; above
 // that the host presents faster and the frames in between are synthesized.
 extern std::atomic<uint32_t> g_gsFrameRate;

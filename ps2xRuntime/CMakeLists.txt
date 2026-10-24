@@ -487,6 +487,22 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_achievements.cpp
 )
 
+# xxHash (header-only, XXH_INLINE_ALL): XXH3-64 texture hashes as PCSX2
+# computes them (texture-pack replacement names). The root project points
+# FetchContent at vendor/deps/xxhash.
+include(FetchContent)
+FetchContent_Declare(
+    xxhash
+    GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
+    GIT_TAG v0.8.3
+    GIT_SHALLOW TRUE
+)
+FetchContent_GetProperties(xxhash)
+if(NOT xxhash_POPULATED)
+    FetchContent_Populate(xxhash)
+endif()
+target_include_directories(ps2_runtime PRIVATE "${xxhash_SOURCE_DIR}")
+
 # Host-CPU code generation for the runtime/IOP libraries (VU1 interpreter, GS
 # rasterizer, SPU2). FP contraction stays off so FMA can't change emulated
 # float results (verified with tools/vu1_replay).
@@ -587,7 +603,6 @@ endif()
 # Set to 0 (or remove) for release builds.
 target_compile_definitions(ps2_runtime PRIVATE
     PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
-    AGRESSIVE_LOGS=1
 )
 
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
@@ -598,9 +613,8 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
-file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
-)
+set(PS2X_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/runner" CACHE PATH "Generated game sources")
+file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS "${PS2X_GENERATED_DIR}/*.cpp")
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
@@ -637,8 +651,8 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        "${PS2X_GENERATED_DIR}/ps2_recompiled_functions.h"
+        "${PS2X_GENERATED_DIR}/ps2_recompiled_stubs.h")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()
@@ -702,6 +716,7 @@ if(UNIX AND NOT APPLE AND NOT PS2X_IS_ANDROID)
 elseif(WIN32)
     target_link_libraries(ps2_runtime PUBLIC opengl32 gdi32)
 endif()
+target_include_directories(ps2_runtime PUBLIC "${PS2X_GENERATED_DIR}")
 # raylib first on Windows: its CloseWindow and ShowCursor share names with USER32's,
 # lld takes the first archive on the line that offers a symbol, and FFmpeg's system
 # libraries otherwise put -luser32 ahead of raylib.

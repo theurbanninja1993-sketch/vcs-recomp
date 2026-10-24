@@ -5,6 +5,7 @@
 #include "ps2recomp/types.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
@@ -158,13 +159,56 @@ namespace ps2recomp
         ss << "PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[" << std::dec << (slotCount == 0u ? 1u : slotCount) << "u] = {};\n\n";
 
         ss << "namespace {\n";
+        // A single constructor with hundreds of thousands of stores is very
+        // expensive for host optimizers. Keep large tables as constant data;
+        // adjacent resumable entries with the same wrapper share one range.
+        // Small tables retain the simple form used by existing codegen tests.
+        const bool useRanges = entries.size() > 1024u;
+        if (useRanges)
+        {
+            ss << "struct GeneratedFunctionTableRange {\n";
+            ss << "    uint32_t first;\n";
+            ss << "    uint32_t end;\n";
+            ss << "    PS2Runtime::RecompiledFunction function;\n";
+            ss << "};\n";
+            ss << "static const GeneratedFunctionTableRange g_generatedFunctionTableRanges[] = {\n";
+            for (std::size_t i = 0; i < entries.size();)
+            {
+                const auto &[address, name] = entries[i];
+                std::size_t next = i + 1;
+                while (next < entries.size() &&
+                       entries[next].first == entries[next - 1].first + 4u &&
+                       entries[next].second == name)
+                {
+                    ++next;
+                }
+                const uint32_t first = (address - tableBase) >> 2;
+                const uint32_t end = ((entries[next - 1].first - tableBase) >> 2) + 1u;
+                ss << "    {" << std::dec << first << "u, " << end << "u, " << name
+                   << "}, // 0x" << std::hex << address << "..0x" << entries[next - 1].first
+                   << std::dec << "\n";
+                i = next;
+            }
+            ss << "};\n";
+        }
         ss << "struct GeneratedFunctionTableInitializer {\n";
         ss << "    GeneratedFunctionTableInitializer() {\n";
-        for (const auto &[address, name] : entries)
+        if (useRanges)
         {
-            const uint32_t slot = (address - tableBase) >> 2;
-            ss << "        g_ps2RecompiledFunctionTable[" << std::dec << slot << "] = " << name
-               << "; // 0x" << std::hex << address << std::dec << "\n";
+            ss << "        for (const auto &range : g_generatedFunctionTableRanges) {\n";
+            ss << "            for (uint32_t slot = range.first; slot < range.end; ++slot) {\n";
+            ss << "                g_ps2RecompiledFunctionTable[slot] = range.function;\n";
+            ss << "            }\n";
+            ss << "        }\n";
+        }
+        else
+        {
+            for (const auto &[address, name] : entries)
+            {
+                const uint32_t slot = (address - tableBase) >> 2;
+                ss << "        g_ps2RecompiledFunctionTable[" << std::dec << slot << "] = " << name
+                   << "; // 0x" << std::hex << address << std::dec << "\n";
+            }
         }
         ss << "    }\n";
         ss << "};\n";

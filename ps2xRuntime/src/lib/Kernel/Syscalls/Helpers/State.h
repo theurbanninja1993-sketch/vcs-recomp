@@ -3,6 +3,7 @@
 #include <cstddef>
 #include "runtime/ps2_spinlock.h"
 #include <cstdint>
+#include "runtime/ps2_spinlock.h"
 
 // Thread status
 #define THS_RUN 0x01
@@ -158,6 +159,14 @@ struct RpcServerState
 {
     uint32_t sid = 0;
     uint32_t sd_ptr = 0; // PS2 address
+    // Register-time descriptor fields (sceSifRegisterRpc), shadowed host-side so
+    // a clobbered guest descriptor can be fully repaired: the pools overlap
+    // guest RAM (see docs/sector-corruption.md), and the game sets these only
+    // once at registration. 0 = unset (registered fields are absent).
+    uint32_t func = 0;
+    uint32_t buf = 0;
+    uint32_t cbuf = 0;
+    uint32_t cfunc = 0;
 };
 
 struct RpcClientState
@@ -244,11 +253,17 @@ inline std::filesystem::path g_cdrom_cwd;
 inline std::string g_ps2_cwd_device = "host0";
 
 static constexpr uint32_t kRpcPacketSize = 64;
-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
-static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
+// The pools previously lived at 0x01F00000-0x01F1FFFF, inside guest heap the
+// game actively allocates (LCS streams up to ~0x1FE0000, and its IOP reply
+// buffers move around in there - see docs/sector-corruption.md). PS2X_REGION_WATCH
+// maps across scripted runs show 0x1FE0000-0x1FFD000 is never written (the gap
+// between the game's heap top and its stack), so the pools live there, 32 KiB
+// each. Slot counts stay far above what the game binds.
+static constexpr uint32_t kRpcPacketPoolBase = 0x01FE0000;
+static constexpr uint32_t kRpcPacketPoolBytes = 0x00008000;
 static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
-static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
+static constexpr uint32_t kRpcServerPoolBase = 0x01FE8000;
+static constexpr uint32_t kRpcServerPoolBytes = 0x00008000;
 static constexpr uint32_t kRpcServerStride = 0x80;
 static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
 

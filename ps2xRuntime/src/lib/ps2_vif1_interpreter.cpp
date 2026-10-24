@@ -622,6 +622,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
+                // V4-32 with no masking and no row/col mode is a pure copy and is
+                // the vertex-data workhorse. The per-vector loop below reads each
+                // destination lane (only to preserve masked fields, which are off
+                // here) and writes 16 bytes per vector; copy the whole run in at
+                // most two pieces instead, splitting at the 4 KiB VU-address wrap.
+                const uint32_t writeMode = vif1_regs.mode & 3u;
+                if (vl == 0u && components == 4 && !maskEnable && cl >= wl && (writeMode == 0u || writeMode == 3u) &&
+                    totalBytes == writeVectorCount * 16u)
+                {
+                    const uint8_t *copySrc = data + pos;
+                    const uint32_t firstVectors = std::min<uint32_t>(writeVectorCount, 0x400u - vuAddr);
+                    std::memcpy(m_vu1Data + static_cast<size_t>(vuAddr) * 16u, copySrc,
+                                static_cast<size_t>(firstVectors) * 16u);
+                    if (writeVectorCount > firstVectors)
+                        std::memcpy(m_vu1Data, copySrc + static_cast<size_t>(firstVectors) * 16u,
+                                    static_cast<size_t>(writeVectorCount - firstVectors) * 16u);
+                    pos += totalBytes;
+                    continue;
+                }
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
                 for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)

@@ -6,6 +6,14 @@
 #include <optional>
 #include <string>
 #include "runtime/gs/gs_gpu_backend.h"
+#if defined(__linux__)
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+// The GPU worker's thread id and CPU clock, for PS2X_PC_SAMPLE_GPU (LCS).
+std::atomic<int> g_ps2GsGpuWorkerTid{0}, g_ps2GsGpuWorkerClock{0};
 
 #include "runtime/gs/gpu/gs_gpu_renderer.h"
 
@@ -179,6 +187,14 @@ void GSGpuBackend::runSync(const std::function<void()> &fn, const char *why) con
 void GSGpuBackend::renderLoop()
 {
     ThreadNaming::SetCurrentThreadName("GsGpu");
+#if defined(__linux__)
+    clockid_t cpuClock{};
+    if (pthread_getcpuclockid(pthread_self(), &cpuClock) == 0)
+    {
+        g_ps2GsGpuWorkerClock.store(static_cast<int>(cpuClock));
+        g_ps2GsGpuWorkerTid.store(static_cast<int>(syscall(SYS_gettid)));
+    }
+#endif
     std::vector<Command> batch;
     for (;;)
     {

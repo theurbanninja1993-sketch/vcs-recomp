@@ -4,6 +4,7 @@
 #include <cstddef>
 #include "runtime/ps2_spinlock.h"
 #include <cstdint>
+#include "runtime/ps2_spinlock.h"
 #include <array>
 #include <functional>
 #include <vector>

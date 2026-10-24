@@ -5,12 +5,39 @@ static void setRegU32(R5900Context *ctx, int reg, uint32_t value)
     SET_GPR_U32(ctx, reg, value);
 }
 
-static void rpcCopyToRdram(uint8_t *rdram, uint32_t dst, uint32_t src, size_t size)
+static void rpcCopyToRdram(uint8_t *rdram, uint32_t dst, uint32_t src, size_t size,
+                           const char *site = "unknown")
 {
     if (!rdram || size == 0)
         return;
 
     ps2TraceGuestRangeWrite(rdram, dst, static_cast<uint32_t>(size), "rpcCopyToRdram", nullptr);
+
+    // PS2X_RPC_COPY_TRACE=<hexaddr>: opt-in diagnostic for an RPC copy whose
+    // destination range touches <addr>. Logs the call site, source pointer and
+    // the source bytes actually copied. Disabled by default; no behavior change.
+    static const uint32_t s_rpcTraceAddr = []() -> uint32_t
+    {
+        const char *env = std::getenv("PS2X_RPC_COPY_TRACE");
+        return env ? (static_cast<uint32_t>(std::strtoul(env, nullptr, 0)) & PS2_RAM_MASK & ~3u) : 0u;
+    }();
+    static std::atomic<uint32_t> s_rpcTraceLogs{0};
+    if (s_rpcTraceAddr != 0u && (s_rpcTraceAddr - (dst & PS2_RAM_MASK)) < size &&
+        s_rpcTraceLogs.fetch_add(1, std::memory_order_relaxed) < 128u)
+    {
+        char bytes[3 * 33];
+        size_t bi = 0;
+        for (size_t i = 0; i < size && i < 32u && bi + 3u <= sizeof(bytes); ++i)
+        {
+            const uint8_t *p = getConstMemPtr(rdram, src + static_cast<uint32_t>(i));
+            const int written = std::snprintf(bytes + bi, sizeof(bytes) - bi, "%02x", p ? *p : 0u);
+            if (written > 0)
+                bi += static_cast<size_t>(written);
+        }
+        bytes[bi] = '\0';
+        std::fprintf(stderr, "[rpc-copy] site=%s dst=0x%x src=0x%x size=%zu bytes=%s\n",
+                     site ? site : "?", dst, src, size, bytes);
+    }
 
     constexpr size_t kMaxRpcTransferBytes = 1u * 1024u * 1024u;
     const size_t clampedSize = std::min(size, kMaxRpcTransferBytes);
@@ -83,13 +110,31 @@ static bool readStackU32(uint8_t *rdram, uint32_t sp, uint32_t offset, uint32_t 
     return true;
 }
 
+// Legacy safety net: the pools are now at 0x01FE0000+ (outside the game's
+// heap), but if they ever return to guest-heap territory the allocators skip
+// the game's observed IOP reply window so neither side touches the other's
+// data. See docs/sector-corruption.md for the full overlap history.
+static constexpr uint32_t kGameReplyBufferBase = 0x1F0C080u;
+static constexpr uint32_t kGameReplyBufferBytes = 0x8000u;
+
+static bool rpcRangeHitsGameReply(uint32_t addr, uint32_t bytes)
+{
+    return addr < kGameReplyBufferBase + kGameReplyBufferBytes &&
+           addr + bytes > kGameReplyBufferBase;
+}
+
 static uint32_t rpcAllocPacketAddr(uint8_t *rdram)
 {
     if (kRpcPacketPoolCount == 0)
         return 0;
 
-    uint32_t slot = g_rpc_packet_index++ % kRpcPacketPoolCount;
-    uint32_t addr = kRpcPacketPoolBase + (slot * kRpcPacketSize);
+    uint32_t slot;
+    uint32_t addr;
+    do
+    {
+        slot = g_rpc_packet_index++ % kRpcPacketPoolCount;
+        addr = kRpcPacketPoolBase + (slot * kRpcPacketSize);
+    } while (rpcRangeHitsGameReply(addr, kRpcPacketSize));
     rpcZeroRdram(rdram, addr, kRpcPacketSize);
     return addr;
 }
@@ -99,8 +144,13 @@ static uint32_t rpcAllocServerAddr(uint8_t *rdram)
     if (kRpcServerPoolCount == 0)
         return 0;
 
-    uint32_t slot = g_rpc_server_index++ % kRpcServerPoolCount;
-    uint32_t addr = kRpcServerPoolBase + (slot * kRpcServerStride);
+    uint32_t slot;
+    uint32_t addr;
+    do
+    {
+        slot = g_rpc_server_index++ % kRpcServerPoolCount;
+        addr = kRpcServerPoolBase + (slot * kRpcServerStride);
+    } while (rpcRangeHitsGameReply(addr, kRpcServerStride));
     rpcZeroRdram(rdram, addr, kRpcServerStride);
     return addr;
 }

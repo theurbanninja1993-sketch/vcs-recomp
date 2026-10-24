@@ -5,6 +5,7 @@
 #include <chrono>
 #include <string>
 #include <map>
+#include <vector>
 #include <cstdlib>
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_platform.h"
@@ -47,9 +48,42 @@ namespace
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
     constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
-    constexpr auto kVBlankCatchUpLimit = std::chrono::microseconds(4000);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+
+    // PS2X_REGION_WATCH=<hexBase>,<hexSize>: once a second, report which 4 KiB
+    // pages of the region changed since the previous sweep (any writer: guest
+    // stores, host bulk copies, device workers). Opt-in diagnostic for mapping
+    // game-owned memory before relocating the runtime's RPC pools.
+    struct RegionWatch
+    {
+        uint32_t base = 0;
+        uint32_t bytes = 0;
+        bool firstSweep = true;
+        uint32_t reports = 0;
+        std::vector<uint32_t> pageHash;
+        std::vector<bool> reported;
+    };
+    RegionWatch s_regionWatch;
+    const bool s_regionWatchInit = []()
+    {
+        const char *env = std::getenv("PS2X_REGION_WATCH");
+        if (env)
+        {
+            uint32_t base = 0, bytes = 0;
+            if (std::sscanf(env, "%x,%x", &base, &bytes) == 2 && bytes != 0u &&
+                (base & 0x1FFFFFFFu) <= PS2_RAM_SIZE && bytes <= PS2_RAM_SIZE - (base & 0x1FFFFFFFu))
+            {
+                base &= 0x1FFFFFFFu;
+                s_regionWatch.base = base;
+                s_regionWatch.bytes = bytes;
+                const uint32_t pages = (bytes + 0xFFFu) >> 12;
+                s_regionWatch.pageHash.assign(pages, 0u);
+                s_regionWatch.reported.assign(pages, false);
+            }
+        }
+        return true;
+    }();
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
@@ -620,6 +654,14 @@ void ps2PerfLogVBlank(double lateMs, uint64_t eeCycle)
         // The lateness distribution: how many late VBlanks fell in each bucket
         // (<2, <5, <10, <20, <40, <80, <160, more ms). The aggregate hides
         // whether the stutter is a few big spikes or many small ones.
+        std::fprintf(s_file, " lateHist=");
+        for (size_t bin = 0; bin < kLateBins; ++bin)
+            std::fprintf(s_file, "%s%llu", bin == 0 ? "" : ",", static_cast<unsigned long long>(s_lateHist[bin]));
+        for (size_t bin = 0; bin < kLateBins; ++bin)
+            s_lateHist[bin] = 0;
+    }
+    {
+        // Lateness distribution (<5, <10, <20, <40, <80, <160, more ms).
         std::fprintf(s_file, " lateHist=");
         for (size_t bin = 0; bin < kLateBins; ++bin)
             std::fprintf(s_file, "%s%llu", bin == 0 ? "" : ",", static_cast<unsigned long long>(s_lateHist[bin]));
@@ -2299,6 +2341,39 @@ void EeScheduler::processEvent(const EeEvent &event)
         m_runtime.advanceIopVBlank();
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+        // PS2X_DUMP_RAM_VSYNC=<tick>[,<tick>...]: write EE RAM at an exact guest
+        // VBlank. PS2X_DUMP_RAM_FRAME only runs on the presentation path, which
+        // headless runs never take, so A/B memory probes had no deterministic
+        // trigger; this one fires on the executor thread at the exact tick.
+        {
+            static const std::vector<uint64_t> s_dumpVsyncs = []()
+            {
+                std::vector<uint64_t> ticks;
+                if (const char *env = std::getenv("PS2X_DUMP_RAM_VSYNC"))
+                {
+                    for (const char *p = env; *p;)
+                    {
+                        char *end = nullptr;
+                        ticks.push_back(std::strtoull(p, &end, 10));
+                        p = (*end == ',') ? end + 1 : end;
+                        if (end == p && *p != 0)
+                            break;
+                    }
+                }
+                return ticks;
+            }();
+            if (m_rdram && !s_dumpVsyncs.empty() &&
+                std::find(s_dumpVsyncs.begin(), s_dumpVsyncs.end(), m_vsyncTick) != s_dumpVsyncs.end())
+            {
+                const std::string path = "ram_v" + std::to_string(m_vsyncTick) + ".bin";
+                if (FILE *file = std::fopen(path.c_str(), "wb"))
+                {
+                    std::fwrite(m_rdram, 1, PS2_RAM_SIZE, file);
+                    std::fclose(file);
+                }
+                std::cerr << "[ram:dump] vsync=" << m_vsyncTick << std::endl;
+            }
+        }
         if ((m_vsyncTick & 1u) != 0u)
         {
             m_runtime.memory().gs().csr.fetch_or(0x2000ull, std::memory_order_acq_rel);
@@ -2315,6 +2390,31 @@ void EeScheduler::processEvent(const EeEvent &event)
             {
                 std::memcpy(m_rdram + physical, &m_vsyncTick, sizeof(m_vsyncTick));
             }
+        }
+        if (s_regionWatch.base != 0u && (m_vsyncTick % 60u) == 0u)
+        {
+            // 1 Hz sweep: FNV-1a per 4 KiB page, one report per changed page.
+            const uint32_t pages = static_cast<uint32_t>(s_regionWatch.pageHash.size());
+            for (uint32_t p = 0; p < pages; ++p)
+            {
+                const uint32_t addr = s_regionWatch.base + p * 0x1000u;
+                uint32_t h = 0x811C9DC5u;
+                for (uint32_t off = 0; off < 0x1000u; off += 4u)
+                {
+                    uint32_t w = 0u;
+                    std::memcpy(&w, m_rdram + addr + off, 4u);
+                    h = (h ^ w) * 0x01000193u;
+                }
+                if (!s_regionWatch.firstSweep && h != s_regionWatch.pageHash[p] &&
+                    !s_regionWatch.reported[p] && s_regionWatch.reports < 256u)
+                {
+                    ++s_regionWatch.reports;
+                    s_regionWatch.reported[p] = true;
+                    std::cerr << std::hex << "[region-watch] page 0x" << addr << " changed\n" << std::dec;
+                }
+                s_regionWatch.pageHash[p] = h;
+            }
+            s_regionWatch.firstSweep = false;
         }
         m_vsyncFlagAddress = 0u;
         m_vsyncTickAddress = 0u;

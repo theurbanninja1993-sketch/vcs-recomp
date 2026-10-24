@@ -443,11 +443,75 @@ void ps2AchievementsInit(uint8_t *rdram)
                  s_unlocked.size());
 }
 
+// PS2X_ACH_TRACE=0x004CD18C:f,0x0052FC74 prints each watched address whenever its
+// value changes, with the game frame it changed on: a byte, or a float with the ":f"
+// suffix. How a condition's address is checked against a real session, one frame at
+// a time, instead of by two dumps.
+static void traceWatchedAddresses(const uint8_t *rdram)
+{
+    struct Watch
+    {
+        uint32_t address;
+        bool isFloat;
+        uint32_t last;
+    };
+    static bool parsed = false;
+    static std::vector<Watch> watches;
+    static unsigned long long frame = 0;
+    ++frame;
+    if (!parsed)
+    {
+        parsed = true;
+        const char *spec = std::getenv("PS2X_ACH_TRACE");
+        std::string text = spec != nullptr ? spec : "";
+        size_t start = 0;
+        while (start < text.size())
+        {
+            size_t comma = text.find(',', start);
+            if (comma == std::string::npos)
+                comma = text.size();
+            std::string item = text.substr(start, comma - start);
+            start = comma + 1;
+            Watch watch{0, false, 0xFFFFFFFFu};
+            if (item.size() > 2 && item.compare(item.size() - 2, 2, ":f") == 0)
+            {
+                watch.isFloat = true;
+                item.resize(item.size() - 2);
+            }
+            watch.address = static_cast<uint32_t>(std::strtoul(item.c_str(), nullptr, 16)) & PS2_RAM_MASK;
+            watches.push_back(watch);
+        }
+    }
+    for (Watch &watch : watches)
+    {
+        uint32_t bits = 0;
+        if (watch.isFloat)
+            std::memcpy(&bits, rdram + watch.address, sizeof bits);
+        else
+            bits = rdram[watch.address];
+        if (bits == watch.last)
+            continue;
+        watch.last = bits;
+        if (watch.isFloat)
+        {
+            float value = 0.0f;
+            std::memcpy(&value, &bits, sizeof value);
+            std::fprintf(stderr, "[ach-trace] frame %llu  0x%08X = %g\n", frame, watch.address, value);
+        }
+        else
+        {
+            std::fprintf(stderr, "[ach-trace] frame %llu  0x%08X = %u\n", frame, watch.address, bits);
+        }
+    }
+}
+
 void ps2AchievementsFrame(uint8_t *rdram)
 {
     if (!s_ready || rdram == nullptr)
         return;
     s_rdram = rdram;
+    if (std::getenv("PS2X_ACH_TRACE") != nullptr)
+        traceWatchedAddresses(rdram);
     rc_runtime_do_frame(&s_runtime, onRuntimeEvent, readGuestMemory, rdram, nullptr);
 
     // A set that never fires is either a set whose addresses are wrong or an engine

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 namespace ps2x::iop::detail
 {
@@ -31,8 +33,8 @@ namespace ps2x::iop::detail
         std::fill(m_owned.begin(), m_owned.end(), uint8_t{0});
         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
         m_hardware.clear();
+        m_spuMadrAtEnd[0] = m_spuMadrAtEnd[1] = false;
         m_allocations.clear();
-        m_heapCursor = HeapBase;
         m_interruptStatus = 0;
         m_interruptMask = 0;
         m_interruptControl = 1;
@@ -247,6 +249,15 @@ namespace ps2x::iop::detail
         for (uint32_t core = 0; core < 2u; ++core)
         {
             const uint32_t chcr = core == 0u ? kDmaSpu0Chcr : kDmaSpu1Chcr;
+            if (address == chcr - 8u && m_spuMadrAtEnd[core] && !m_spu2.autoDmaActive(core))
+            {
+                // Between AutoDMA blocks: the hardware MADR stays at the end of the
+                // finished transfer until libsd programs the next one. Reading the
+                // start address back made the movie player's sceSdBlockTransStatus
+                // jump 12 KiB backwards, so it stopped refilling and the SPU looped
+                // stale audio (stuttering logo/cutscene sound).
+                return m_spu2.autoDmaAddress(core);
+            }
             if ((address != chcr && address != chcr - 8u) || !m_spu2.autoDmaActive(core))
                 continue;
             if (address == chcr - 8u)
@@ -288,6 +299,8 @@ namespace ps2x::iop::detail
         }
 
         m_hardware[address] = value;
+        if (address == kDmaSpu0Chcr - 8u || address == kDmaSpu1Chcr - 8u)
+            m_spuMadrAtEnd[address == kDmaSpu1Chcr - 8u ? 1u : 0u] = false;
         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
             return;
 
@@ -301,6 +314,7 @@ namespace ps2x::iop::detail
         if (const auto it = m_hardware.find(address - 4u); it != m_hardware.end())
             bcr = it->second;
         const uint64_t delay = m_spu2.startDma(secondCore ? 1u : 0u, m_ram.data(), m_ram.size(), madr, bcr, value);
+        m_spuMadrAtEnd[secondCore ? 1u : 0u] = m_spu2.autoDmaActive(secondCore ? 1u : 0u);
         // AutoDMA transfers complete as the SPU2 plays them (see Spu2::takeDmaIrqMask).
         if (delay != 0u)
             m_dmaStart = DmaStart{secondCore ? kDmaSpu1Irq : kDmaSpu0Irq, delay};
@@ -315,42 +329,44 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::allocate(uint32_t size, uint32_t alignment, std::optional<uint32_t> fixed)
     {
+        // Reject oversized requests before rounding, which could otherwise wrap.
+        if (size > HeapLimit - HeapBase)
+            return 0u;
         size = alignUp(std::max(size, 1u), 16u);
         alignment = std::max<uint32_t>(alignment, 4u);
+        if ((alignment & (alignment - 1u)) != 0u || alignment > HeapLimit)
+            return 0u;
+        uint32_t candidate = alignUp(HeapBase, alignment);
         if (fixed)
         {
-            const uint32_t address = *fixed;
-            if (address < HeapBase || address + size > HeapLimit)
+            candidate = *fixed;
+            if (candidate < HeapBase || candidate > HeapLimit || size > HeapLimit - candidate)
                 return 0u;
             for (const auto &block : m_allocations)
-                if (address < block.address + block.size && block.address < address + size)
+                if (candidate < block.address + block.size && block.address < candidate + size)
                     return 0u;
-            m_allocations.push_back({address, size});
-            markOwned(address, size);
-            return address;
         }
-
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
-        for (;;)
+        else
         {
-            bool overlap = false;
+            // Keep live blocks sorted and choose the first fitting gap. A freed
+            // block becomes available immediately, including below live modules.
             for (const auto &block : m_allocations)
             {
-                if (candidate < block.address + block.size && block.address < candidate + size)
-                {
-                    candidate = alignUp(block.address + block.size, alignment);
-                    overlap = true;
+                if (candidate <= block.address && size <= block.address - candidate)
                     break;
-                }
+                candidate = alignUp(block.address + block.size, alignment);
             }
-            if (!overlap)
-                break;
         }
         if (candidate > HeapLimit || size > HeapLimit - candidate)
             return 0u;
-        m_allocations.push_back({candidate, size});
+        const auto insertion = std::lower_bound(m_allocations.begin(), m_allocations.end(), candidate,
+                                                [](const Allocation &block, uint32_t address)
+                                                { return block.address < address; });
+        m_allocations.insert(insertion, {candidate, size});
         markOwned(candidate, size);
-        m_heapCursor = std::max(m_heapCursor, candidate + size);
+        if (std::getenv("PS2X_IOP_ALLOC_TRACE"))
+            std::fprintf(stderr, "[iop:alloc] address=0x%x size=0x%x maxFree=%u totalFree=%u\n",
+                         candidate, size, maxFreeMemory(), totalFreeMemory());
         return candidate;
     }
 
@@ -364,13 +380,32 @@ namespace ps2x::iop::detail
         std::fill(m_owned.begin() + block->address,
                   m_owned.begin() + block->address + block->size,
                   uint8_t{0});
+        const uint32_t freedSize = block->size;
         m_allocations.erase(block);
+        if (std::getenv("PS2X_IOP_ALLOC_TRACE"))
+            std::fprintf(stderr, "[iop:free] address=0x%x size=0x%x maxFree=%u totalFree=%u\n",
+                         address, freedSize, maxFreeMemory(), totalFreeMemory());
         return true;
     }
 
     uint32_t IopMemory::maxFreeMemory() const
     {
-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        uint32_t cursor = HeapBase;
+        uint32_t largest = 0u;
+        for (const auto &block : m_allocations)
+        {
+            largest = std::max(largest, block.address - cursor);
+            cursor = block.address + block.size;
+        }
+        return std::max(largest, HeapLimit - cursor);
+    }
+
+    uint32_t IopMemory::totalFreeMemory() const
+    {
+        uint32_t free = HeapLimit - HeapBase;
+        for (const auto &block : m_allocations)
+            free -= block.size;
+        return free;
     }
 
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const

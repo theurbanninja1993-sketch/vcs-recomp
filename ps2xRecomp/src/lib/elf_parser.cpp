@@ -1431,6 +1431,20 @@ namespace
                 uint32_t target = 0;
                 if (ReadSectionWord(section, offset, target) && (target % MIPS_INSTRUCTION_SIZE) == 0 && FindCodeSectionByAddress(sections, target))
                 {
+                    // Raw pointer clusters provide heuristic evidence only.
+                    // A saved-RA instruction in a branch delay slot can look
+                    // like a prologue, but promoting it truncates the real
+                    // owner's branch and drops its delay-slot side effects.
+                    // Explicit call targets/entry hints remain independent.
+                    const auto *code = FindCodeSectionByAddress(sections, target);
+                    const uint32_t targetOffset = target - code->address;
+                    uint32_t predecessor = 0u;
+                    if (targetOffset >= MIPS_INSTRUCTION_SIZE &&
+                        ReadSectionWord(*code, targetOffset - MIPS_INSTRUCTION_SIZE, predecessor) &&
+                        IsControlTransfer(predecessor))
+                    {
+                        continue;
+                    }
                     candidates.push_back({offset, target, LooksLikeCallableEntry(sections, target, true)});
                 }
             }
