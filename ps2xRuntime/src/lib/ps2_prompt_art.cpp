@@ -13,6 +13,7 @@
 // The runtime cannot reuse the Python tools, so everything is drawn with
 // raylib's image API and exported as PNGs. Alpha is written in the GS scale
 // (0x80 = opaque) the replacement pipeline expects.
+#include "runtime/gs/gs_texture_capture.h"
 #include "runtime/ps2_prompt_art.h"
 
 #include "runtime/ps2_platform.h"
@@ -545,7 +546,33 @@ bool ps2PromptArtRefreshIfNeeded()
     static int s_pendingFrames = 0;
 
     const int context = artContextValue();
-    const uint64_t sig = effectiveSignature(set);
+    uint64_t sig = effectiveSignature(set);
+    // The HUD tutorial sheet is drawn over the game's own font texture, captured
+    // from the running game (it comes from the disc, so it cannot ship with the
+    // source). Until the capture lands the sheet is skipped; when it does, the
+    // art is written again.
+    const fs::path capturedSheet = fs::path(ps2PromptArtDirectory()) / "_base" / kSheetName;
+    static bool s_sheetBaseSeen = false;
+    {
+        std::error_code ec;
+        const bool haveBase = fs::exists(fs::path(ps2PromptsDirectory()) / set / kSheetName, ec) ||
+                              fs::exists(capturedSheet, ec);
+        if (!haveBase)
+        {
+            static bool s_requested = false;
+            if (!s_requested)
+            {
+                s_requested = true;
+                gsTextureCaptureRequest(kSheetName, capturedSheet.string());
+            }
+        }
+        else if (!s_sheetBaseSeen)
+        {
+            s_sheetBaseSeen = true;
+            s_appliedSig = 0; // write the art again, now with the sheet
+        }
+        sig ^= s_sheetBaseSeen ? 0x5EE7ull : 0u;
+    }
     if (sig == s_appliedSig && set == s_appliedSet)
     {
         s_pendingFrames = 0;
@@ -609,7 +636,12 @@ bool ps2PromptArtRefreshIfNeeded()
         UnloadImage(img);
     }
 
-    const fs::path shipped = fs::path(ps2PromptsDirectory()) / set / kSheetName;
+    fs::path shipped = fs::path(ps2PromptsDirectory()) / set / kSheetName;
+    {
+        std::error_code ec;
+        if (!fs::exists(shipped, ec))
+            shipped = capturedSheet; // the game's own, captured while playing
+    }
     if (Image sheet = LoadImage(shipped.string().c_str()); sheet.data != nullptr)
     {
         for (const SheetCell &cell : kSheetCells)
