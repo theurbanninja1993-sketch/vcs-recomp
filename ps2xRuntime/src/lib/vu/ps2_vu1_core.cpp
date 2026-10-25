@@ -1821,6 +1821,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][3] = 1.0f;
     // Recompiled programs assume the default (fast-commit) pipeline model.
     m_compiledEntry = fastCommitEnabled() ? lookupCompiled(vuCode, codeSize, memory, m_state.pc) : nullptr;
+    m_ranRegion = m_compiledEntry != nullptr && m_lastLookupRegion;
     if (m_unit == Unit::VU1)
         (m_compiledEntry ? g_ps2Vu1CompiledCalls : g_ps2Vu1InterpretedCalls).fetch_add(1, std::memory_order_relaxed);
     // The VU's own cycles over this run, accumulated once per call. Read here
@@ -1853,6 +1854,8 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
 std::atomic<uint64_t> g_ps2Vu1ExitEnded{0}, g_ps2Vu1ExitBudget{0}, g_ps2Vu1ExitContinue{0};
 // Hand-overs from one compiled program to another at a jump (see run()).
 std::atomic<uint64_t> g_ps2Vu1ChainedCalls{0};
+// Compiled runs that still finished in the interpreter (no compiled code at a jump target).
+std::atomic<uint64_t> g_ps2Vu1FellBack{0};
 
 // Host CPU time spent inside run(), split by unit. VU0 and VU1 share this
 // interpreter class but only VU1 has a compiled path (lookupCompiled requires
@@ -1964,11 +1967,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             s_cycles += m_cycle - before;
             ++s_exits[exit & 3];
             static int s_logged = 0;
-            if (exit == VU1CompiledContinue && s_logged++ < 12)
+            if (exit == VU1CompiledContinue && s_logged++ < (std::getenv("PS2X_VU1_CONTINUE_ALL") ? 1000000 : 12))
                 std::cerr << "[vu1:continue] entry=0x" << std::hex << entryPcForStats << " exitPc=0x" << m_state.pc << std::dec << std::endl;
             if ((s_calls & 1023u) == 0u)
                 std::cerr << "[vu1:compiled] calls=" << s_calls << " tsc/call=" << s_tsc / s_calls << " cycles/call=" << s_cycles / s_calls << " ended=" << s_exits[0]
-                          << " budget=" << s_exits[1] << " continue=" << s_exits[2] << " lastExitPc=0x" << std::hex << m_state.pc
+                          << " budget=" << s_exits[1] << " continue=" << s_exits[2]
+                          << " chained=" << g_ps2Vu1ChainedCalls.load() << " fellBack=" << g_ps2Vu1FellBack.load() << " lastExitPc=0x" << std::hex << m_state.pc
                           << std::dec << std::endl;
         }
         compiled = nullptr;
@@ -1976,11 +1980,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         {
             compiled = lookupCompiled(vuCode, codeSize, memory, m_state.pc);
             if (compiled != nullptr)
+            {
                 g_ps2Vu1ChainedCalls.fetch_add(1u, std::memory_order_relaxed);
+                m_ranRegion = m_ranRegion || m_lastLookupRegion;
+            }
             else
             {
                 m_leftCompiled = true;
                 m_leftCompiledAt = m_state.pc;
+                g_ps2Vu1FellBack.fetch_add(1u, std::memory_order_relaxed);
+                static const bool s_logFallBack = std::getenv("PS2X_VU1_FALLBACK_LOG") != nullptr;
+                if (s_logFallBack)
+                    std::cerr << "[vu1:fallback] from=0x" << std::hex << entryPcForStats << " at=0x" << m_state.pc
+                              << std::dec << std::endl;
             }
         }
     }

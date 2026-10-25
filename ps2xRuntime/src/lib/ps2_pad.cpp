@@ -40,13 +40,6 @@ extern std::atomic<uint64_t> g_ps2PresentedFrameCounter;
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
-// GLFW's gamepad mappings (from SDL's database, generated into mappings.h at
-// build time) only carry the device revisions it knew about. A pad whose
-// firmware reports a different revision matches nothing: it is detected, but
-// every button and axis reads zero. GLFW can be handed extra mappings at
-// runtime, which is how those are fixed without rebuilding.
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
 namespace
 {
     constexpr uint8_t kPadAnalogMarker = 0x73;
@@ -1085,6 +1078,10 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             }
             moving = moving || moveX != 0.0f || moveY != 0.0f;
         }
+        if (moveX != 0.0f)
+            data[6] = static_cast<uint8_t>(128 + moveX * 127);
+        if (moveY != 0.0f)
+            data[7] = static_cast<uint8_t>(128 + moveY * 127);
 
         // Weapon cycling: mouse wheel / the Next weapon key, as short R2
         // (next) / L2 (previous) presses. In the game's menus the wheel is the
