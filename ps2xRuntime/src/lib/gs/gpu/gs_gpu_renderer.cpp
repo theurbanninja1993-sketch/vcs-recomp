@@ -1,3 +1,4 @@
+#include <map>
 #include "runtime/gs/gpu/gs_gpu_renderer.h"
 
 #include "runtime/gs/gs_cpu_backend.h"
@@ -7,6 +8,7 @@
 #include "runtime/ps2_host_settings.h" // smoothFiltering: the shared display texture's filter
 
 #include "ThreadNaming.h"
+#include "runtime/gs/gs_texture_capture.h"
 #include "raylib.h" // PS2X_TEXREPL_DUMP: ExportImage writes the dumped PNGs
 
 #define XXH_INLINE_ALL
@@ -90,6 +92,21 @@ std::atomic<uint32_t> g_gsGpuPresentHeight{0};
 std::atomic<bool> g_gsGpuActive{false};
 char g_gsGpuInfo[160]{};
 extern std::atomic<uint64_t> g_ps2PresentedFrameCounter; // EeScheduler.cpp (dump index)
+
+// ---------------------------------------------------------- texture capture
+namespace
+{
+    std::mutex g_captureMutex;
+    std::map<std::string, std::string> g_captureRequests; // key name -> PNG path
+    std::atomic<bool> g_captureWanted{false};
+}
+
+void gsTextureCaptureRequest(const std::string &keyName, const std::string &path)
+{
+    std::lock_guard<std::mutex> lock(g_captureMutex);
+    g_captureRequests[keyName] = path;
+    g_captureWanted.store(true, std::memory_order_release);
+}
 
 // ------------------------------------------------------------- dump worker
 // PS2X_TEXREPL_DUMP writes from a background thread: PNG encoding on the
@@ -3191,8 +3208,29 @@ void main()
     void Renderer::dumpReplacementTexture(const GSDrawState &state, const gsrepl::Key &key)
     {
         const char *dir = std::getenv("PS2X_TEXREPL_DUMP");
-        if (!dir || !*dir || !m_cpu || !m_vram)
+        if (!dir || !*dir)
             return;
+        DumpJob job;
+        if (!decodeReplacementTexture(state, job.rgba, job.width, job.height))
+            return;
+        const GSTex0Reg &dumpTex0 = state.context.tex0;
+        job.tbp0 = dumpTex0.tbp0;
+        job.tbw = dumpTex0.tbw;
+        job.psm = dumpTex0.psm;
+        job.tw = dumpTex0.tw;
+        job.th = dumpTex0.th;
+        job.frame = g_ps2PresentedFrameCounter.load(std::memory_order_relaxed);
+        std::snprintf(job.name, sizeof(job.name), "%016llx-%016llx-%08x.png", static_cast<unsigned long long>(key.tex0Hash),
+                      static_cast<unsigned long long>(key.clutHash), key.bits);
+        // Encoded off-thread: PNG compression on the render thread stutters.
+        enqueueDump(std::move(job));
+    }
+
+    bool Renderer::decodeReplacementTexture(const GSDrawState &state, std::vector<uint8_t> &out, int &outWidth,
+                                            int &outHeight)
+    {
+        if (!m_cpu || !m_vram)
+            return false;
         const GSContext &ctx = state.context;
         const GSTex0Reg &tex0 = ctx.tex0;
         const uint32_t psm = tex0.psm & 0x3Fu;
@@ -3202,11 +3240,11 @@ void main()
         // see every drawn texture.
         static const bool s_anyFormat = std::getenv("PS2X_TEXREPL_DUMP_ALL") != nullptr;
         if (!palettized && psm != PSM_CT32 && psm != PSM_CT24 && psm != PSM_CT16 && psm != PSM_CT16S && !s_anyFormat)
-            return;
+            return false;
         const uint32_t width = 1u << std::min<uint32_t>(tex0.tw, 10u);
         const uint32_t height = 1u << std::min<uint32_t>(tex0.th, 10u);
         if (width == 0u || height == 0u)
-            return;
+            return false;
         // Skip very large textures while hunting glyphs: copying 1-4 MB
         // buffers per dump stutters the render thread. Raise via
         // PS2X_TEXREPL_DUMP_MAX (edge length, default 512) when needed.
@@ -3216,7 +3254,7 @@ void main()
             return env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 512u;
         }();
         if (width > s_maxEdge || height > s_maxEdge)
-            return;
+            return false;
         // Palette for palettized textures, expanded like hashClut does.
         uint32_t palette[256] = {};
         if (palettized)
@@ -3265,20 +3303,10 @@ void main()
                 }
                 std::memcpy(rgba.data() + (size_t(y) * width + x) * 4u, &c, 4u);
             }
-        DumpJob job;
-        job.rgba = std::move(rgba);
-        job.width = static_cast<int>(width);
-        job.height = static_cast<int>(height);
-        job.tbp0 = tex0.tbp0;
-        job.tbw = tex0.tbw;
-        job.psm = tex0.psm;
-        job.tw = tex0.tw;
-        job.th = tex0.th;
-        job.frame = g_ps2PresentedFrameCounter.load(std::memory_order_relaxed);
-        std::snprintf(job.name, sizeof(job.name), "%016llx-%016llx-%08x.png", static_cast<unsigned long long>(key.tex0Hash),
-                      static_cast<unsigned long long>(key.clutHash), key.bits);
-        // Encoded off-thread: PNG compression on the render thread stutters.
-        enqueueDump(std::move(job));
+        out = std::move(rgba);
+        outWidth = static_cast<int>(width);
+        outHeight = static_cast<int>(height);
+        return true;
     }
 
     GLuint Renderer::replacementTexture(const GSDrawState &state)
@@ -3356,6 +3384,33 @@ void main()
         if (const char *dumpDir = std::getenv("PS2X_TEXREPL_DUMP"); dumpDir && *dumpDir &&
                                                                         m_dumpedTextures.insert(key).second)
             dumpReplacementTexture(state, key);
+        if (g_captureWanted.load(std::memory_order_acquire))
+        {
+            char name[64];
+            std::snprintf(name, sizeof(name), "%016llx-%016llx-%08x.png", static_cast<unsigned long long>(key.tex0Hash),
+                          static_cast<unsigned long long>(key.clutHash), key.bits);
+            std::string path;
+            {
+                std::lock_guard<std::mutex> lock(g_captureMutex);
+                const auto it = g_captureRequests.find(name);
+                if (it != g_captureRequests.end())
+                {
+                    path = it->second;
+                    g_captureRequests.erase(it);
+                    g_captureWanted.store(!g_captureRequests.empty(), std::memory_order_release);
+                }
+            }
+            std::vector<uint8_t> rgba;
+            int width = 0, height = 0;
+            if (!path.empty() && decodeReplacementTexture(state, rgba, width, height))
+            {
+                // Once per texture and small (a font sheet): written right here.
+                std::error_code ec;
+                std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+                ::Image image{rgba.data(), width, height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                ExportImage(image, path.c_str());
+            }
+        }
         // Settled answer from a previous draw of this same texture: one lookup
         // instead of two, and no Key comparison in either map.
         if (hashed.resolved)

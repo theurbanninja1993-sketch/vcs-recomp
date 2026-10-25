@@ -271,6 +271,8 @@ namespace gsgpu
         // the same naming PCSX2 uses. For authoring packs (e.g. button-prompt
         // sets); the RGBA expansion is best effort for identification.
         void dumpReplacementTexture(const GSDrawState &state, const gsrepl::Key &key);
+        // The texture as the game drew it, as RGBA (dumps and captures).
+        bool decodeReplacementTexture(const GSDrawState &state, std::vector<uint8_t> &rgba, int &width, int &height);
         uint64_t hashTextureMemory(const GSDrawState &state);
         uint64_t hashClut(const GSDrawState &state);
         // CPU-copy bookkeeping for [begin, end): a write happened; `cpuStale`:

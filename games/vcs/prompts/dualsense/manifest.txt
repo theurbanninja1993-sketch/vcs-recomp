@@ -1,0 +1,10 @@
+controller=preview_controller.png
+cross=preview_cross.png
+triangle=preview_triangle.png
+dpad_up=preview_dpad_up.png
+dpad_down=preview_dpad_down.png
+dpad_left=preview_dpad_left.png
+dpad_right=preview_dpad_right.png
+map_zoom_l=preview_map_zoom_l.png
+map_zoom_r=preview_map_zoom_r.png
+map_target=preview_map_target.png
