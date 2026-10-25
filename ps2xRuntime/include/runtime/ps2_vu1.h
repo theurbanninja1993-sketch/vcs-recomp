@@ -42,10 +42,28 @@ struct VU1CompiledRegion
     VU1CompiledFn run;
     uint32_t codeSize; // the unit: 4 KB VU0, 16 KB VU1
     uint32_t start, end;
-    const uint32_t *entries; // where it can be entered, sorted
+    const uint32_t *entries;   // where it can be entered, sorted
+    const uint64_t *entryKeys; // per entry: ps2Vu1RegionEntryKey when compiled
     uint32_t entryCount;
+    uint32_t delayEnd;         // end, or end + 8 when its last pair's delay slot lies past it
+    const uint32_t *cuts;      // edges of other uploads inside it, sorted: segments
+    uint32_t cutCount;
 };
-uint64_t ps2Vu1RegionKey(const uint8_t *code, uint32_t codeSize, uint32_t start, uint32_t end);
+// Key of what a region runs when entered at `entry`: the pairs reachable from it
+// without leaving [start, end) (delay slots up to delayEnd) and without following
+// JR/JALR. Code elsewhere in the region does not change it, so an upload that
+// overwrites part of the region leaves the other entries valid.
+// `cuts` split the region into segments where other uploads begin or end: the
+// pairs stop at the edge of the entry's segment (the code past it can be another
+// upload's), with a delay slot allowed just past it.
+uint64_t ps2Vu1RegionEntryKey(const uint8_t *code, uint32_t codeSize, uint32_t entry, uint32_t start, uint32_t end,
+                              uint32_t delayEnd, const uint32_t *cuts = nullptr, uint32_t cutCount = 0);
+void ps2Vu1RegionEntryPairs(const uint8_t *code, uint32_t codeSize, uint32_t entry, uint32_t start, uint32_t end,
+                            uint32_t delayEnd, std::vector<uint32_t> &pairs, const uint32_t *cuts = nullptr,
+                            uint32_t cutCount = 0);
+// The segment [from, to) of the region holding pc.
+void ps2Vu1RegionSegment(uint32_t pc, uint32_t start, uint32_t end, const uint32_t *cuts, uint32_t cutCount,
+                         uint32_t &from, uint32_t &to);
 
 // Key of the program entered at startPC: entry, plus the address and words of
 // every pair reachable from it (and from `roots`) without following JR/JALR.
@@ -339,9 +357,12 @@ private:
     // (code generation, entry PC) -> program cache behind it.
     VU1CompiledFn m_compiledEntry = nullptr;
     bool m_leftCompiled = false; // see leftCompiledLastRun()
+    bool m_ranRegion = false;     // see ranRegionLastRun()
+    bool m_lastLookupRegion = false;
     uint32_t m_leftCompiledAt = 0;
     uint64_t m_compiledGeneration = ~0ull;
     const uint8_t *m_compiledCode = nullptr;
+    uint64_t m_lookupGeneration = 0; // the code generation the last lookup saw
     // Lookups per entry PC: the result for the current code generation, and
     // the code layouts seen before (games cycle through a few), each with the
     // words (pc, lower, upper) its lookup depended on.
@@ -349,11 +370,13 @@ private:
     {
         std::vector<uint32_t> words;
         VU1CompiledFn fn = nullptr;
+        bool region = false; // fn is a region compiled from the ELF
     };
     struct CompiledCacheEntry
     {
         uint64_t generation = ~0ull;
         VU1CompiledFn fn = nullptr;
+        bool region = false;
         std::vector<CompiledLayout> layouts; // most recently used first
     };
     std::unordered_map<uint32_t, CompiledCacheEntry> m_compiledCache;
@@ -368,6 +391,9 @@ public:
     // compiled program at its target, so the rest ran interpreted. The runtime
     // records such runs, so the missing target can be compiled too.
     bool leftCompiledLastRun() const { return m_leftCompiled; }
+    // The last run used code compiled from the ELF (a region) somewhere: recorded
+    // too, so the compile after play can make precise programs of it.
+    bool ranRegionLastRun() const { return m_ranRegion; }
     uint32_t leftCompiledAt() const { return m_leftCompiledAt; } // the jump target it left at
     VU1CompiledFn lookupCompiled(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t startPC);
 

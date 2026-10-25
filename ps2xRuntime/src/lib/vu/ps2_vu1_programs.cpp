@@ -183,8 +183,93 @@ void ps2Vu1ProgramPairs(const uint8_t *code, uint32_t codeSize, uint32_t startPC
     }
 }
 
-uint64_t ps2Vu1RegionKey(const uint8_t *code, uint32_t codeSize, uint32_t start, uint32_t end)
+void ps2Vu1RegionSegment(uint32_t pc, uint32_t start, uint32_t end, const uint32_t *cuts, uint32_t cutCount,
+                         uint32_t &from, uint32_t &to)
 {
+    from = start;
+    to = end;
+    for (uint32_t i = 0; i < cutCount; ++i)
+    {
+        if (cuts[i] <= pc && cuts[i] > from)
+            from = cuts[i];
+        if (cuts[i] > pc && cuts[i] < to)
+            to = cuts[i];
+    }
+}
+
+void ps2Vu1RegionEntryPairs(const uint8_t *code, uint32_t codeSize, uint32_t entry, uint32_t start, uint32_t end,
+                            uint32_t delayEnd, std::vector<uint32_t> &pairs, const uint32_t *cuts, uint32_t cutCount)
+{
+    pairs.clear();
+    if (entry < start || entry >= end || delayEnd > codeSize)
+        return;
+    {
+        // Only the entry's segment; its delay slot may lie just past it.
+        uint32_t from = start, to = end;
+        ps2Vu1RegionSegment(entry, start, end, cuts, cutCount, from, to);
+        if (to < end)
+            delayEnd = to + 8u;
+        start = from;
+        end = to;
+    }
+    std::vector<uint8_t> seen((delayEnd - start) / 8u, 0u);
+    std::vector<uint32_t> work = {entry};
+    seen[(entry - start) / 8u] = 1u;
+    auto addNormal = [&](uint32_t pc)
+    {
+        if (pc < start || pc >= end || (pc & 7u))
+            return; // leaves the region: compiled code hands over there
+        uint8_t &mark = seen[(pc - start) / 8u];
+        if (!(mark & 1u))
+        {
+            mark |= 1u;
+            work.push_back(pc);
+        }
+    };
+    auto addDelay = [&](uint32_t pc)
+    {
+        if (pc >= start && pc < delayEnd)
+            seen[(pc - start) / 8u] |= 2u;
+    };
+    while (!work.empty())
+    {
+        const uint32_t pc = work.back();
+        work.pop_back();
+        const uint32_t lower = loadWord(code, pc);
+        const uint32_t upper = loadWord(code, pc + 4u);
+        const bool iBit = (upper & 0x80000000u) != 0u;
+        const bool eBit = (upper & 0x40000000u) != 0u;
+        const uint32_t opHi = iBit ? 0xFFu : (lower >> 25) & 0x7Fu;
+        const bool branch = opHi == 0x20u || opHi == 0x21u || opHi == 0x24u || opHi == 0x25u || opHi == 0x28u ||
+                            opHi == 0x29u || (opHi >= 0x2Cu && opHi <= 0x2Fu);
+        if (eBit)
+        {
+            addDelay(pc + 8u);
+            continue;
+        }
+        if (!branch)
+        {
+            addNormal(pc + 8u);
+            continue;
+        }
+        addDelay(pc + 8u);
+        if (opHi == 0x24u || opHi == 0x25u)
+            continue; // JR/JALR: always hands over (the target's own key is checked)
+        const int32_t imm = static_cast<int32_t>(lower << 21) >> 21;
+        addNormal((pc + 8u + static_cast<uint32_t>(imm * 8)) & (codeSize - 1u));
+        if (opHi != 0x20u)
+            addNormal(pc + 16u); // fall-through or call return point
+    }
+    for (uint32_t i = 0; i < seen.size(); ++i)
+        if (seen[i])
+            pairs.push_back(start + i * 8u);
+}
+
+uint64_t ps2Vu1RegionEntryKey(const uint8_t *code, uint32_t codeSize, uint32_t entry, uint32_t start, uint32_t end,
+                              uint32_t delayEnd, const uint32_t *cuts, uint32_t cutCount)
+{
+    std::vector<uint32_t> pairs;
+    ps2Vu1RegionEntryPairs(code, codeSize, entry, start, end, delayEnd, pairs, cuts, cutCount);
     uint64_t hash = 1469598103934665603ull;
     auto mix = [&](uint32_t value)
     {
@@ -195,10 +280,13 @@ uint64_t ps2Vu1RegionKey(const uint8_t *code, uint32_t codeSize, uint32_t start,
         }
     };
     mix(codeSize);
-    mix(start);
-    mix(end);
-    for (uint32_t pc = start; pc + 4u <= end && pc + 4u <= codeSize; pc += 4u)
+    mix(entry);
+    for (uint32_t pc : pairs)
+    {
+        mix(pc);
         mix(loadWord(code, pc));
+        mix(loadWord(code, pc + 4u));
+    }
     return hash;
 }
 
@@ -246,6 +334,7 @@ VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t cod
     if (vu1 ? vuCode != memory->getVU1Code() : vuCode != memory->getVU0Code())
         return nullptr;
     const uint64_t generation = vu1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
+    m_lookupGeneration = generation;
     if (vuCode != m_compiledCode)
     {
         m_compiledCode = vuCode;
@@ -253,7 +342,10 @@ VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t cod
     }
     CompiledCacheEntry &entry = m_compiledCache[startPC];
     if (entry.generation == generation)
+    {
+        m_lastLookupRegion = entry.region;
         return entry.fn;
+    }
     entry.generation = generation;
     for (size_t i = 0; i < entry.layouts.size(); ++i)
     {
@@ -268,6 +360,8 @@ VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t cod
                 std::rotate(entry.layouts.begin(), entry.layouts.begin() + static_cast<std::ptrdiff_t>(i),
                             entry.layouts.begin() + static_cast<std::ptrdiff_t>(i) + 1);
             entry.fn = entry.layouts[0].fn;
+            entry.region = entry.layouts[0].region;
+            m_lastLookupRegion = entry.region;
             return entry.fn;
         }
     }
@@ -297,17 +391,25 @@ VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t cod
         for (size_t i = 0; i < g_ps2Vu1CompiledRegionCount && !region; ++i)
         {
             const VU1CompiledRegion &r = g_ps2Vu1CompiledRegions[i];
-            if (r.codeSize == codeSize && startPC >= r.start && startPC < r.end &&
-                std::binary_search(r.entries, r.entries + r.entryCount, startPC) &&
-                ps2Vu1RegionKey(vuCode, codeSize, r.start, r.end) == r.key)
-                region = &r;
+            if (r.codeSize != codeSize || startPC < r.start || startPC >= r.end)
+                continue;
+            const uint32_t *at = std::lower_bound(r.entries, r.entries + r.entryCount, startPC);
+            if (at == r.entries + r.entryCount || *at != startPC)
+                continue;
+            const bool match = ps2Vu1RegionEntryKey(vuCode, codeSize, startPC, r.start, r.end, r.delayEnd, r.cuts,
+                                                    r.cutCount) == r.entryKeys[at - r.entries];
             static const bool s_dbg = std::getenv("PS2X_VU_REGION_DEBUG") != nullptr;
-            if (s_dbg && r.codeSize == codeSize && startPC >= r.start && startPC < r.end)
+            if (s_dbg)
                 std::cerr << "[vu:region] pc=0x" << std::hex << startPC << " region 0x" << r.start << "-0x" << r.end
-                          << (ps2Vu1RegionKey(vuCode, codeSize, r.start, r.end) == r.key ? " match" : " differs") << std::dec << std::endl;
+                          << (match ? " match" : " differs") << std::dec << std::endl;
+            if (match)
+                region = &r;
         }
         if (region)
+        {
             layout.fn = region->run;
+            layout.region = true;
+        }
     }
     // The layout matches only while the code every candidate depends on is
     // unchanged (a change could select a different variant).
@@ -323,8 +425,14 @@ VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t cod
         covered.insert(covered.end(), delay.begin(), delay.end());
     }
     if (region)
-        for (uint32_t pc = region->start; pc + 8u <= region->end; pc += 8u)
-            covered.push_back(pc);
+    {
+        // Only what this entry runs: the rest of the region may be replaced
+        // without affecting it.
+        std::vector<uint32_t> pairs;
+        ps2Vu1RegionEntryPairs(vuCode, codeSize, startPC, region->start, region->end, region->delayEnd, pairs,
+                               region->cuts, region->cutCount);
+        covered.insert(covered.end(), pairs.begin(), pairs.end());
+    }
     std::sort(covered.begin(), covered.end());
     covered.erase(std::unique(covered.begin(), covered.end()), covered.end());
     for (uint32_t pc : covered)
@@ -338,6 +446,8 @@ VU1CompiledFn VU1Interpreter::lookupCompiled(const uint8_t *vuCode, uint32_t cod
     if (entry.layouts.size() > kMaxLayouts)
         entry.layouts.pop_back();
     entry.fn = entry.layouts[0].fn;
+    entry.region = entry.layouts[0].region;
+    m_lastLookupRegion = entry.region;
     static const bool s_log = std::getenv("PS2X_VU1_COMPILED_LOG") != nullptr;
     if (s_log)
         std::cerr << "[vu1:compiled] pc=0x" << std::hex << startPC << std::dec << (entry.fn ? " compiled" : " interpreted")

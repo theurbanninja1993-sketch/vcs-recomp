@@ -19,6 +19,7 @@
 #include "ps2_runtime.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <memory>
 #include <iterator>
 #include <fstream>
@@ -47,12 +48,23 @@ public:
     // A region: every pair in [start, end) is an entry (a jump may land anywhere
     // in it), nothing outside it is compiled, and leaving it - or reaching a pair
     // that cannot be compiled - hands over at that pc.
-    void setRegion(uint32_t start, uint32_t end, const std::set<uint32_t> *extraEntries = nullptr)
+    void setRegion(uint32_t start, uint32_t end, uint32_t delayEnd, const std::set<uint32_t> *extraEntries = nullptr,
+                   const std::vector<uint32_t> &cuts = {})
     {
         m_regionStart = start;
         m_regionEnd = end;
+        m_delayEnd = delayEnd;
         m_extraEntries = extraEntries;
+        m_cuts = cuts;
     }
+    std::vector<uint32_t> m_cuts;
+    uint32_t segmentOf(uint32_t pc) const
+    {
+        uint32_t from = 0, to = 0;
+        ps2Vu1RegionSegment(pc, m_regionStart, m_regionEnd, m_cuts.data(), static_cast<uint32_t>(m_cuts.size()), from, to);
+        return from;
+    }
+    uint32_t m_delayEnd = 0;
     const std::set<uint32_t> *m_extraEntries = nullptr;
     // A region's entries that it actually compiled (after generate()).
     std::set<uint32_t> compiledEntries() const
@@ -123,6 +135,7 @@ public:
           << "    const uint32_t vuDataSize = J::dataSize(vu);\n"
           << "    const uint32_t vuDataMask = vuDataSize - 1u;\n"
           << (m_skipsFlags ? "    J::noteFlagless(vu);\n" : "")
+          << (m_regionEnd > m_regionStart ? regionPrologue() : std::string())
           << "    switch (S.pc)\n    {\n";
         if (m_regionEnd > m_regionStart)
         {
@@ -231,8 +244,21 @@ public:
             o << "L_dispatch:\n    switch (jumpTarget)\n    {\n";
             for (uint32_t label : jumpEntries)
                 if (m_normalSet.count(label))
-                    o << "    case " << label << "u: goto L_" << label << ";\n";
-            o << "    default: return J::leaveAt(vu, cyc, jumpTarget);\n    }\n";
+                {
+                    if (m_regionEnd > m_regionStart)
+                    {
+                        const uint64_t mask = entryChunkMask(label);
+                        char line[160];
+                        std::snprintf(line, sizeof(line),
+                                      "    case %uu: if ((intactChunks & 0x%016llxull) == 0x%016llxull) goto L_%u; break;\n",
+                                      label, static_cast<unsigned long long>(mask),
+                                      static_cast<unsigned long long>(mask), label);
+                        o << line;
+                    }
+                    else
+                        o << "    case " << label << "u: goto L_" << label << ";\n";
+                }
+            o << "    default: break;\n    }\n    return J::leaveAt(vu, cyc, jumpTarget);\n";
         }
         else
         {
@@ -481,11 +507,25 @@ private:
 
     // A static transfer: to the label when it is compiled here, otherwise out to
     // whatever runs that pc (a region's edge, or a pair it could not compile).
-    std::string go(uint32_t pc) const
+    std::string go(uint32_t from, uint32_t pc) const
     {
-        if (m_normalSet.count(pc))
-            return "goto L_" + std::to_string(pc) + ";";
-        return "return J::leaveAt(vu, cyc, " + std::to_string(pc) + "u);";
+        const std::string leave = "return J::leaveAt(vu, cyc, " + std::to_string(pc) + "u);";
+        if (!m_normalSet.count(pc))
+            return leave;
+        // In a region, into another segment (another upload can be there): only
+        // while the chunks the code from there reaches are as compiled.
+        if (m_regionEnd > m_regionStart && segmentOf(from) != segmentOf(pc))
+        {
+            const uint64_t mask = entryChunkMask(pc);
+            char text[320];
+            std::snprintf(text, sizeof(text),
+                          "{ intactChunks = J::regionChunks(vu, s_regionGeneration, s_regionChunks, %uu, %uu, k_chunkHash); "
+                          "if ((intactChunks & 0x%016llxull) == 0x%016llxull) goto L_%u; %s }",
+                          m_regionStart, m_delayEnd, static_cast<unsigned long long>(mask),
+                          static_cast<unsigned long long>(mask), pc, leave.c_str());
+            return text;
+        }
+        return "goto L_" + std::to_string(pc) + ";";
     }
 
     // Where a jump into the region can land: its first pair, and the pair after
@@ -503,23 +543,10 @@ private:
                 if (pc + 16u < m_regionEnd)
                     entries.insert(pc + 16u);
         }
-        // And every static branch target in the region, from anywhere in the code
-        // image: a region is a piece of an upload, and a branch from the piece
-        // before it lands part-way in.
-        for (uint32_t pc = 0; pc + 8u <= m_codeSize; pc += 8u)
-        {
-            const Decoded d = decode(pc);
-            const uint32_t op = opHi(d);
-            if (!isBranch(d) || op == 0x24u || op == 0x25u)
-                continue;
-            const uint32_t target = (pc + 8u + static_cast<uint32_t>(IMM11(d.lower) * 8)) & (m_codeSize - 1u);
-            if (target >= m_regionStart && target < m_regionEnd)
-                entries.insert(target);
-            if (op != 0x20u && pc + 16u >= m_regionStart && pc + 16u < m_regionEnd)
-                entries.insert(pc + 16u); // fall-through / return point
-        }
-        // The same kinds of place in every other upload of this unit: a return or a
-        // jump from code loaded elsewhere lands in this one.
+        // Static branch targets inside the region are not entries: ordinary flow
+        // reaches them, with known pipeline state (each entry costs that). The
+        // same kinds of place in every other upload of this unit are: a return or
+        // a jump from code loaded elsewhere lands in this one.
         if (m_extraEntries)
             for (auto it = m_extraEntries->lower_bound(m_regionStart); it != m_extraEntries->end() && *it < m_regionEnd; ++it)
                 entries.insert(*it);
@@ -549,7 +576,7 @@ private:
                 if (pc >= m_regionStart && pc + 8u <= m_regionEnd && !bad.count(pc))
                     m_normal.push_back(pc);
             for (uint32_t pc : delay)
-                if (pc >= m_regionStart && pc + 8u <= m_regionEnd)
+                if (pc >= m_regionStart && pc + 8u <= m_delayEnd)
                     m_delay.push_back(pc);
             const size_t before = bad.size();
             for (uint32_t pc : m_normal)
@@ -561,7 +588,7 @@ private:
                 {
                     const uint32_t slot = nextPc(pc);
                     const Decoded ds = decode(slot);
-                    ok = slot >= m_regionStart && slot + 8u <= m_regionEnd && !isBranch(ds) && !ds.eBit &&
+                    ok = slot >= m_regionStart && slot + 8u <= m_delayEnd && !isBranch(ds) && !ds.eBit &&
                          !(ds.upperUsage.reserved || ds.lowerUsage.reserved || ds.dBit || ds.tBit);
                 }
                 if (!ok)
@@ -587,6 +614,35 @@ private:
     }
 
     uint32_t m_regionStart = 0, m_regionEnd = 0;
+
+    // A region's 256-byte chunk hashes (what regionChunks compares) and state.
+    std::string regionPrologue() const
+    {
+        std::string text = "    static uint64_t s_regionGeneration = ~0ull;\n    static uint64_t s_regionChunks = 0;\n"
+                           "    uint64_t intactChunks = 0;\n    static const uint64_t k_chunkHash[] = {";
+        for (uint32_t from = m_regionStart; from < m_delayEnd; from += 256u)
+        {
+            char hex[32];
+            std::snprintf(hex, sizeof(hex), "0x%016llxull, ",
+                          static_cast<unsigned long long>(VU1Jit::codeHash(m_code, from, std::min(m_delayEnd, from + 256u))));
+            text += hex;
+        }
+        return text + "0ull};\n    (void)intactChunks;\n";
+    }
+    // The chunks the code reached from `entry` lies in (see ps2Vu1RegionEntryPairs).
+    uint64_t entryChunkMask(uint32_t entry) const
+    {
+        std::vector<uint32_t> pairs;
+        ps2Vu1RegionEntryPairs(m_code, m_codeSize, entry, m_regionStart, m_regionEnd, m_delayEnd, pairs, m_cuts.data(),
+                               static_cast<uint32_t>(m_cuts.size()));
+        uint64_t mask = 0u;
+        for (uint32_t pc : pairs)
+        {
+            mask |= 1ull << std::min(63u, (pc - m_regionStart) / 256u);
+            mask |= 1ull << std::min(63u, (pc + 7u - m_regionStart) / 256u);
+        }
+        return mask;
+    }
 
     static bool fail(std::string &reason, uint32_t pc, const char *what)
     {
@@ -627,6 +683,21 @@ private:
             const uint32_t op = opHi(d);
             if (op == 0x24u || op == 0x25u)
             {
+                // In a region every jump through a register hands over, so the
+                // code at the target is checked against its own key first.
+                if (m_regionEnd > m_regionStart)
+                {
+                    // Unless the chunks the target's code reaches are all still loaded
+                    // (checked once per upload, see L_dispatch): then it is one of the
+                    // region's own entries, as compiled.
+                    char check[200];
+                    std::snprintf(check, sizeof(check),
+                                  "    jumpTarget = target;\n    intactChunks = J::regionChunks(vu, s_regionGeneration, "
+                                  "s_regionChunks, %uu, %uu, k_chunkHash);\n    goto L_dispatch;\n",
+                                  m_regionStart, m_delayEnd);
+                    o << check;
+                    return true;
+                }
                 o << "    jumpTarget = target;\n    goto L_dispatch;\n";
                 return true;
             }
@@ -641,9 +712,9 @@ private:
                         successors->emplace_back(nextPc(next), h);
                 }
                 if (op == 0x20u || op == 0x21u)
-                    o << "    " << go(dest) << "\n";
+                    o << "    " << go(pc, dest) << "\n";
                 else
-                    o << "    if (taken) " << go(dest) << "\n    " << go(nextPc(next)) << "\n";
+                    o << "    if (taken) " << go(pc, dest) << "\n    " << go(pc, nextPc(next)) << "\n";
             }
         }
         else if (d.eBit)
@@ -656,7 +727,7 @@ private:
         {
             if (successors)
                 successors->emplace_back(next, h);
-            o << "    " << go(next) << "\n";
+            o << "    " << go(pc, next) << "\n";
         }
         return false;
     }
@@ -1541,8 +1612,10 @@ int main(int argc, char **argv)
         std::vector<uint32_t> roots;
         std::string text;
         bool flagless = false;
-        uint32_t regionStart = 0, regionEnd = 0, codeSize = 0; // regions only
-        std::vector<uint32_t> entries;                          // regions only, sorted
+        uint32_t regionStart = 0, regionEnd = 0, codeSize = 0, delayEnd = 0; // regions only
+        std::vector<uint32_t> entries;                                       // regions only, sorted
+        std::vector<uint64_t> entryKeys;                                     // per entry
+        std::vector<uint32_t> cuts;
     };
     std::map<uint64_t, Variant> generated; // by full key
     size_t skipped = 0;
@@ -1560,14 +1633,13 @@ int main(int argc, char **argv)
         std::vector<uint32_t> roots;
         uint32_t regionEnd = 0; // a region [startPC, regionEnd) (see VU1Recompiler::setRegion)
         const std::set<uint32_t> *entries = nullptr; // likely entries from every upload of the unit
+        uint32_t delayEnd = 0;  // regionEnd, or + 8 for a delay slot past it
+        std::vector<uint32_t> cuts; // edges of other uploads inside the region
     };
     std::vector<Job> jobs;
 
-    // From the ELF: each upload of the layout alone at its VU address, and every
-    // program start in it - its first pair, and each pair after a program end
-    // (E-bit) or an unconditional jump (B, JR), where the next routine begins.
-    // Only starts whose code stays inside the upload: their key then does not
-    // depend on whatever else is loaded.
+    // From the ELF: each upload of the layout at its VU address, compiled as a
+    // region (below).
     std::vector<std::unique_ptr<Program>> fromElf;
     if (!elfPath.empty())
     {
@@ -1616,7 +1688,9 @@ int main(int argc, char **argv)
                 const uint32_t op = (upper & 0x80000000u) ? 0xFFu : (lower >> 25) & 0x7Fu;
                 const bool branch = op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u || op == 0x28u ||
                                     op == 0x29u || (op >= 0x2Cu && op <= 0x2Fu);
-                if ((upper & 0x40000000u) || (branch && op != 0x20u) || op == 0x20u || op == 0x24u)
+                // After a program end, an unconditional jump, or a call (its return),
+                // and static branch targets: a jump table points at those as well.
+                if ((upper & 0x40000000u) || op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u)
                     entries.insert((pc + 16u) & (size - 1u));
                 if (branch && op != 0x24u && op != 0x25u)
                 {
@@ -1624,6 +1698,29 @@ int main(int argc, char **argv)
                     entries.insert((pc + 8u + static_cast<uint32_t>(imm * 8)) & (size - 1u));
                 }
             }
+        }
+        // One upload command carries at most 256 pairs, so a big program arrives as
+        // several pieces that follow each other both in the ELF and in VU memory.
+        // They are one program: merged, branches between the pieces stay compiled.
+        {
+            std::sort(table.begin(), table.end(), [](const Upload &a, const Upload &b)
+                      { return a.unit != b.unit ? a.unit < b.unit : a.offset < b.offset; });
+            std::vector<Upload> merged;
+            for (const Upload &u : table)
+            {
+                // Any group this piece continues (another upload can sort between two
+                // pieces of the same program).
+                auto group = std::find_if(merged.begin(), merged.end(), [&](const Upload &m)
+                                          { return m.unit == u.unit && m.offset + m.length == u.offset &&
+                                                   m.address + m.length == u.address; });
+                if (group != merged.end())
+                {
+                    group->length += u.length;
+                    continue;
+                }
+                merged.push_back(u);
+            }
+            table.swap(merged);
         }
         size_t uploads = 0, starts = 0;
         for (const Upload &u : table)
@@ -1642,75 +1739,45 @@ int main(int argc, char **argv)
             program->code.assign(codeSize, 0u);
             std::memcpy(program->code.data() + address, elf.data() + offset, length);
             ++uploads;
-            std::set<uint32_t> candidates = {address};
-            for (uint32_t pc = address; pc + 8u <= address + length; pc += 8u)
+            // And the whole upload as a region, entered at the likely jump targets
+            // (jump tables the game fills in at run time land there). Each entry is
+            // keyed by the code it reaches inside the upload, so an upload that
+            // overwrites part of this one leaves the other entries usable. A branch
+            // or program end in the last pair runs its delay slot from the pair
+            // after the upload: one region per upload that can sit there.
             {
-                uint32_t lower = 0, upper = 0;
-                std::memcpy(&lower, program->code.data() + pc, 4);
-                std::memcpy(&upper, program->code.data() + pc + 4, 4);
-                const bool iBit = (upper & 0x80000000u) != 0u;
-                const uint32_t op = iBit ? 0xFFu : (lower >> 25) & 0x7Fu;
-                if ((upper & 0x40000000u) || op == 0x20u || op == 0x24u)
-                    candidates.insert(pc + 16u);
-            }
-            for (uint32_t start : candidates)
-            {
-                if (start >= address + length)
-                    continue;
-                std::vector<uint32_t> normal, delay;
-                ps2Vu1ProgramPairs(program->code.data(), codeSize, start, normal, delay);
-                bool inside = !normal.empty();
-                for (uint32_t pc : normal)
-                    inside = inside && pc >= address && pc + 8u <= address + length;
-                for (uint32_t pc : delay)
-                    inside = inside && pc >= address && pc + 8u <= address + length;
-                if (!inside)
-                    continue;
-                jobs.push_back({program.get(), start, {}});
-                ++starts;
-            }
-            // And the upload as regions, for the jumps that land between program
-            // starts (jump tables the game fills in at run time). Cut at every
-            // upload's edges: uploads overlap (a slot loaded over the end of a
-            // bigger block), and a region keyed across such an edge would stop
-            // matching whenever the other upload is in. A jump across a cut chains.
-            std::vector<unsigned> cuts = {address};
-            for (unsigned b : boundaries[unit])
-                if (b > address && b < address + length)
-                    cuts.push_back(b);
-            cuts.push_back(address + length);
-            for (size_t c = 0; c + 1 < cuts.size(); ++c)
-            {
-                if (cuts[c + 1] <= cuts[c])
-                    continue;
-                // A branch or program end in the last pair runs its delay slot from
-                // the pair after the piece: the region takes that pair in too (its
-                // key covers it, so it matches whatever the game loads there).
-                unsigned end = cuts[c + 1];
+                const unsigned end = address + length;
+                std::set<uint32_t> cutSet;
+                for (const Upload &other : table)
+                    if (other.unit == unit && !(other.address == address && other.length == length))
+                        for (uint32_t edge : {other.address, other.address + other.length})
+                            if (edge > address && edge < end)
+                                cutSet.insert(edge);
+                const std::vector<uint32_t> cuts(cutSet.begin(), cutSet.end());
                 uint32_t lower = 0, upper = 0;
                 std::memcpy(&lower, program->code.data() + end - 8u, 4);
                 std::memcpy(&upper, program->code.data() + end - 4u, 4);
                 const uint32_t op = (upper & 0x80000000u) ? 0xFFu : (lower >> 25) & 0x7Fu;
                 const bool branch = op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u || op == 0x28u ||
                                     op == 0x29u || (op >= 0x2Cu && op <= 0x2Fu);
+                bool any = false;
                 if ((branch || (upper & 0x40000000u)) && end + 8u <= codeSize)
-                {
-                    // The pair there comes from whichever upload covers it.
                     for (const Upload &other : table)
                         if (other.unit == unit && other.address <= end && end + 8u <= other.address + other.length)
                         {
                             auto variant = std::make_unique<Program>(*program);
                             std::memcpy(variant->code.data() + end, elf.data() + other.offset + (end - other.address), 8);
-                            jobs.push_back({variant.get(), cuts[c], {}, end + 8u, &s_unitEntries[unit]});
+                            jobs.push_back({variant.get(), address, {}, end, &s_unitEntries[unit], end + 8u, cuts});
                             fromElf.push_back(std::move(variant));
+                            any = true;
                         }
-                    continue;
-                }
-                jobs.push_back({program.get(), cuts[c], {}, end, &s_unitEntries[unit]});
+                if (!any)
+                    jobs.push_back({program.get(), address, {}, end, &s_unitEntries[unit], end, cuts});
             }
             fromElf.push_back(std::move(program));
         }
-        std::fprintf(stderr, "%s: %zu uploads, %zu program starts\n", layoutPath.c_str(), uploads, starts);
+        std::fprintf(stderr, "%s: %zu uploads\n", layoutPath.c_str(), uploads);
+        (void)starts;
     }
     for (const auto &[ids, program] : programs)
     {
@@ -1731,8 +1798,20 @@ int main(int argc, char **argv)
                                             static_cast<uint32_t>(roots.size()));
         if (job.regionEnd != 0u)
         {
-            // A region is keyed by its bytes where they sit (ps2Vu1RegionKey).
-            baseKey = fullKey = ps2Vu1RegionKey(program.code.data(), program.codeSize, job.startPC, job.regionEnd);
+            // A region's name: its place and its bytes (entries are keyed separately).
+            uint64_t hash = 1469598103934665603ull;
+            auto mix = [&](uint32_t v) { for (int i = 0; i < 4; ++i) { hash ^= (v >> (8 * i)) & 0xFFu; hash *= 1099511628211ull; } };
+            mix(program.codeSize);
+            mix(job.startPC);
+            mix(job.regionEnd);
+            mix(job.delayEnd);
+            for (uint32_t pc = job.startPC; pc < job.delayEnd; pc += 4u)
+            {
+                uint32_t w = 0;
+                std::memcpy(&w, program.code.data() + pc, 4);
+                mix(w);
+            }
+            baseKey = fullKey = hash;
         }
         if (std::getenv("VU1_RECOMP_VERBOSE"))
         {
@@ -1746,7 +1825,7 @@ int main(int argc, char **argv)
             continue;
         VU1Recompiler recompiler(program.code.data(), job.startPC, roots, program.codeSize);
         if (job.regionEnd != 0u)
-            recompiler.setRegion(job.startPC, job.regionEnd, job.entries);
+            recompiler.setRegion(job.startPC, job.regionEnd, job.delayEnd, job.entries, job.cuts);
         std::string text, reason;
         if (!recompiler.generate(fullKey, text, reason))
         {
@@ -1761,8 +1840,15 @@ int main(int argc, char **argv)
             variant.regionStart = job.startPC;
             variant.regionEnd = job.regionEnd;
             variant.codeSize = program.codeSize;
+            variant.delayEnd = job.delayEnd;
+            variant.cuts = job.cuts;
             for (uint32_t pc : recompiler.compiledEntries())
+            {
                 variant.entries.push_back(pc);
+                variant.entryKeys.push_back(ps2Vu1RegionEntryKey(program.code.data(), program.codeSize, pc, job.startPC,
+                                                                 job.regionEnd, job.delayEnd, job.cuts.data(),
+                                                                 static_cast<uint32_t>(job.cuts.size())));
+            }
         }
         generated.emplace(fullKey, std::move(variant));
     }
@@ -1842,6 +1928,16 @@ int main(int argc, char **argv)
         registry += "static const uint32_t vu1e_" + std::string(name) + "[] = {";
         for (uint32_t pc : variant.entries)
             registry += std::to_string(pc) + "u, ";
+        registry += "0u};\nstatic const uint64_t vu1k_" + std::string(name) + "[] = {";
+        for (uint64_t k : variant.entryKeys)
+        {
+            char hex[32];
+            std::snprintf(hex, sizeof(hex), "0x%016llxull, ", static_cast<unsigned long long>(k));
+            registry += hex;
+        }
+        registry += "0ull};\nstatic const uint32_t vu1c_" + std::string(name) + "[] = {";
+        for (uint32_t cut : variant.cuts)
+            registry += std::to_string(cut) + "u, ";
         registry += "0u};\n";
     }
     registry += "\nextern const VU1CompiledRegion g_ps2Vu1CompiledRegions[] = {\n";
@@ -1851,12 +1947,15 @@ int main(int argc, char **argv)
             continue;
         ++regionCount;
         char line[256];
-        std::snprintf(line, sizeof(line), "    {0x%016llxull, vu1p_%llx, %uu, %uu, %uu, vu1e_%llx, %zuu},\n",
+        std::snprintf(line, sizeof(line),
+                      "    {0x%016llxull, vu1p_%llx, %uu, %uu, %uu, vu1e_%llx, vu1k_%llx, %zuu, %uu, vu1c_%llx, %zuu},\n",
                       static_cast<unsigned long long>(key), static_cast<unsigned long long>(key), variant.codeSize,
-                      variant.regionStart, variant.regionEnd, static_cast<unsigned long long>(key), variant.entries.size());
+                      variant.regionStart, variant.regionEnd, static_cast<unsigned long long>(key),
+                      static_cast<unsigned long long>(key), variant.entries.size(), variant.delayEnd,
+                      static_cast<unsigned long long>(key), variant.cuts.size());
         registry += line;
     }
-    registry += "    {0, nullptr, 0u, 0u, 0u, nullptr, 0u},\n";
+    registry += "    {0, nullptr, 0u, 0u, 0u, nullptr, nullptr, 0u, 0u, nullptr, 0u},\n";
     registry += "};\nextern const size_t g_ps2Vu1CompiledRegionCount = " + std::to_string(regionCount) + ";\n";
     if (!writeIfChanged(dir + "/vu1_programs.cpp", registry))
         return 1;

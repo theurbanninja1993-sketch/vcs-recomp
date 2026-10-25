@@ -61,6 +61,63 @@ struct VU1Jit
 
     // ------------------------------------------------------------ cycles
 
+    // FNV-1a over the 32-bit words of code[start, end): a region's content.
+    static inline uint64_t codeHash(const uint8_t *code, uint32_t start, uint32_t end)
+    {
+        uint64_t hash = 1469598103934665603ull;
+        for (uint32_t pc = start; pc + 4u <= end; pc += 4u)
+        {
+            uint32_t word;
+            std::memcpy(&word, code + pc, 4);
+            for (int i = 0; i < 4; ++i)
+            {
+                hash ^= (word >> (8 * i)) & 0xFFu;
+                hash *= 1099511628211ull;
+            }
+        }
+        return hash;
+    }
+    // Which 256-byte chunks of a compiled region still hold the code it was compiled
+    // from (bit i: chunk i), recomputed once per code upload. A register jump stays
+    // in the region's compiled code when every chunk its target reaches is intact.
+    static inline uint64_t regionChunks(V &vu, uint64_t &checkedGeneration, uint64_t &intact, uint32_t start,
+                                        uint32_t end, const uint64_t *chunkHashes)
+    {
+        if (vu.m_compiledCode == nullptr)
+            return 0u;
+        if (vu.m_lookupGeneration != checkedGeneration)
+        {
+            checkedGeneration = vu.m_lookupGeneration;
+            intact = 0u;
+            for (uint32_t i = 0; start + i * 256u < end && i < 64u; ++i)
+            {
+                const uint32_t from = start + i * 256u;
+                const uint32_t to = std::min(end, from + 256u);
+                if (codeHash(vu.m_compiledCode, from, to) == chunkHashes[i])
+                    intact |= 1ull << i;
+            }
+        }
+        return intact;
+    }
+    // Whether a compiled region's code is all still loaded, checked once per code
+    // upload (the generation counter): then a jump through a register can stay in
+    // the region's compiled code instead of handing over to be checked.
+    static inline bool regionIntact(V &vu, uint64_t &checkedGeneration, bool &intact, uint32_t start, uint32_t end,
+                                    uint64_t hash)
+    {
+        if (vu.m_compiledCode == nullptr)
+            return false;
+        // Set by lookupCompiled, which every compiled run goes through; the code
+        // cannot change while a program runs.
+        const uint64_t generation = vu.m_lookupGeneration;
+        if (generation != checkedGeneration)
+        {
+            checkedGeneration = generation;
+            intact = codeHash(vu.m_compiledCode, start, end) == hash;
+        }
+        return intact;
+    }
+
     __attribute__((always_inline)) static inline uint64_t now(const V &vu) { return vu.m_cycle; }
     __attribute__((always_inline)) static inline void noteFlagless(V &vu) { vu.m_ranFlagless = true; }
 

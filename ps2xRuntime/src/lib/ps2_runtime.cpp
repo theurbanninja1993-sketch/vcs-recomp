@@ -1231,7 +1231,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                      static std::unordered_map<uint32_t, FellBack> s_fellBack;
                                      const uint64_t codeGeneration = m_memory.getVU1CodeGeneration();
                                      const auto fell = s_fellBack.find(startPC);
-                                     const bool fellBack = fell != s_fellBack.end() && fell->second.generation == codeGeneration;
+                                     // Recorded enough already, by start and where it left (counted
+                                     // here first: the keys below cost a code walk each).
+                                     static std::unordered_map<uint64_t, uint32_t> s_fellBackRecorded;
+                                     bool fellBack = fell != s_fellBack.end() && fell->second.generation == codeGeneration;
+                                     uint32_t *fellBackCount = nullptr;
+                                     if (fellBack)
+                                     {
+                                         fellBackCount = &s_fellBackRecorded[(static_cast<uint64_t>(startPC) << 32) | fell->second.at];
+                                         if (*fellBackCount >= 4u)
+                                             fellBack = false;
+                                     }
                                      FILE *recordTo = capture ? s_capture : nullptr;
                                      if (!recordTo &&
                                          (fellBack || !m_vu1.lookupCompiled(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE, &m_memory, startPC)))
@@ -1248,6 +1258,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                              ++runs;
                                              recordTo = ps2VuLearnFile(1);
                                          }
+                                         if (fellBackCount)
+                                             ++*fellBackCount;
                                      }
                                      if (recordTo)
                                      {
@@ -1265,6 +1277,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                      }
                                      if (m_vu1.leftCompiledLastRun())
                                          s_fellBack[startPC] = {codeGeneration, m_vu1.leftCompiledAt()};
+                                     else if (m_vu1.ranRegionLastRun())
+                                         s_fellBack[startPC] = {codeGeneration, startPC}; // recorded like a fall-back
                                      else if (fellBack)
                                          s_fellBack.erase(startPC);
                                      if (recordTo)
