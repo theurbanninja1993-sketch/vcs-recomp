@@ -1,12 +1,13 @@
 # GTA: Vice City Stories — PlayStation 2 recompilation
 
-A source-only port of **Grand Theft Auto: Vice City Stories** (SLUS_215.90) to
-PC, built on [PS2Recomp](https://github.com/ran-j/PS2Recomp) by ran-j.
+A source-only port of **Grand Theft Auto: Vice City Stories and Liberty City Stories** (SLUS_215.90) and (SLUS_214.23) to PC, built on [PS2Recomp](https://github.com/ran-j/PS2Recomp) by ran-j.
 
 **No game code or data is in this repository** — only our own code, the
 recompiler configuration (addresses), and scripts. The game is generated on your
 machine, from your own disc. That is deliberate: the point is that nothing of
 Rockstar's is distributed here.
+
+Download the laucnher from https://github.com/theurbanninja1993-sketch/thestoriescollection-launcher it is the easiest way to build the games.
 
 ## Built with AI
 
